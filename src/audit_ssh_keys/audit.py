@@ -38,7 +38,6 @@ import logging
 import os
 import pwd
 import re
-import shlex
 import shutil
 import stat
 import subprocess
@@ -273,6 +272,132 @@ def read_effective_sshd_config(
     return dict(config), "parsed sshd_config (sshd -T unavailable)", sshd_error
 
 
+def _split_config_args(text: str) -> list[str] | None:
+    """Split the argument part of one sshd_config line into arguments, the way sshd does.
+
+    This mirrors sshd's argv_split() (misc.c), which sshd calls with
+    terminate_on_comment set when it reads a config file:
+
+    - spaces and tabs separate arguments, and any run of them is skipped;
+    - a `#` that starts an argument ends the line, so everything from there on
+      is a comment; a `#` anywhere inside an argument is an ordinary character;
+    - single and double quotes group text and are removed, so an argument can
+      hold a space;
+    - a backslash escapes a single quote, a double quote, another backslash,
+      or -- outside quotes -- a space; any other backslash is kept as itself;
+    - a quote that is never closed makes sshd refuse the whole config.
+
+    Returns the arguments, or None for that unclosed-quote case, so the caller
+    can skip a line sshd itself would not accept.
+    """
+    args: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] in " \t":
+            index += 1
+            continue
+        if text[index] == "#":
+            break
+        # Start of an argument: collect characters until unquoted whitespace
+        # or the end of the line.
+        quote = ""
+        chars: list[str] = []
+        while index < length:
+            char = text[index]
+            if char == "\\":
+                following = text[index + 1] if index + 1 < length else ""
+                if following in ("'", '"', "\\") or (not quote and following == " "):
+                    index += 1
+                    chars.append(text[index])
+                else:
+                    # Not an escape sshd recognises, so the backslash is just
+                    # a character in the argument.
+                    chars.append(char)
+            elif not quote and char in " \t":
+                break
+            elif not quote and char in "\"'":
+                quote = char
+            elif quote and char == quote:
+                quote = ""
+            else:
+                chars.append(char)
+            index += 1
+        args.append("".join(chars))
+        if index >= length:
+            if quote:
+                return None
+            break
+    return args
+
+
+def _expand_config_tilde(argument: str) -> str:
+    """Expand a leading '~' in a config argument to a home directory, as sshd does.
+
+    sshd passes an AuthorizedKeysFile argument through
+    tilde_expand_filename(arg, getuid()) (servconf.c), and a HostKey argument
+    through derelativise_path(), which calls the same function. A leading '~'
+    on its own, or followed by '/', stands for the home directory of whoever
+    runs sshd -- normally root -- and not for the home directory of the account
+    whose keys are being audited; this fallback parser uses the home directory
+    of whoever is running the audit, which is the closest it can get. A '~name'
+    argument names that account's home directory instead, which is the same for
+    sshd and for this tool.
+
+    sshd expands '~' for several other filename settings too
+    (AuthorizedPrincipalsFile, TrustedUserCAKeys, RevokedKeys, PidFile and
+    HostKeyAgent). This tool never opens those files -- it only echoes their
+    values back into coverage warnings -- so it does not expand them either,
+    and the warning shows the path as the config file writes it.
+    """
+    if not argument.startswith("~"):
+        return argument
+    name, _, rest = argument[1:].partition("/")
+    if name:
+        try:
+            home = pwd.getpwnam(name).pw_dir
+        except KeyError:
+            # sshd gives up on the whole config here ("No such user"), so
+            # there is no right answer; the argument is kept as written.
+            logger.debug("no such account %s, so %s is left unexpanded", name, argument)
+            return argument
+    else:
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError:
+            # No passwd entry for the uid this process is running as, which
+            # happens inside a container started with an arbitrary uid. sshd
+            # gives up on the whole config in that case too, so as above the
+            # argument is kept as written.
+            logger.debug("no passwd entry for uid %s, so %s is left unexpanded", os.getuid(), argument)
+            return argument
+    # sshd joins the home directory and the rest of the path with a single '/',
+    # which leaves a trailing '/' on a bare '~'.
+    return home.rstrip("/") + "/" + rest.lstrip("/")
+
+
+def _derelativise_config_path(argument: str) -> str:
+    """Expand a leading '~' in a HostKey argument and make a relative path absolute, as sshd does.
+
+    sshd passes each HostKey argument through derelativise_path() (servconf.c),
+    which expands '~' and then joins a path that is still relative onto the
+    directory sshd was started in. Nothing records that directory, so this
+    fallback can only use the directory the audit is running in, which is very
+    likely a different one; a relative HostKey path is rare for that reason.
+    """
+    # derelativise_path() checks for "none" before it touches anything else,
+    # and leaves it alone (it returns the literal lowercase "none"; the value
+    # is kept as written here so the report shows what the file says).
+    if argument.lower() == "none":
+        return argument
+    expanded = _expand_config_tilde(argument)
+    if expanded.startswith("/"):
+        return expanded
+    # Joined onto the current directory without collapsing any '..' in it,
+    # which is what sshd does too.
+    return str(Path.cwd() / expanded)
+
+
 def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int = 0) -> None:
     """Read one sshd_config file into config, following the Include directives in it.
 
@@ -282,6 +407,12 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
     including any Include inside it. A file that is missing or unreadable is
     skipped. depth counts how many Includes deep this file is; nesting stops at
     MAX_INCLUDE_DEPTH, which is also what stops a file that includes itself.
+
+    Each line's arguments are split the way sshd splits them (see
+    _split_config_args), so a trailing comment is dropped, quotes and
+    backslash escapes are honoured, and a line sshd would reject over an
+    unclosed quote is skipped here too. The arguments are stored joined back
+    together with single spaces, which is how `sshd -T` prints them as well.
     """
     try:
         if not _is_regular_file(path):
@@ -309,13 +440,46 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = re.split(r"\s+|=", line, maxsplit=1)
-        if len(parts) != 2:
+        # sshd's strdelim_internal() (misc.c) ends the keyword at the first
+        # whitespace or '=', then skips the whitespace around it -- and skips
+        # one '=' as well, but only if the keyword did not already end at one.
+        # So "Keyword=value", "Keyword = value" and "Keyword =value" all mean
+        # the same thing, while "Keyword==value" leaves a value of "=value",
+        # which sshd then refuses ("unsupported option"). Whichever character
+        # ended the keyword has to be remembered to tell those apart.
+        keyword_split = re.match(r"([^\s=]*)(\s+|=)(.*)", line)
+        if keyword_split is None:
             continue
-        key, value = parts[0].lower(), parts[1].strip()
+        key = keyword_split.group(1).lower()
+        rest = keyword_split.group(3).lstrip()
+        if keyword_split.group(2) != "=" and rest.startswith("="):
+            rest = rest[1:].lstrip()
         if key == "match":
+            # Decide this before looking at the value, because the value is not
+            # used for Match and a Match line sshd would reject -- an unclosed
+            # quote, say -- still opens a block as far as this parser's reading
+            # of the rest of the file goes. Going on to read the block's body
+            # as global configuration would be much worse than skipping it:
+            # a Match-block AuthorizedKeysFile would become the global pattern
+            # and no account's real file would ever be scanned.
             in_match = True
             continue
+        arguments = _split_config_args(rest)
+        if arguments is None:
+            # sshd refuses the whole config over an unclosed quote ("invalid
+            # quotes"), so there is nothing sensible to read on this line.
+            logger.debug("ignoring line with an unclosed quote in %s: %s", path, line)
+            continue
+        if not arguments:
+            # Nothing but a comment after the keyword. sshd refuses a config
+            # with a keyword that has no argument, so do not invent a value.
+            logger.debug("ignoring %s line with no argument in %s", key, path)
+            continue
+        if key == "authorizedkeysfile":
+            arguments = [_expand_config_tilde(argument) for argument in arguments]
+        elif key == "hostkey":
+            arguments = [_derelativise_config_path(argument) for argument in arguments]
+        value = " ".join(arguments)
         if in_match:
             continue
         if key == "include":
@@ -329,15 +493,9 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
             if depth >= MAX_INCLUDE_DEPTH:
                 logger.debug("ignoring Include in %s: more than %s levels deep", path, MAX_INCLUDE_DEPTH)
                 continue
-            try:
-                # sshd splits the arguments the way a shell would, so a path
-                # with a space in it can be quoted. An unbalanced quote makes
-                # sshd refuse the whole config; there is nothing sensible to
-                # read here, so skip the line.
-                arguments = shlex.split(value)
-            except ValueError as exc:
-                logger.debug("ignoring unparseable Include in %s: %s", path, exc)
-                continue
+            # The arguments were already split the way sshd splits them, so a
+            # path with a space in it can be quoted, and a line with an
+            # unclosed quote was skipped above.
             for argument in arguments:
                 # sshd leaves an argument that starts with / or ~ alone (it
                 # does not expand ~, and neither does glob below) and prefixes
@@ -424,8 +582,32 @@ def _without_none(patterns: list[str]) -> list[str]:
     that entry, not only when the whole value is "none" -- so
     "none .ssh/authorized_keys2" scans authorized_keys2 and skips a file
     actually named "none".
+
+    That is how every released sshd behaves, including 10.2, which starts
+    happily with "none" listed alongside other entries. OpenSSH's current
+    development code (servconf.c) refuses such a configuration outright
+    instead, so a future sshd will not start on it at all; a value that mixes
+    "none" with other entries gets a coverage warning saying so (see
+    _mixed_none_warning).
     """
     return [p for p in patterns if p.lower() != "none"]
+
+
+def _mixed_none_warning(value: str, user_name: str | None = None) -> str:
+    """The coverage line for an AuthorizedKeysFile value listing 'none' next to real paths.
+
+    value is the configured AuthorizedKeysFile value, echoed back to the
+    operator so they can see which setting is meant. user_name is None for the
+    global setting, and otherwise the account whose own effective value came
+    from a Match block.
+    """
+    whose = "" if user_name is None else f" for {user_name} (Match block)"
+    return (
+        f"AuthorizedKeysFile mixes 'none' with other entries{whose} ({value}); "
+        "released sshd versions skip just the 'none' entry and this audit does the same, "
+        "but OpenSSH's current development code rejects the whole configuration, "
+        "so a future upgrade may stop sshd from starting."
+    )
 
 
 def home_dir(user: pwd.struct_passwd) -> Path:
@@ -999,11 +1181,12 @@ def _is_bare_key_line(stripped: str) -> bool:
 def split_options(line: str) -> tuple[list[str], str]:
     """Split an authorized_keys line into (options, key-material-and-comment).
 
-    Options are comma-separated and may contain quoted strings with commas
-    or escaped quotes (e.g. command="foo,bar"). A line whose second field is a
-    key blob naming the same type as its first field has no options -- the same
-    test sshd applies before it looks for options, so key types this tool has
-    never seen still parse.
+    Options are comma-separated and may contain quoted strings with commas or
+    escaped quotes (e.g. command="foo,bar"). Inside a quoted value only \\" is
+    an escape, the same rule _dequote_value() applies when it reads the value
+    itself. A line whose second field is a key blob naming the same type as its
+    first field has no options -- the same test sshd applies before it looks
+    for options, so key types this tool has never seen still parse.
     """
     stripped = line.strip()
     if _is_bare_key_line(stripped):
@@ -1016,7 +1199,12 @@ def split_options(line: str) -> tuple[list[str], str]:
     while i < len(stripped):
         ch = stripped[i]
         if in_quotes:
-            if ch == "\\" and i + 1 < len(stripped):
+            if ch == "\\" and i + 1 < len(stripped) and stripped[i + 1] == '"':
+                # Only \" is an escape, exactly as sshd's opt_dequote() and
+                # sshkey_advance_past_options() read it: a backslash in front
+                # of anything else is a literal backslash and does not hide the
+                # character after it. Skipping that character would close the
+                # quote early and find a key on a line sshd throws out.
                 current.append(stripped[i : i + 2])
                 i += 2
                 continue
@@ -1111,12 +1299,13 @@ def check_options(options: list[str]) -> str | None:
     one option ('no-pty' or 'command="a,b"').
 
     What is checked: the option names, the quoting of every value, the three
-    clauses sshd allows only once (command, principals, from), and the values
-    of environment= and tunnel=. What is deliberately not checked: the
-    contents of expiry-time=, permitopen=, and permitlisten= values, because
-    whether those parse depends on the sshd version, on the machine's timezone
-    and date handling, and on /etc/services lookups -- wrongly calling a
-    working line dead would be worse than missing a broken one.
+    clauses sshd allows only once (command, principals, from), the values of
+    environment= and tunnel=, and that principals= appears only together with
+    cert-authority. What is deliberately not checked: the contents of
+    expiry-time=, permitopen=, and permitlisten= values, because whether those
+    parse depends on the sshd version, on the machine's timezone and date
+    handling, and on /etc/services lookups -- wrongly calling a working line
+    dead would be worse than missing a broken one.
     """
     seen_single_use: set[str] = set()
     for option in options:
@@ -1161,6 +1350,14 @@ def check_options(options: list[str]) -> str | None:
         elif name == "tunnel" and value.lower() != "any":
             if not _TUN_NUMBER_RE.fullmatch(value) or not 0 <= int(value) <= _TUN_DEVICE_MAX:
                 return "invalid tun device"
+
+    lowered_options = [o.lower() for o in options]
+    if any(o.startswith("principals=") for o in lowered_options) and "cert-authority" not in lowered_options:
+        # auth_authorise_keyopts() (auth2-pubkeyfile.c) denies a line whose
+        # options name principals without also marking the key as a CA: the
+        # principals list only means anything for certificates signed by it.
+        # sshd checks this after the options have parsed, so this check does too.
+        return "principals on non-CA key"
     return None
 
 
@@ -1333,6 +1530,11 @@ def audit_server_config(
             f"AuthorizedKeysCommand is set ({cfg_value(config, 'authorizedkeyscommand', '')}); "
             "keys sourced from it are NOT covered by this file-based audit."
         )
+    if cfg_value(config, "hostkeyagent", "none").lower() != "none":
+        coverage.append(
+            f"HostKeyAgent is set ({cfg_value(config, 'hostkeyagent', '')}); "
+            "private host keys held by the agent are not on disk and cannot be audited."
+        )
     if cfg_value(config, "trustedusercakeys", "none").lower() != "none":
         coverage.append(
             f"TrustedUserCAKeys is set ({cfg_value(config, 'trustedusercakeys', '')}); "
@@ -1386,6 +1588,84 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
                 )
             continue
 
+        if not looks_like_private_key(path):
+            public = fingerprint_file(path)
+            if public is not None:
+                # A HostKey that names a public key file. sshd tries
+                # sshkey_load_private() first, then sshkey_load_public()
+                # (sshd.c): with HostKeyAgent set it logs "will rely on agent
+                # for hostkey" and serves that key, and without one it cannot
+                # load a private key at all. Either way the file holds no
+                # private material, so the permission, passphrase and .pub
+                # checks below have nothing to look at.
+                key_type, bits, fingerprint, _ = public
+                if _is_certificate(key_type):
+                    # A certificate file, which sshd cannot use as a HostKey at
+                    # all. The "will rely on agent for hostkey" path in sshd.c
+                    # is only taken for a plain key type, so a HostKey naming a
+                    # certificate fails even when the agent holds both the key
+                    # and the certificate -- verified against OpenSSH 10.2,
+                    # which logs "Unable to load host key" and then exits with
+                    # "no hostkeys available". The host offers nothing from this
+                    # line, so its type is not recorded as present and its
+                    # algorithm and size are not graded.
+                    findings.append(
+                        HostKeyFinding(
+                            str(path),
+                            key_type,
+                            bits,
+                            fingerprint,
+                            [
+                                Issue(
+                                    "LOW",
+                                    "HostKey names a certificate file; sshd cannot load a host key from it "
+                                    "(a certificate belongs on a HostCertificate line)",
+                                )
+                            ],
+                        )
+                    )
+                    continue
+                agent = cfg_value(config, "hostkeyagent", "none")
+                if agent.lower() != "none":
+                    finding = HostKeyFinding(
+                        str(path),
+                        key_type,
+                        bits,
+                        fingerprint,
+                        [
+                            Issue(
+                                "INFO",
+                                "public key file; the private half is held by HostKeyAgent and cannot be audited here",
+                            )
+                        ],
+                    )
+                    # sshd serves this key through the agent, so the host does
+                    # offer this key type, and its algorithm and size still matter.
+                    types_present.add(key_type.upper())
+                    finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
+                    findings.append(finding)
+                else:
+                    # No agent, so sshd has no usable key from this line at
+                    # all: the type is deliberately not recorded as present,
+                    # and the algorithm and size are deliberately not graded
+                    # either, because sshd never offers this key to anyone.
+                    findings.append(
+                        HostKeyFinding(
+                            str(path),
+                            key_type,
+                            bits,
+                            fingerprint,
+                            [
+                                Issue(
+                                    "LOW",
+                                    "HostKey names a public key file and no HostKeyAgent is set; "
+                                    "sshd cannot load a private key from it",
+                                )
+                            ],
+                        )
+                    )
+                continue
+
         result, mismatch = fingerprint_private_key(path)
         if result is None:
             finding = HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", "could not fingerprint host key")])
@@ -1401,9 +1681,19 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
         if mismatch is not None:
             finding.issues.append(mismatch)
         perm_issues = check_private_key_perms(path, expected_uid=owner_uid)
+        # sshkey_perm_ok() turns a private key down over its mode only when the
+        # account running the program owns the file. sshd runs as root, so it
+        # refuses a root-owned host key with group or other bits, and loads one
+        # that belongs to somebody else whatever its mode says -- which leaves
+        # that account, and anyone the mode admits, able to read and replace the
+        # server's identity key. The owner issue check_private_key_perms()
+        # produces is what says which case this is.
+        wrong_owner = any(issue.message.startswith("owned by ") for issue in perm_issues)
         for issue in perm_issues:
             if "accessible" in issue.message:
-                issue.message += "; sshd refuses to load it"
+                issue.message += (
+                    "; sshd still loads it because root does not own it" if wrong_owner else "; sshd refuses to load it"
+                )
         finding.issues.extend(perm_issues)
         enc = private_key_is_encrypted(path)
         if enc is True:
@@ -1456,6 +1746,12 @@ def audit_authorized_keys(
     remaining = _without_none(patterns)
     if not remaining and patterns:
         coverage.append("AuthorizedKeysFile is 'none'; sshd reads no authorized_keys files.")
+    # 'none' listed next to real paths is a configuration this sshd accepts
+    # and a future one will not, so it is worth a warning of its own -- once
+    # for the global setting, not once per account.
+    global_mixes_none = bool(remaining) and len(remaining) != len(patterns)
+    if global_mixes_none:
+        coverage.append(_mixed_none_warning(" ".join(patterns)))
     patterns = remaining
 
     files: list[FileFinding] = []
@@ -1509,6 +1805,12 @@ def audit_authorized_keys(
                     "sshd reads no authorized_keys files for that account."
                 )
             continue
+        if len(user_remaining) != len(user_patterns) and not global_mixes_none:
+            # Same reasoning as the 'none' line just above: a per-account run
+            # echoes the global value, so only a Match block that mixes 'none'
+            # in for this one account earns a line here. The global case
+            # already has its own line above.
+            coverage.append(_mixed_none_warning(" ".join(user_patterns), user.pw_name))
         user_patterns = user_remaining
 
         for pattern in user_patterns:

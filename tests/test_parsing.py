@@ -86,6 +86,31 @@ def test_split_options_escaped_quote_inside_value():
     assert rest == "ssh-ed25519 AAAA"
 
 
+def test_split_options_backslash_before_anything_but_a_quote_is_not_an_escape():
+    r"""Only \" escapes inside a quoted value, so command="a\\" never closes its quote.
+
+    sshd's opt_dequote() (misc.c) and sshkey_advance_past_options() (sshkey.c)
+    both skip a character after a backslash only when that character is a
+    double quote. Here sshd reads `a`, then the first backslash as a literal
+    one, then `\"` as an escaped quote -- so the value runs to the end of the
+    line and sshd throws the line out with "missing end quote" instead of
+    finding a key on it.
+    """
+    blob = _blob("ssh-ed25519")
+    opts, rest = audit.split_options(rf'command="a\\" ssh-ed25519 {blob} c')
+    assert rest == ""
+    assert audit.check_options(opts) == "missing end quote"
+
+
+def test_split_options_escaped_quote_after_a_literal_backslash():
+    r"""The same line with the escaped quote closed: the key material survives intact."""
+    blob = _blob("ssh-ed25519")
+    opts, rest = audit.split_options(rf'command="a\\\" b" ssh-ed25519 {blob} c')
+    assert opts == [r'command="a\\\" b"']
+    assert rest == f"ssh-ed25519 {blob} c"
+    assert audit.check_options(opts) is None
+
+
 def test_split_options_only_options_is_malformed():
     opts, rest = audit.split_options("no-pty,restrict")
     assert opts == ["no-pty", "restrict"]
@@ -113,6 +138,8 @@ def test_split_options_only_options_is_malformed():
         pytest.param([r'command="a\b"'], id="a backslash before anything but a quote is literal"),
         pytest.param(['tunnel="ANY"'], id="any tun device, case-insensitive"),
         pytest.param(['expiry-time="whatever"'], id="expiry-time contents are not checked"),
+        pytest.param(["cert-authority", 'principals="x"'], id="principals after cert-authority"),
+        pytest.param(['principals="x"', "cert-authority"], id="principals before cert-authority"),
         pytest.param(['permitlisten="not a port"'], id="permitlisten contents are not checked"),
     ],
 )
@@ -147,6 +174,12 @@ def test_check_options_accepts_a_rich_line_split_by_split_options():
         pytest.param(['environment="FOO"'], "invalid environment string", id="environment with no ="),
         pytest.param(['environment="a-b=c"'], "invalid environment string", id="punctuation in an environment name"),
         pytest.param(['environment="=x"'], "invalid environment string", id="empty environment name"),
+        pytest.param(['principals="x"'], "principals on non-CA key", id="principals needs cert-authority beside it"),
+        pytest.param(
+            ["no-pty", 'principals="x"', "restrict"],
+            "principals on non-CA key",
+            id="restrict does not stand in for cert-authority",
+        ),
         pytest.param(['tunnel="x"'], "invalid tun device", id="non-numeric tun device"),
         pytest.param(['tunnel="-1"'], "invalid tun device", id="negative tun device"),
         pytest.param(['tunnel="2147483646"'], "invalid tun device", id="one above the largest tun device number"),

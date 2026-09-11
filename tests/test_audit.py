@@ -1157,6 +1157,230 @@ def test_host_keys_from_config(keys: dict[str, Path], tmp_path: Path):
     assert "(none)" not in by_path  # an Ed25519 key is present, so no "missing Ed25519" entry
 
 
+def test_host_key_naming_a_public_key_file_with_an_agent_is_info(keys: dict[str, Path], tmp_path: Path):
+    """With HostKeyAgent set, a public-key HostKey is how sshd is told which agent key to serve.
+
+    sshd tries sshkey_load_private() on every HostKey, falls back to
+    sshkey_load_public(), and with an agent configured logs "will rely on agent
+    for hostkey" and serves that key (sshd.c). The private half is not on disk,
+    so there are no permissions, no passphrase and no `.pub` sibling to check --
+    not even at mode 0644, which on a private key file would be a CRITICAL, and
+    not even when a `.pub` file for a different key does sit next to it.
+    """
+    hk = tmp_path / "ssh_host_ed25519_key.pub"
+    hk.write_text(pub(keys["ed25519"]) + "\n")
+    hk.chmod(0o644)
+    # A `.pub` sibling holding a different key entirely. On a private key file
+    # this is a LOW "does not match this private key"; here there is no private
+    # key to compare it against, so the check must not run at all.
+    hk.with_name(hk.name + ".pub").write_text(pub(keys["rsa4096"]) + "\n")
+
+    config = {"hostkey": [str(hk)], "hostkeyagent": ["/run/host-key-agent.sock"]}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(hk))
+    assert (finding.key_type, finding.bits) == ("ED25519", 256)
+    assert finding.fingerprint
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        ("INFO", "public key file; the private half is held by HostKeyAgent and cannot be audited here")
+    ]
+    assert not any("does not match" in i.message for i in finding.issues)
+    # sshd serves this key through the agent, so it counts as the host's Ed25519 key.
+    assert not any(f.path == "(none)" for f in findings)
+
+
+def test_host_key_held_by_an_agent_is_still_graded(keys: dict[str, Path], tmp_path: Path):
+    """An agent-held key is still a key sshd serves, so its algorithm and size are graded."""
+    hk = tmp_path / "ssh_host_rsa_key.pub"
+    hk.write_text(pub(keys["rsa1024"]) + "\n")
+
+    config = {"hostkey": [str(hk)], "hostkeyagent": ["/run/host-key-agent.sock"]}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(hk))
+    assert any("below 2048" in m for m in _by_sev(finding.issues)["CRITICAL"])
+
+
+@pytest.mark.parametrize(
+    "config_extra",
+    [
+        pytest.param({}, id="HostKeyAgent absent"),
+        pytest.param({"hostkeyagent": ["none"]}, id="HostKeyAgent none"),
+        pytest.param({"hostkeyagent": ["None"]}, id="HostKeyAgent None, any case"),
+    ],
+)
+def test_host_key_naming_a_public_key_file_without_an_agent_is_low(
+    keys: dict[str, Path], tmp_path: Path, config_extra: dict[str, list[str]]
+):
+    """Without an agent a public-key HostKey is unusable, and it is not a private key file either.
+
+    Verified against OpenSSH 10.2: `sshd -t` with such a HostKey prints
+    "Unable to load host key: <path>" and, with no other key configured,
+    "no hostkeys available -- exiting". So the permission and passphrase
+    checks -- which are about private key files -- must not run on it, and the
+    key's type must not count as a type the host can offer.
+    """
+    hk = tmp_path / "ssh_host_ed25519_key.pub"
+    hk.write_text(pub(keys["ed25519"]) + "\n")
+    hk.chmod(0o644)
+
+    config = {"hostkey": [str(hk)], **config_extra}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(hk))
+    assert (finding.key_type, finding.bits) == ("ED25519", 256)
+    assert finding.fingerprint
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        (
+            "LOW",
+            "HostKey names a public key file and no HostKeyAgent is set; sshd cannot load a private key from it",
+        )
+    ]
+    # sshd has no usable Ed25519 key from this line, so the Ed25519 note still fires.
+    assert any(f.path == "(none)" and "Ed25519" in f.issues[0].message for f in findings)
+
+
+def test_host_key_naming_a_public_key_file_without_an_agent_is_not_graded(keys: dict[str, Path], tmp_path: Path):
+    """sshd can never use the key, so grading its size would imply the host offers something it does not.
+
+    An RSA-1024 private host key is a CRITICAL. Named as a public file with no
+    agent, it is only the LOW saying sshd cannot load a private key from it:
+    there is nothing for an attacker to reach, because sshd never serves it.
+    """
+    hk = tmp_path / "ssh_host_rsa_key.pub"
+    hk.write_text(pub(keys["rsa1024"]) + "\n")
+
+    findings = audit.audit_host_keys({"hostkey": [str(hk)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(hk))
+    assert (finding.key_type, finding.bits) == ("RSA", 1024)
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        (
+            "LOW",
+            "HostKey names a public key file and no HostKeyAgent is set; sshd cannot load a private key from it",
+        )
+    ]
+
+
+def _ed25519_host_certificate(tmp_path: Path, name: str) -> Path:
+    """Sign a fresh ed25519 host key with a fresh CA and return the certificate file's path."""
+
+    def keygen(path: Path, *extra: str) -> None:
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(path), *extra],
+            check=True,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+        )
+
+    ca = tmp_path / f"{name}-ca"
+    host_key = tmp_path / name
+    keygen(ca)
+    keygen(host_key)
+    subprocess.run(
+        ["ssh-keygen", "-q", "-s", str(ca), "-I", "test", "-h", str(host_key) + ".pub"],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    return host_key.with_name(host_key.name + "-cert.pub")
+
+
+@pytest.mark.parametrize(
+    "config_extra",
+    [
+        pytest.param({}, id="no HostKeyAgent"),
+        pytest.param({"hostkeyagent": ["/run/host-key-agent.sock"]}, id="HostKeyAgent set"),
+    ],
+)
+def test_host_key_naming_a_certificate_file_is_low(tmp_path: Path, config_extra: dict[str, list[str]]):
+    """A certificate is not a host key sshd can load, with or without an agent.
+
+    The "will rely on agent for hostkey" fallback in sshd.c is only taken for a
+    plain key type, so a certificate named by HostKey is unusable either way.
+    Verified against OpenSSH 10.2 with a live agent holding both the key and
+    its certificate: `sshd -t` still logs "Unable to load host key" for the
+    certificate file and exits with "no hostkeys available", while the same
+    setup with the plain `.pub` file loads the key through the agent. So the
+    key's type must not count as one the host can offer, and grading its
+    algorithm and size would wrongly imply it does something.
+    """
+    cert = _ed25519_host_certificate(tmp_path, "ssh_host_ed25519_key")
+
+    config = {"hostkey": [str(cert)], **config_extra}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(cert))
+    assert finding.key_type == "ED25519-CERT"
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        (
+            "LOW",
+            "HostKey names a certificate file; sshd cannot load a host key from it "
+            "(a certificate belongs on a HostCertificate line)",
+        )
+    ]
+    # The Ed25519 inside the certificate is not a host key sshd can serve, so
+    # the "no Ed25519 host key present" note still fires.
+    assert any(f.path == "(none)" and "Ed25519" in f.issues[0].message for f in findings)
+
+
+def test_server_config_warns_when_a_host_key_agent_is_set():
+    """Keys an agent holds are not on disk, so the report has to say they were not audited."""
+    _, coverage = audit.audit_server_config({"hostkeyagent": ["/run/agent.sock"]}, "sshd -T", "")
+    assert (
+        "HostKeyAgent is set (/run/agent.sock); private host keys held by the agent "
+        "are not on disk and cannot be audited." in coverage
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [pytest.param({}, id="absent"), pytest.param({"hostkeyagent": ["none"]}, id="none")],
+)
+def test_server_config_says_nothing_about_an_unset_host_key_agent(config: dict[str, list[str]]):
+    _, coverage = audit.audit_server_config(config, "sshd -T", "")
+    assert not any("HostKeyAgent" in c for c in coverage)
+
+
+def test_host_key_group_accessible_and_root_owned_is_refused_by_sshd(keys: dict[str, Path], tmp_path: Path):
+    """sshkey_perm_ok() refuses a key over its mode only when the account running sshd owns it.
+
+    Here the expected owner does own the file, which is the production case of a
+    root-owned host key read by a root sshd, so sshd turns it down.
+    """
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o640)
+
+    findings = audit.audit_host_keys({"hostkey": [str(ed)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(ed))
+    assert _by_sev(finding.issues)["HIGH"] == ["group-accessible private key (mode 0640); sshd refuses to load it"]
+
+
+def test_host_key_not_owned_by_root_is_loaded_anyway(keys: dict[str, Path], tmp_path: Path):
+    """A host key somebody else owns is loaded whatever its mode, so the message must not claim otherwise.
+
+    sshkey_perm_ok() only looks at the mode when the file belongs to the uid
+    running the program; sshd runs as root, so another account's host key is
+    read regardless -- and that account, plus anyone its mode admits, can read
+    and replace the server's identity key.
+    """
+    if os.getuid() == 0:
+        pytest.skip("running as root: the file IS root-owned, so there is no mismatch to observe")
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o640)
+
+    findings = audit.audit_host_keys({"hostkey": [str(ed)]}, min_rsa_bits=3072)  # owner_uid defaults to root
+
+    finding = next(f for f in findings if f.path == str(ed))
+    assert _by_sev(finding.issues)["HIGH"] == [
+        f"owned by {audit.uid_name(os.getuid())}, expected root",
+        "group-accessible private key (mode 0640); sshd still loads it because root does not own it",
+    ]
+
+
 def test_host_keys_default_owner_is_root(keys: dict[str, Path], tmp_path: Path):
     """Without an injected owner_uid, a host key not owned by root is a HIGH."""
     if os.getuid() == 0:
@@ -1598,6 +1822,34 @@ def test_a_key_on_a_rejected_line_is_not_counted_as_reused(keys: dict[str, Path]
     ]
 
 
+def test_authorized_keys_principals_without_cert_authority_is_reported_not_counted(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """sshd denies a line that lists principals on a key it is not told is a CA.
+
+    auth_authorise_keyopts() (auth2-pubkeyfile.c) turns such a line down with
+    "principals on non-CA key", so the key on it authorises nobody. The same
+    options with cert-authority beside them are fine, and that line is counted.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(
+        alice,
+        [
+            f'principals="admin" {pub(keys["ed25519"])}',
+            f'cert-authority,principals="admin" {pub(keys["rsa4096"])}',
+        ],
+    )
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 1
+    assert _by_sev(files[0].issues)["LOW"] == [
+        "line 1: bad key options (principals on non-CA key); sshd rejects the whole line"
+    ]
+    assert [f.line_number for f in found] == [2]
+
+
 def test_authorized_keys_rich_valid_options_are_counted_and_graded(keys: dict[str, Path], tmp_path: Path):
     """The clean case: every option shape sshd accepts leaves the line counted and graded as usual."""
     alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
@@ -2017,7 +2269,10 @@ def test_authorized_keys_none_entry_is_skipped_per_entry_not_whole_list(keys: di
 
     "none .ssh/authorized_keys2" must scan authorized_keys2 and skip a file
     that happens to be named "none" -- and must not produce the "AuthorizedKeysFile
-    is 'none'" coverage line, since some files are still being read.
+    is 'none'" coverage line, since some files are still being read. It gets the
+    "mixes 'none' with other entries" warning instead, because OpenSSH's
+    current development code refuses to start on that configuration, so a
+    future upgrade may stop sshd from starting.
     """
     alice = make_user("alice", os.getuid(), tmp_path / "alice")
     mkdir_clean(Path(alice.pw_dir) / ".ssh", tmp_path)
@@ -2035,7 +2290,75 @@ def test_authorized_keys_none_entry_is_skipped_per_entry_not_whole_list(keys: di
     assert patterns == [".ssh/authorized_keys2"]
     assert [f.file_path for f in files] == [str(ak2)]
     assert [k.key_type for k in ak] == ["ED25519"]
-    assert coverage == []
+    assert len(coverage) == 1
+    assert coverage[0].startswith("AuthorizedKeysFile mixes 'none' with other entries (none .ssh/authorized_keys2)")
+    assert not any("AuthorizedKeysFile is 'none'" in c for c in coverage)
+
+
+def test_authorized_keys_mixed_none_warns_once_not_per_account(keys: dict[str, Path], tmp_path: Path):
+    """A global value mixing 'none' with real paths is one warning, however many accounts there are.
+
+    `sshd -T -C user=<name>` echoes the global AuthorizedKeysFile for every
+    account, so a per-account check on its own would repeat the same warning
+    once per account.
+    """
+    users = [make_user(name, USER_UID, tmp_path / "home" / name) for name in ("alice", "bob", "carol")]
+    for user in users:
+        mkdir_clean(Path(user.pw_dir), tmp_path)
+        _write_ak(user, [pub(keys["ed25519"])])
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        return {"authorizedkeysfile": ["none .ssh/authorized_keys"]}
+
+    _, files, ak, _, coverage = audit.audit_authorized_keys(
+        {"authorizedkeysfile": ["none .ssh/authorized_keys"]}, 3072, users=users, user_config=user_config
+    )
+
+    assert len(coverage) == 1
+    assert coverage[0] == (
+        "AuthorizedKeysFile mixes 'none' with other entries (none .ssh/authorized_keys); "
+        "released sshd versions skip just the 'none' entry and this audit does the same, "
+        "but OpenSSH's current development code rejects the whole configuration, "
+        "so a future upgrade may stop sshd from starting."
+    )
+    # The entries that are not 'none' are still scanned for every account.
+    assert {f.user for f in files} == {"alice", "bob", "carol"}
+    assert {k.user for k in ak} == {"alice", "bob", "carol"}
+
+
+def test_authorized_keys_match_block_mixed_none_names_the_account(keys: dict[str, Path], tmp_path: Path):
+    """A Match block that mixes 'none' in for one account is warned about for that account."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    for user in (alice, bob):
+        mkdir_clean(Path(user.pw_dir), tmp_path)
+        _write_ak(user, [pub(keys["ed25519"])])
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        # {} for alice is a successful sshd -T -C run that sets nothing special for her.
+        return {"authorizedkeysfile": ["none .ssh/authorized_keys"]} if user.pw_name == "bob" else {}
+
+    _, files, ak, _, coverage = audit.audit_authorized_keys({}, 3072, users=[alice, bob], user_config=user_config)
+
+    assert len(coverage) == 1
+    assert coverage[0].startswith(
+        "AuthorizedKeysFile mixes 'none' with other entries for bob (Match block) (none .ssh/authorized_keys)"
+    )
+    # bob's real entry is still scanned, and alice is not mentioned at all.
+    assert {f.user for f in files} == {"alice", "bob"}
+    assert {k.user for k in ak} == {"alice", "bob"}
+    assert "alice" not in coverage[0]
+
+
+def test_authorized_keys_unmixed_values_get_no_mixed_none_warning(keys: dict[str, Path], tmp_path: Path):
+    """Neither a plain 'none' nor an ordinary value is a mixed value, so neither earns that warning."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [pub(keys["ed25519"])])
+
+    for value in ("none", ".ssh/authorized_keys", ".ssh/authorized_keys .ssh/authorized_keys2"):
+        _, _, _, _, coverage = audit.audit_authorized_keys({"authorizedkeysfile": [value]}, 3072, users=[alice])
+        assert not any("mixes 'none'" in c for c in coverage), value
 
 
 def test_authorized_keys_empty_pw_dir_does_not_read_cwd(

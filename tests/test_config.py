@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import pwd
 import stat
 from pathlib import Path
 
@@ -248,6 +250,215 @@ def test_fallback_parser_relative_include_is_read_from_the_config_directory(
     monkeypatch.setattr(audit, "SSHD_CONFIG_DIR", tmp_path)
     config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
     assert config["permitrootlogin"] == ["no"]
+
+
+# --- _split_config_args and the fallback parser's argument handling ----------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("a b", ["a", "b"]),
+        ("  a\t\tb  ", ["a", "b"]),  # leading and repeated whitespace is skipped
+        ("", []),
+        ("# all comment", []),
+        ("a # comment", ["a"]),  # a '#' starting an argument ends the line
+        ("a#b", ["a#b"]),  # a '#' inside an argument is an ordinary character
+        ('"/dir with space/ak"', ["/dir with space/ak"]),
+        ("'single quoted'", ["single quoted"]),
+        ('a"b c"d', ["ab cd"]),  # quotes group text and are removed, mid-argument too
+        ('a\\"b', ['a"b']),  # \" is an escaped double quote
+        ("a\\'b", ["a'b"]),
+        ("a\\\\b", ["a\\b"]),  # \\ is an escaped backslash
+        ("a\\ b", ["a b"]),  # outside quotes, \<space> is an escaped space
+        ("x\\yz", ["x\\yz"]),  # any other backslash is a literal backslash
+        ("a\\", ["a\\"]),  # a trailing backslash escapes nothing
+        ('"a\\ b"', ["a\\ b"]),  # inside quotes, \<space> is not an escape
+        ('"unterminated', None),
+        ("'", None),
+        ('""', [""]),  # an empty argument, which sshd rejects for the keywords it matters to
+    ],
+)
+def test_split_config_args_matches_sshd(text: str, expected: list[str] | None):
+    """_split_config_args mirrors sshd's argv_split(), including its unclosed-quote error."""
+    assert audit._split_config_args(text) == expected
+
+
+def test_fallback_parser_strips_an_inline_comment(tmp_path: Path):
+    """sshd ends a line at a '#' that starts an argument, so the comment is not part of the value."""
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("StrictModes no # reason we turned it off\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["strictmodes"] == ["no"]
+
+
+def test_fallback_parser_keeps_a_hash_inside_an_argument(tmp_path: Path):
+    """A '#' that does not start an argument is an ordinary character to sshd."""
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("AuthorizedKeysFile .ssh/keys#1\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["authorizedkeysfile"] == [".ssh/keys#1"]
+
+
+def test_fallback_parser_keyword_with_only_a_comment_after_it_is_skipped(tmp_path: Path):
+    """A keyword whose only argument is a comment has no value at all, and sshd refuses such a line."""
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("StrictModes # nothing here\nPermitRootLogin no\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert "strictmodes" not in config
+    assert config["permitrootlogin"] == ["no"]
+
+
+def test_fallback_parser_keeps_a_quoted_path_with_a_space(tmp_path: Path):
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text('AuthorizedKeysFile "/x/dir with space/ak"\n')
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["authorizedkeysfile"] == ["/x/dir with space/ak"]
+
+
+def test_fallback_parser_honours_backslash_escapes(tmp_path: Path):
+    r"""\" is a double quote and \\ is a single backslash, as sshd's argv_split() reads them."""
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text('AuthorizedKeysFile a\\"b c\\\\d\n')
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    # Two arguments, stored joined with a single space the way `sshd -T` prints them.
+    assert config["authorizedkeysfile"] == ['a"b c\\d']
+
+
+def test_fallback_parser_skips_a_line_with_an_unclosed_quote(tmp_path: Path):
+    """sshd refuses the whole config over an unclosed quote, so the line is skipped -- but the file is read on."""
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text('AuthorizedKeysFile "/unterminated\nStrictModes no\n')
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert "authorizedkeysfile" not in config
+    assert config["strictmodes"] == ["no"]
+
+
+def test_fallback_parser_expands_a_leading_tilde(tmp_path: Path):
+    """sshd tilde-expands AuthorizedKeysFile and HostKey arguments against the uid running it."""
+    running_home = pwd.getpwuid(os.getuid()).pw_dir.rstrip("/")
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("AuthorizedKeysFile ~/keys/%u\nHostKey ~/hostkey\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["authorizedkeysfile"] == [f"{running_home}/keys/%u"]
+    assert config["hostkey"] == [f"{running_home}/hostkey"]
+
+
+def test_fallback_parser_expands_a_tilde_account_name(tmp_path: Path):
+    """'~name' is that account's home directory, which sshd looks up the same way."""
+    running = pwd.getpwuid(os.getuid())
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f"AuthorizedKeysFile ~{running.pw_name}/keys\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["authorizedkeysfile"] == [f"{running.pw_dir.rstrip('/')}/keys"]
+
+
+def test_fallback_parser_leaves_an_unknown_tilde_account_alone(tmp_path: Path):
+    """There is no home directory to expand to for an account that does not exist, and sshd refuses the config."""
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("AuthorizedKeysFile ~no-such-account-here/keys\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["authorizedkeysfile"] == ["~no-such-account-here/keys"]
+
+
+def test_fallback_parser_makes_a_relative_hostkey_absolute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """sshd resolves a relative HostKey against its own working directory; the fallback can only use this one."""
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("HostKey etc/ssh_host_ed25519_key\nAuthorizedKeysFile .ssh/authorized_keys\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["hostkey"] == [str(tmp_path / "etc" / "ssh_host_ed25519_key")]
+    # Only HostKey is made absolute: an AuthorizedKeysFile pattern is relative
+    # to each account's home directory, and is expanded per account later.
+    assert config["authorizedkeysfile"] == [".ssh/authorized_keys"]
+
+
+def test_fallback_parser_leaves_hostkey_none_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """sshd's derelativise_path() checks for 'none' first and does not turn it into a path."""
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("HostKey none\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["hostkey"] == ["none"]
+
+
+def test_fallback_parser_leaves_a_tilde_alone_when_the_running_uid_has_no_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A uid with no passwd entry (a container started with an arbitrary uid) has no home to expand to."""
+
+    def no_such_uid(uid: int) -> pwd.struct_passwd:
+        raise KeyError(f"getpwuid(): uid not found: {uid}")
+
+    monkeypatch.setattr(audit.pwd, "getpwuid", no_such_uid)
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("AuthorizedKeysFile ~/keys/%u\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["authorizedkeysfile"] == ["~/keys/%u"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param("StrictModes=no", id="no spaces"),
+        pytest.param("StrictModes = no", id="spaces either side"),
+        pytest.param("StrictModes =no", id="space before only"),
+        pytest.param("StrictModes= no", id="space after only"),
+    ],
+)
+def test_fallback_parser_accepts_an_equals_separator(tmp_path: Path, line: str):
+    """sshd accepts `Keyword=value`, with or without spaces around the `=`, as well as `Keyword value`.
+
+    strdelim_internal() (misc.c) skips the first '=' it finds and the
+    whitespace on either side of it, so all four spellings give the same value.
+    Verified against OpenSSH 10.2: `sshd -T` prints `strictmodes no` for each.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(line + "\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["strictmodes"] == ["no"]
+
+
+def test_fallback_parser_keeps_a_second_equals_in_the_value(tmp_path: Path):
+    """Only one '=' is ever skipped, and it is the one that ends the keyword.
+
+    strdelim_internal() (misc.c) skips an '=' after the keyword only when the
+    keyword did not already end at one, so "StrictModes==no" has the value
+    "=no". Verified against OpenSSH 10.2, which refuses the config with
+    `unsupported option "=no"` -- which is why the fallback parser is the code
+    that reads such a file, and why it must not quietly read it as "no".
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("StrictModes==no\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["strictmodes"] == ["=no"]
+
+
+def test_fallback_parser_strips_the_equals_from_a_path_value(tmp_path: Path):
+    """The '=' separator must not end up inside the value, which a path keyword would make visible."""
+    host_key = tmp_path / "ssh_host_ed25519_key"
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f"StrictModes = no\nHostKey = {host_key}\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["strictmodes"] == ["no"]
+    assert config["hostkey"] == [str(host_key)]
+
+
+def test_fallback_parser_skips_a_match_block_opened_by_a_malformed_match_line(tmp_path: Path):
+    """A Match line sshd would reject still opens a block, so its body must not be read as global config.
+
+    sshd refuses the whole configuration over the unclosed quote here
+    ("line 1: invalid quotes ... terminating, 1 bad configuration options",
+    verified against OpenSSH 10.2). The dangerous reading is to treat the
+    Match line as unusable and carry on: the block's own AuthorizedKeysFile
+    would become the global pattern, and no account's real file would ever be
+    scanned.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text('Match User "alice\nPermitRootLogin yes\nAuthorizedKeysFile .ssh/match_only\n')
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert "permitrootlogin" not in config
+    assert "authorizedkeysfile" not in config
 
 
 # --- audit_server_config ------------------------------------------------------
