@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import pwd
 import struct
 from pathlib import Path
 
@@ -192,6 +193,21 @@ def test_expand_pattern_relative_and_tokens(tmp_path: Path):
 def test_expand_pattern_literal_percent(tmp_path: Path):
     alice = make_user("alice", 1000, tmp_path)
     assert audit.expand_authorized_keys_pattern("/k/100%%/%u", alice) == "/k/100%/alice"
+
+
+def test_expand_pattern_empty_pw_dir_uses_filesystem_root():
+    """An empty pw_dir means the filesystem root to sshd, not the auditing process's cwd.
+
+    make_user stringifies its home argument, so an empty Path("") can't be
+    built through it (it would come out as "."). Build the passwd entry by
+    hand instead, the way a real account with no home directory looks.
+    """
+    nohome = pwd.struct_passwd(("nohome", "x", 1000, 1000, "nohome", "", "/bin/sh"))
+    assert audit.expand_authorized_keys_pattern(".ssh/authorized_keys", nohome) == "/.ssh/authorized_keys"
+    # %h substitutes the raw (empty) pw_dir, giving "" + "/.ssh/authorized_keys" --
+    # already absolute, so it is returned as-is. Same result as above, both ways,
+    # because sshd's own expand_authorized_keys works the same way.
+    assert audit.expand_authorized_keys_pattern("%h/.ssh/authorized_keys", nohome) == "/.ssh/authorized_keys"
 
 
 # --- cfg_value ---------------------------------------------------------------

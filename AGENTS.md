@@ -106,8 +106,8 @@ These standards apply to ALL project Python code **including tests**.
 
 ## Markdown Style
 
-- All markdown must pass VSCode's default markdownlint config
-  - VScode projects must be configured with `"markdownlint.config": {"MD024": false}` to allow for proper changelog headings
+- All markdown must pass VS Code's default markdownlint config
+  - VS Code projects must be configured with `"markdownlint.config": {"MD024": false}` to allow for proper changelog headings
 
 ## GitHub releases
 

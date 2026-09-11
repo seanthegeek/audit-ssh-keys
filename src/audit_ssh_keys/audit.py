@@ -87,8 +87,12 @@ WEAK_SIG_ALGORITHMS = {
     "ssh-rsa-cert-v01@openssh.com": "RSA certificate with SHA-1 signatures",
 }
 
+# First and last line of a key file in OpenSSH's own private key format.
+OPENSSH_PRIVATE_KEY_HEADER = "-----BEGIN OPENSSH PRIVATE KEY-----"
+OPENSSH_PRIVATE_KEY_FOOTER = "-----END OPENSSH PRIVATE KEY-----"
+
 PRIVATE_KEY_HEADERS = (
-    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    OPENSSH_PRIVATE_KEY_HEADER,
     "-----BEGIN RSA PRIVATE KEY-----",
     "-----BEGIN DSA PRIVATE KEY-----",
     "-----BEGIN EC PRIVATE KEY-----",
@@ -354,6 +358,29 @@ def cfg_value(config: dict[str, list[str]], key: str, default: str) -> str:
     return values[0] if values else default
 
 
+def _without_none(patterns: list[str]) -> list[str]:
+    """A parsed AuthorizedKeysFile value with every 'none' entry (any case) dropped.
+
+    sshd's user_key_allowed() loop (auth2-pubkey.c) checks each
+    AuthorizedKeysFile entry against "none" with strcasecmp and skips just
+    that entry, not only when the whole value is "none" -- so
+    "none .ssh/authorized_keys2" scans authorized_keys2 and skips a file
+    actually named "none".
+    """
+    return [p for p in patterns if p.lower() != "none"]
+
+
+def home_dir(user: pwd.struct_passwd) -> Path:
+    """The directory to treat as an account's home for filesystem lookups.
+
+    An empty pw_dir field (a real, if unusual, passwd entry) means the
+    filesystem root to sshd and to login -- not the current working directory
+    of whatever process happens to be looking, which is what plain
+    Path(user.pw_dir) would resolve to when pw_dir is "".
+    """
+    return Path(user.pw_dir or "/")
+
+
 def expand_authorized_keys_pattern(pattern: str, user: pwd.struct_passwd) -> str:
     """Expand sshd AuthorizedKeysFile tokens (%%, %h, %u, %U) for one account."""
     path = (
@@ -364,7 +391,7 @@ def expand_authorized_keys_pattern(pattern: str, user: pwd.struct_passwd) -> str
         .replace("\x00", "%")
     )
     if not path.startswith("/"):
-        path = str(Path(user.pw_dir) / path)
+        path = str(home_dir(user) / path)
     return path
 
 
@@ -447,19 +474,29 @@ def _read_string(buf: bytes, offset: int) -> tuple[bytes, int]:
     return buf[offset:end], end
 
 
-def _openssh_private_key_lines(path: Path) -> list[str] | None:
-    """Read a file's stripped, non-blank lines if it is an OpenSSH-format private key.
+def _stripped_lines(path: Path) -> list[str] | None:
+    """Read a file and return its non-blank lines with surrounding whitespace removed.
 
-    Returns None when the file cannot be read, or its first non-blank line is
-    not the OpenSSH private-key header (for example a PEM/PKCS#8 key, or
-    anything that is not a key at all).
+    Returns None when the file cannot be read.
     """
     try:
         text = path.read_text(errors="ignore")
     except OSError:
         return None
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines or lines[0] != "-----BEGIN OPENSSH PRIVATE KEY-----":
+    return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+
+def _openssh_private_key_lines(path: Path) -> list[str] | None:
+    """Read a file's stripped, non-blank lines if it is a complete OpenSSH-format private key.
+
+    Returns None when the file cannot be read, when its first non-blank line is
+    not the OpenSSH private-key header (for example a PEM/PKCS#8 key, or
+    anything that is not a key at all), or when its last non-blank line is not
+    the matching footer -- a missing footer means the file was cut short, and
+    ssh cannot load a key that stops partway through.
+    """
+    lines = _stripped_lines(path)
+    if not lines or lines[0] != OPENSSH_PRIVATE_KEY_HEADER or lines[-1] != OPENSSH_PRIVATE_KEY_FOOTER:
         return None
     return lines
 
@@ -470,17 +507,22 @@ def _is_openssh_format(path: Path) -> bool:
     Used to tell a corrupt OpenSSH-format key (which must be reported as
     unfingerprintable, not confused with whatever `.pub` file happens to sit
     next to it) apart from the older PEM/PKCS#8 formats, where falling back
-    to a `.pub` file is the intended behaviour.
+    to a `.pub` file is the intended behaviour. Only the header is checked, so
+    a file that is in this format but cut short -- missing its footer line,
+    say -- still counts as one, which is what keeps it from falling back to a
+    `.pub` file that says nothing about it.
     """
-    return _openssh_private_key_lines(path) is not None
+    lines = _stripped_lines(path)
+    return bool(lines) and lines[0] == OPENSSH_PRIVATE_KEY_HEADER
 
 
 def _openssh_key_blob(path: Path) -> bytes | None:
     """Decode an OpenSSH-format private key file and return everything after the magic string.
 
     Returns None when the file cannot be read, is not in OpenSSH's own private
-    key format, or its base64 body is corrupt or does not start with the
-    expected "openssh-key-v1" marker.
+    key format, stops before its closing "-----END OPENSSH PRIVATE KEY-----"
+    line, or its base64 body is corrupt or does not start with the expected
+    "openssh-key-v1" marker.
     """
     lines = _openssh_private_key_lines(path)
     if lines is None:
@@ -505,8 +547,12 @@ def public_key_from_private(path: Path) -> str | None:
     passphrase and without ssh-keygen having to open the file (which it refuses
     to do when the file is readable by anyone else).
 
-    Returns None for anything that is not an OpenSSH-format private key, or
-    whose contents are truncated or otherwise unreadable.
+    Returns None for anything that is not an OpenSSH-format private key, and
+    for any such file that ssh itself would not load: one truncated anywhere --
+    in its public half, in the private half that follows it, or at the footer
+    line -- one claiming any number of keys other than one, and one carrying
+    extra bytes after the private half. A key ssh cannot load must not be
+    reported as a healthy key.
     """
     blob = _openssh_key_blob(path)
     if blob is None:
@@ -516,9 +562,19 @@ def public_key_from_private(path: Path) -> str | None:
         _kdf, offset = _read_string(blob, offset)
         _kdf_options, offset = _read_string(blob, offset)
         nkeys, offset = _read_uint32(blob, offset)
-        if nkeys < 1:
+        if nkeys != 1:
+            # The format can hold a count other than one, but ssh itself only
+            # loads single-key files, so no other count is a usable key.
             return None
-        public_blob, _ = _read_string(blob, offset)
+        public_blob, offset = _read_string(blob, offset)
+        # The private half comes last. Its contents are not read here (they are
+        # encrypted when the key has a passphrase), but it has to be there in
+        # full: a file that stops inside it is one ssh cannot load.
+        _private_data, end = _read_string(blob, offset)
+        if end != len(blob):
+            # ssh refuses a file with bytes after the private half. (The padding
+            # that rounds the key out sits inside that half, not after it.)
+            return None
         key_type, _ = _read_string(public_blob, 0)
         name = key_type.decode("ascii")
     except ValueError:  # UnicodeDecodeError is a ValueError subclass
@@ -594,7 +650,7 @@ def private_key_is_encrypted(path: Path) -> bool | None:
         return None
     header = lines[0]
 
-    if header == "-----BEGIN OPENSSH PRIVATE KEY-----":
+    if header == OPENSSH_PRIVATE_KEY_HEADER:
         blob = _openssh_key_blob(path)
         if blob is None:
             return None
@@ -964,13 +1020,18 @@ def audit_authorized_keys(
     """
     patterns = cfg_value(config, "authorizedkeysfile", " ".join(DEFAULT_AUTHORIZED_KEYS_PATTERNS)).split()
     coverage: list[str] = []
-    if patterns == ["none"]:
-        patterns = []
+    remaining = _without_none(patterns)
+    if not remaining and patterns:
         coverage.append("AuthorizedKeysFile is 'none'; sshd reads no authorized_keys files.")
+    patterns = remaining
 
     files: list[FileFinding] = []
     keys: list[AuthorizedKeyFinding] = []
     fp_locations: dict[str, list[str]] = defaultdict(list)
+    # Which accounts each key is authorized for. The same key listed twice for
+    # one account is untidy but grants nothing extra, so it is graded lower
+    # than the same key shared between two accounts.
+    fp_users: dict[str, set[str]] = defaultdict(set)
     # (account, path): sshd consults a shared absolute path for every account,
     # so the same file has to be scanned once per account -- but a pattern
     # listed twice for one account is still only scanned once.
@@ -986,7 +1047,8 @@ def audit_authorized_keys(
                 user_patterns = cfg_value(
                     account_config, "authorizedkeysfile", " ".join(DEFAULT_AUTHORIZED_KEYS_PATTERNS)
                 ).split()
-        if user_patterns == ["none"]:
+        user_remaining = _without_none(user_patterns)
+        if not user_remaining and user_patterns:
             # An account's effective AuthorizedKeysFile can be 'none' for two
             # different reasons: a Match block actually sets it for this one
             # account, or the global AuthorizedKeysFile is already 'none', in
@@ -1001,6 +1063,7 @@ def audit_authorized_keys(
                     "sshd reads no authorized_keys files for that account."
                 )
             continue
+        user_patterns = user_remaining
 
         for pattern in user_patterns:
             path = Path(expand_authorized_keys_pattern(pattern, user))
@@ -1046,19 +1109,50 @@ def audit_authorized_keys(
                     comment=comment,
                     options=options,
                 )
-                finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
-                finding.issues.extend(grade_options(options, user))
+                if key_type.upper().endswith("-CERT"):
+                    # auth_check_authkey_line() (auth2-pubkeyfile.c) matches a plain
+                    # presented key only against the line itself, and a presented
+                    # certificate only against a cert-authority line holding the
+                    # CA's plain key. A line whose own blob is a certificate --
+                    # what ssh-keygen -l labels "<TYPE>-CERT" -- matches neither, so
+                    # it never grants access; grading its size/algorithm or its
+                    # options would wrongly imply it does something.
+                    finding.issues.append(
+                        Issue(
+                            "INFO",
+                            "certificate listed in authorized_keys; sshd never matches a certificate here, "
+                            "so this line grants no access",
+                        )
+                    )
+                else:
+                    finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
+                    finding.issues.extend(grade_options(options, user))
                 keys.append(finding)
                 fp_locations[fingerprint].append(f"{user.pw_name} {path}:{idx}")
+                fp_users[fingerprint].add(user.pw_name)
 
             files.append(file_finding)
 
     duplicates = {fp: locs for fp, locs in fp_locations.items() if len(locs) > 1}
     for finding in keys:
-        if finding.fingerprint in duplicates:
-            here = f"{finding.user} {finding.file_path}:{finding.line_number}"
-            others = [loc for loc in duplicates[finding.fingerprint] if loc != here]
+        locations = duplicates.get(finding.fingerprint)
+        if locations is None:
+            continue
+        here = f"{finding.user} {finding.file_path}:{finding.line_number}"
+        others = [loc for loc in locations if loc != here]
+        if len(fp_users[finding.fingerprint]) > 1:
             finding.issues.append(Issue("MEDIUM", f"same key also authorized at: {', '.join(others)}"))
+        else:
+            # One account, several entries: whoever holds the private key could
+            # already log into this account, so nothing extra is granted. It
+            # still matters, because deleting one entry does not revoke the key.
+            finding.issues.append(
+                Issue(
+                    "LOW",
+                    f"same key also listed for this account at: {', '.join(others)}; "
+                    "removing one entry does not revoke it",
+                )
+            )
 
     return patterns, files, keys, duplicates, coverage
 
@@ -1078,7 +1172,7 @@ def audit_private_keys(
     seen: set[str] = set()
 
     for user in sorted(users if users is not None else pwd.getpwall(), key=lambda u: u.pw_uid):
-        ssh_dir = Path(user.pw_dir) / ".ssh"
+        ssh_dir = home_dir(user) / ".ssh"
         if not ssh_dir.is_dir() or str(ssh_dir) in seen:
             continue
         seen.add(str(ssh_dir))
@@ -1088,7 +1182,7 @@ def audit_private_keys(
             continue
 
         for path in entries:
-            if str(path) in host_key_paths or path.suffix == ".pub" or not looks_like_private_key(path):
+            if str(path) in host_key_paths or not looks_like_private_key(path):
                 continue
 
             encrypted = private_key_is_encrypted(path)
