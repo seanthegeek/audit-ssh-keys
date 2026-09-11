@@ -2039,18 +2039,49 @@ def test_a_key_on_a_rejected_line_is_not_counted_as_reused(keys: dict[str, Path]
     ]
 
 
-def test_authorized_keys_leading_comma_is_reported_not_counted(keys: dict[str, Path], tmp_path: Path):
-    """A leading comma leaves an empty option that matches no name, so sshd rejects the whole line."""
+def test_authorized_keys_leading_comma_is_accepted_and_counted(keys: dict[str, Path], tmp_path: Path):
+    """sshd's option loop skips the empty token left by a leading comma and accepts the line; a live OpenSSH
+    10.2 login confirmed ",no-pty <key>" is accepted."""
     alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
     mkdir_clean(Path(alice.pw_dir), tmp_path)
     _write_ak(alice, [f",no-pty {pub(keys['ed25519'])}"])
 
     _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
 
+    assert files[0].key_count == 1
+    assert not any("bad key options" in i.message for i in files[0].issues)
+    assert len(found) == 1
+    assert found[0].options == ["no-pty"]
+
+
+def test_authorized_keys_doubled_comma_is_accepted_and_counted(keys: dict[str, Path], tmp_path: Path):
+    """Same reasoning as the leading-comma case; a live OpenSSH 10.2 login confirmed "no-pty,,restrict <key>"
+    is accepted."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f"no-pty,,restrict {pub(keys['ed25519'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 1
+    assert not any("bad key options" in i.message for i in files[0].issues)
+    assert len(found) == 1
+    assert found[0].options == ["no-pty", "restrict"]
+
+
+def test_authorized_keys_unknown_option_after_a_comma_is_still_rejected(keys: dict[str, Path], tmp_path: Path):
+    """An empty token is skipped, but a real unmatched token still gets the whole line thrown out; a live
+    OpenSSH 10.2 login confirmed "no-pty,bogus <key>" is rejected."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f"no-pty,bogus {pub(keys['ed25519'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
     assert found == []
     assert files[0].key_count == 0
     assert _by_sev(files[0].issues)["LOW"] == [
-        'line 1: bad key options (unknown key option ""); sshd rejects the whole line'
+        'line 1: bad key options (unknown key option "bogus"); sshd rejects the whole line'
     ]
 
 

@@ -117,16 +117,18 @@ def test_split_options_only_options_is_malformed():
     assert rest == ""
 
 
-def test_split_options_leading_comma_keeps_an_empty_option():
-    """A leading comma leaves an empty option in the list, not nothing: sshd rejects the line over it."""
+def test_split_options_leading_comma_is_skipped():
+    """sshd's option loop has no final else, so an empty token just leaves it looking at a comma and skipping it;
+    a live OpenSSH 10.2 login accepted ",no-pty <key>"."""
     opts, rest = audit.split_options(",no-pty ssh-ed25519 AAAA")
-    assert opts == ["", "no-pty"]
+    assert opts == ["no-pty"]
     assert rest == "ssh-ed25519 AAAA"
 
 
-def test_split_options_doubled_comma_keeps_an_empty_option():
-    opts, rest = audit.split_options("no-pty,,no-x11-forwarding ssh-ed25519 AAAA")
-    assert opts == ["no-pty", "", "no-x11-forwarding"]
+def test_split_options_doubled_comma_is_skipped():
+    """Same reasoning as the leading-comma case; a live OpenSSH 10.2 login accepted "no-pty,,restrict <key>"."""
+    opts, rest = audit.split_options("no-pty,,restrict ssh-ed25519 AAAA")
+    assert opts == ["no-pty", "restrict"]
     assert rest == "ssh-ed25519 AAAA"
 
 
@@ -137,10 +139,11 @@ def test_split_options_trailing_comma_before_the_key_is_dropped():
     assert rest == "ssh-ed25519 AAAA"
 
 
-def test_split_options_trailing_comma_at_end_of_line_is_kept():
-    """With nothing after the comma, sshd reports "unexpected end-of-options": the empty option stays."""
+def test_split_options_options_only_trailing_comma_is_dropped():
+    """A comma at the very end of an options-only string is "unexpected end-of-options" to sshd, but such a
+    line has no key after the options and is already reported as malformed before options are checked."""
     opts, rest = audit.split_options("no-pty,")
-    assert opts == ["no-pty", ""]
+    assert opts == ["no-pty"]
     assert rest == ""
 
 
@@ -224,12 +227,6 @@ def test_check_options_rejects_what_sshd_rejects(options: list[str], reason: str
 
 def test_check_options_accepts_no_pty_alone():
     assert audit.check_options(["no-pty"]) is None
-
-
-def test_check_options_rejects_an_empty_option():
-    """An empty option -- from a leading or doubled comma -- is unknown, not a no-op."""
-    assert audit.check_options([""]) == 'unknown key option ""'
-    assert audit.check_options(["no-pty", ""]) == 'unknown key option ""'
 
 
 def test_check_options_rejects_a_typo_split_by_split_options():
