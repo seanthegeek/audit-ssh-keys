@@ -1238,6 +1238,19 @@ def split_options(line: str) -> tuple[list[str], str]:
     itself. A line whose second field is a key blob naming the same type as its
     first field has no options -- the same test sshd applies before it looks
     for options, so key types this tool has never seen still parse.
+
+    An empty option (an empty string between two commas, or before the first
+    comma) is kept in the returned list, because sshd treats it as a real,
+    unrecognized option name and throws the whole line out for it -- a leading
+    comma or a doubled comma is a broken line, not a no-op. The one exception
+    is a single trailing empty option made by a comma sitting right before the
+    space that ends the options. sshd's option loop stops as soon as it sees
+    that space, before it ever tries to read another option name, so a
+    trailing comma there is accepted and produces no empty option; this
+    function drops it too, so its result matches what sshd actually parsed. A
+    comma at the very end of a line with nothing after it is different: sshd
+    calls that "unexpected end-of-options" and rejects the line, so the empty
+    option is kept there (such a line has no key on it anyway).
     """
     stripped = line.strip()
     if _is_bare_key_line(stripped):
@@ -1269,13 +1282,22 @@ def split_options(line: str) -> tuple[list[str], str]:
             options.append("".join(current))
             current = []
         elif ch in " \t":
-            options.append("".join(current))
-            return [o for o in options if o], stripped[i:].strip()
+            # The space or tab that ends the options: a trailing comma just
+            # before it (current is empty) is dropped, not kept as an empty
+            # option -- see the docstring.
+            tail = "".join(current)
+            if tail:
+                options.append(tail)
+            return options, stripped[i:].strip()
         else:
             current.append(ch)
         i += 1
+    # End of the line while still reading options (no key material follows).
+    # A trailing comma here is kept as an empty option: sshd rejects it as
+    # "unexpected end-of-options" rather than stopping quietly -- see the
+    # docstring.
     options.append("".join(current))
-    return [o for o in options if o], ""
+    return options, ""
 
 
 # Options that take no value. sshd accepts each of these on its own, and each
@@ -1399,7 +1421,18 @@ def check_options(options: list[str]) -> str | None:
             if not sep or not _ENV_NAME_RE.fullmatch(env_name):
                 return "invalid environment string"
         elif name == "tunnel" and value.lower() != "any":
-            if not _TUN_NUMBER_RE.fullmatch(value) or not 0 <= int(value) <= _TUN_DEVICE_MAX:
+            if not _TUN_NUMBER_RE.fullmatch(value):
+                return "invalid tun device"
+            try:
+                tunnel_number = int(value)
+            except ValueError:
+                # Python refuses to convert a digit string longer than about
+                # 4300 characters (its integer-string-conversion limit); a tun
+                # device number that long is already far outside the range
+                # sshd allows, so treat it the same as any other out-of-range
+                # value instead of letting the conversion crash the audit.
+                return "invalid tun device"
+            if not 0 <= tunnel_number <= _TUN_DEVICE_MAX:
                 return "invalid tun device"
 
     lowered_options = [o.lower() for o in options]

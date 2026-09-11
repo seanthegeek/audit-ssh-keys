@@ -2039,6 +2039,35 @@ def test_a_key_on_a_rejected_line_is_not_counted_as_reused(keys: dict[str, Path]
     ]
 
 
+def test_authorized_keys_leading_comma_is_reported_not_counted(keys: dict[str, Path], tmp_path: Path):
+    """A leading comma leaves an empty option that matches no name, so sshd rejects the whole line."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f",no-pty {pub(keys['ed25519'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert found == []
+    assert files[0].key_count == 0
+    assert _by_sev(files[0].issues)["LOW"] == [
+        'line 1: bad key options (unknown key option ""); sshd rejects the whole line'
+    ]
+
+
+def test_authorized_keys_trailing_comma_before_the_key_is_accepted(keys: dict[str, Path], tmp_path: Path):
+    """A comma right before the key is sshd's option loop stopping, not an empty option -- the line is fine."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f"no-pty, {pub(keys['ed25519'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 1
+    assert not any("bad key options" in i.message for i in files[0].issues)
+    assert len(found) == 1
+    assert found[0].options == ["no-pty"]
+
+
 def test_authorized_keys_principals_without_cert_authority_is_reported_not_counted(
     keys: dict[str, Path], tmp_path: Path
 ):

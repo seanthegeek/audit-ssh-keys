@@ -117,6 +117,33 @@ def test_split_options_only_options_is_malformed():
     assert rest == ""
 
 
+def test_split_options_leading_comma_keeps_an_empty_option():
+    """A leading comma leaves an empty option in the list, not nothing: sshd rejects the line over it."""
+    opts, rest = audit.split_options(",no-pty ssh-ed25519 AAAA")
+    assert opts == ["", "no-pty"]
+    assert rest == "ssh-ed25519 AAAA"
+
+
+def test_split_options_doubled_comma_keeps_an_empty_option():
+    opts, rest = audit.split_options("no-pty,,no-x11-forwarding ssh-ed25519 AAAA")
+    assert opts == ["no-pty", "", "no-x11-forwarding"]
+    assert rest == "ssh-ed25519 AAAA"
+
+
+def test_split_options_trailing_comma_before_the_key_is_dropped():
+    """A comma right before the space that ends the options is sshd's loop stopping, not an empty option."""
+    opts, rest = audit.split_options("no-pty, ssh-ed25519 AAAA")
+    assert opts == ["no-pty"]
+    assert rest == "ssh-ed25519 AAAA"
+
+
+def test_split_options_trailing_comma_at_end_of_line_is_kept():
+    """With nothing after the comma, sshd reports "unexpected end-of-options": the empty option stays."""
+    opts, rest = audit.split_options("no-pty,")
+    assert opts == ["no-pty", ""]
+    assert rest == ""
+
+
 # --- check_options -----------------------------------------------------------
 
 
@@ -183,11 +210,26 @@ def test_check_options_accepts_a_rich_line_split_by_split_options():
         pytest.param(['tunnel="x"'], "invalid tun device", id="non-numeric tun device"),
         pytest.param(['tunnel="-1"'], "invalid tun device", id="negative tun device"),
         pytest.param(['tunnel="2147483646"'], "invalid tun device", id="one above the largest tun device number"),
+        pytest.param(
+            [f'tunnel="{"9" * 5000}"'],
+            "invalid tun device",
+            id="a tun device number too long for Python to convert",
+        ),
         pytest.param(["no-pty", "bogus"], 'unknown key option "bogus"', id="a later option is checked too"),
     ],
 )
 def test_check_options_rejects_what_sshd_rejects(options: list[str], reason: str):
     assert audit.check_options(options) == reason
+
+
+def test_check_options_accepts_no_pty_alone():
+    assert audit.check_options(["no-pty"]) is None
+
+
+def test_check_options_rejects_an_empty_option():
+    """An empty option -- from a leading or doubled comma -- is unknown, not a no-op."""
+    assert audit.check_options([""]) == 'unknown key option ""'
+    assert audit.check_options(["no-pty", ""]) == 'unknown key option ""'
 
 
 def test_check_options_rejects_a_typo_split_by_split_options():
