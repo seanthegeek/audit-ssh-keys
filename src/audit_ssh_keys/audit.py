@@ -101,6 +101,17 @@ PRIVATE_KEY_HEADERS = (
     "-----BEGIN ENCRYPTED PRIVATE KEY-----",
 )
 
+# The same markers as raw bytes. A private key file is ASCII from end to end,
+# so the code that asks "does this file start with a private-key header?"
+# compares bytes rather than decoded text: decoding first answers from a header
+# line that is not the one in the file. A stray byte replaced with U+FFFD stops
+# the line looking like a header at all -- sending a corrupt key of a format
+# this tool can check down the path meant for the formats it cannot -- while a
+# stray byte dropped joins the text on either side of it into a header line
+# that was never there.
+OPENSSH_PRIVATE_KEY_HEADER_BYTES = OPENSSH_PRIVATE_KEY_HEADER.encode("ascii")
+PRIVATE_KEY_HEADERS_BYTES = tuple(header.encode("ascii") for header in PRIVATE_KEY_HEADERS)
+
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
 
@@ -279,7 +290,14 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
         # the same here rather than raising out of a best-effort fallback.
         return
     try:
-        text = path.read_text(errors="ignore")
+        # An sshd_config file may legitimately hold non-ASCII bytes (in a
+        # Banner path or a comment, say), so a byte that does not decode is
+        # replaced with U+FFFD rather than dropped: dropping it would join the
+        # text on either side of it into something that was never in the file.
+        # The encoding is named rather than left to the locale: what this file
+        # holds is a property of the file, so the audit must not change with
+        # the LANG the operator happens to be running under.
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return
 
@@ -508,7 +526,8 @@ def _fingerprint_private_file_alone(path: Path) -> tuple[str, int, str, str] | N
 
     Returns None when ssh-keygen cannot read the key at all (it is
     passphrase-protected, or the file is owned by the account running this tool
-    and readable by group or others, which makes ssh-keygen refuse to open it),
+    with any group or other permission bits set, which makes ssh-keygen refuse
+    to open it),
     or when the temporary directory or symlink cannot be created; the caller
     then falls back to the `.pub` file, exactly as for a passphrase-protected
     key.
@@ -529,6 +548,64 @@ def _fingerprint_private_file_alone(path: Path) -> tuple[str, int, str, str] | N
         # missing or unusable, which must not be quietly read as "this key
         # needs a passphrase" and turned into a fall back to the `.pub` file.
         return fingerprint_file(link)
+
+
+def _ssh_keygen_would_refuse(path: Path) -> bool:
+    """True when ssh-keygen would turn this private key file down over its permissions.
+
+    `sshkey_perm_ok()` in ssh's authfile.c refuses a key file when the account
+    running the program owns it and it has any group or other permission bits
+    set: `st.st_uid == getuid() && (st.st_mode & 077) != 0`. That is every bit,
+    not just the read bits -- mode 0601 and mode 0610 are turned down as surely
+    as 0644 is. A file owned by someone else is read fine, which is why root
+    auditing another account's world-readable key is not affected.
+
+    Returns True when the file cannot be stat'd either: there is then no way to
+    tell, so the caller must not count on ssh-keygen being able to read it.
+    """
+    try:
+        st = path.stat()
+    except OSError as exc:
+        logger.debug("could not stat %s to tell whether ssh-keygen would read it: %s", path, exc)
+        return True
+    return st.st_uid == os.getuid() and bool(stat.S_IMODE(st.st_mode) & 0o077)
+
+
+def _ssh_can_load_private_key(path: Path) -> bool:
+    """True when ssh itself can load the private half of this key file.
+
+    `ssh-keygen -l` cannot answer this: handed a private key file in the
+    current OpenSSH format it reads the public half out of it and writes the
+    private half's failure to its debug log only (verified against OpenSSH
+    10.2), so a file whose private half is corrupt still prints a fingerprint.
+    `ssh-keygen -y` has to load the private half for real, since it derives
+    the public key from it -- so it is the one cheap, read-only way to ask ssh
+    whether this is a file it can use. For a file in the current OpenSSH format,
+    that runs ssh's own loader: the two check integers have to match, every
+    private field has to deserialize, and the padding has to run 1, 2, 3, ...
+    The public key it prints is discarded; nothing is written anywhere, and the
+    file itself is not touched.
+
+    An empty passphrase is handed over with `-P` so that the command can never
+    stop to ask for one. Closing stdin is not enough on its own here:
+    ssh-keygen reads a passphrase from /dev/tty, so a run from a terminal would
+    otherwise hang. Callers only ask about keys with no passphrase set, and
+    `-P ""` keeps a key that turns out to have one from blocking the run --
+    such a key simply answers False.
+
+    The output is collected as bytes, not text. `ssh-keygen -y` prints the
+    key's comment alongside the public key exactly as the bytes sit in the
+    file, and a comment holding a byte that is not valid UTF-8 (a name typed
+    in Latin-1, say) would make decoding it raise and abort the whole audit.
+    Only the exit status is wanted here, so the output is never decoded.
+    """
+    proc = subprocess.run(
+        ["ssh-keygen", "-y", "-P", "", "-f", str(path)],
+        capture_output=True,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    return proc.returncode == 0
 
 
 def _read_uint32(buf: bytes, offset: int) -> tuple[int, int]:
@@ -555,13 +632,20 @@ def _read_string(buf: bytes, offset: int) -> tuple[bytes, int]:
 
 
 def _stripped_lines(path: Path) -> list[str] | None:
-    """Read a file and return its non-blank lines with surrounding whitespace removed.
+    """Read a private key file and return its non-blank lines with surrounding whitespace removed.
 
-    Returns None when the file cannot be read.
+    A private key file is ASCII from its first line to its last: marker lines,
+    base64, and (in the legacy PEM formats) plain headers. It is decoded
+    strictly, so a single byte that is not ASCII means this is not the key file
+    it claims to be. Dropping such a byte instead would let the base64 on
+    either side of it join up and decode as though the byte had never been
+    there, reporting a file OpenSSH refuses to load as a healthy key.
+
+    Returns None when the file cannot be read, or when it is not ASCII.
     """
     try:
-        text = path.read_text(errors="ignore")
-    except OSError:
+        text = path.read_bytes().decode("ascii")
+    except (OSError, UnicodeDecodeError):
         return None
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
@@ -582,18 +666,36 @@ def _openssh_private_key_lines(path: Path) -> list[str] | None:
 
 
 def _is_openssh_format(path: Path) -> bool:
-    """True when the file's first non-blank line is the OpenSSH private-key header.
+    """True when the file's first non-blank line starts with the OpenSSH private-key header.
 
     Used to tell a corrupt OpenSSH-format key (which must be reported as
     unfingerprintable, not confused with whatever `.pub` file happens to sit
     next to it) apart from the older PEM/PKCS#8 formats, where falling back
-    to a `.pub` file is the intended behaviour. Only the header is checked, so
-    a file that is in this format but cut short -- missing its footer line,
-    say -- still counts as one, which is what keeps it from falling back to a
-    `.pub` file that says nothing about it.
+    to a `.pub` file is the intended behaviour. Only the start of the first
+    line is checked, so a file that is in this format but damaged -- cut short
+    before its footer line, or with junk stuck on the end of the header line
+    itself -- still counts as an attempt at this format, which is what keeps
+    it from falling back to a `.pub` file that says nothing about it.
+    `public_key_from_private` holds the damaged file to the full format (an
+    exact header line, ASCII throughout) and answers None for it, so such a
+    file is reported as unfingerprintable rather than as the `.pub` file's key.
+
+    The comparison is on raw bytes rather than on decoded text. Decoding the
+    file first -- with undecodable bytes replaced -- would make a single stray
+    byte in the header line itself answer False, which is exactly the fallback
+    to an unrelated `.pub` file this check exists to prevent. Returns False
+    when the file cannot be read at all.
     """
-    lines = _stripped_lines(path)
-    return bool(lines) and lines[0] == OPENSSH_PRIVATE_KEY_HEADER
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        logger.debug("could not read %s to tell whether it is in the OpenSSH key format: %s", path, exc)
+        return False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped.startswith(OPENSSH_PRIVATE_KEY_HEADER_BYTES)
+    return False
 
 
 def _openssh_key_blob(path: Path) -> bytes | None:
@@ -680,24 +782,65 @@ def fingerprint_private_key(path: Path) -> tuple[tuple[str, int, str, str] | Non
     `.pub` file is stale or belongs to a different key, and anything copied out
     of it authorises the wrong key.
 
+    For an unencrypted key in the current OpenSSH format the private half is
+    checked as well, by asking ssh-keygen to derive the public key from it
+    (`_ssh_can_load_private_key`) -- work only the private half can do, so no
+    `.pub` file can answer for it. ssh builds the key it actually uses out of
+    that half, and a public half that reads cleanly says nothing about whether
+    the private half is intact, so this runs ssh's own loader over the file:
+    the two check integers have to match, every private field has to
+    deserialize, and the padding has to run 1, 2, 3, ... What that catches is
+    any file ssh's own loader cannot load: mismatched check integers, private
+    fields that do not deserialize, bad padding, or a body mangled in transit
+    (CRLF line endings, indentation). A file that fails any
+    of that is one ssh cannot load, and is reported as unfingerprintable (the
+    same LOW `could not fingerprint` finding a corrupt public half gets). When
+    it passes, the embedded public half is still the answer reported; for any
+    file ssh-keygen itself wrote, the two agree. A file gets only the checks on
+    its public half, so corruption inside its private half goes undetected,
+    when it is passphrase-protected (it cannot be loaded at all without the
+    passphrase), when ssh-keygen would refuse it over its permissions (the
+    account running this tool owns it and it has any group or other permission
+    bits set), or when the file cannot be stat'd to tell which of those is the
+    case.
+
     The fallbacks below apply only to keys in the older PEM/PKCS#8 formats,
     which do not carry a readable public half. For those, the private key
     file itself is fingerprinted first (through the symlink trick in
     `_fingerprint_private_file_alone`, which keeps ssh-keygen from being
     steered by a stale `.pub`). Only when the private file cannot be read at
     all -- it is passphrase-protected, or it is owned by the account running
-    this tool and readable by group or others, which makes ssh-keygen refuse to
-    open it -- is the `.pub` file used instead, and in that case a stale
+    this tool with any group or other permission bits set, which makes
+    ssh-keygen refuse to open it -- is the `.pub` file used instead, and in that case a stale
     `.pub` cannot be detected: there is nothing to compare it against. A key
-    in the current OpenSSH format whose embedded public half cannot be read
-    is corrupt, and is reported as unfingerprintable no matter what `.pub`
-    file sits next to it -- that file says nothing about which key this one
-    is.
+    in the current OpenSSH format whose embedded public half cannot be read,
+    or can be read but not fingerprinted, is corrupt, and is reported as
+    unfingerprintable no matter what `.pub` file sits next to it -- that file
+    says nothing about which key this one is.
     """
     line = public_key_from_private(path)
-    if line is None and _is_openssh_format(path):
-        return None, None
     result = fingerprint_line(line) if line else None
+    if result is None and _is_openssh_format(path):
+        # A key in this format carries its public half in the clear, so either
+        # that half is missing or it is there and unreadable -- a corrupt file
+        # either way, not merely an old format. Whatever `.pub` file sits
+        # beside it could describe any other key, so it gets no say here.
+        return None, None
+
+    # True only for a key in the current OpenSSH format -- the one format with
+    # an embedded public half to have read -- that ssh-keygen can open: not
+    # passphrase-protected, and not turned down over its permissions.
+    ssh_can_load_it_if_intact = (
+        result is not None and private_key_is_encrypted(path) is False and not _ssh_keygen_would_refuse(path)
+    )
+    if ssh_can_load_it_if_intact and not _ssh_can_load_private_key(path):
+        # The public half being intact says nothing about the private half ssh
+        # actually builds the key from, so ask ssh itself: ssh-keygen goes
+        # through ssh's own loader and succeeds only for a file ssh can load.
+        # That turns down mismatched check integers, private fields that do not
+        # deserialize, bad padding, and a body mangled in transit (CRLF line
+        # endings, indentation).
+        return None, None
 
     if result is None:
         # No readable embedded public half: a legacy PEM/PKCS#8 key. Try the
@@ -722,8 +865,9 @@ def fingerprint_private_key(path: Path) -> tuple[tuple[str, int, str, str] | Non
 
     if result is None:
         # The private key itself could not be read (passphrase-protected, or
-        # owned by the account running this tool and readable by group or
-        # others, which makes ssh-keygen refuse to open it): fall back to the
+        # owned by the account running this tool with any group or other
+        # permission bits set, which makes ssh-keygen refuse to open it):
+        # fall back to the
         # .pub file, the only thing left that is readable. A stale .pub cannot
         # be detected here -- there is nothing to compare it against.
         result = pub_result
@@ -740,10 +884,15 @@ def private_key_is_encrypted(path: Path) -> bool | None:
       is ``none`` for unencrypted keys.
     * Legacy PEM (RSA/DSA/EC): a ``Proc-Type: 4,ENCRYPTED`` header.
     * PKCS#8: ``BEGIN ENCRYPTED PRIVATE KEY`` vs ``BEGIN PRIVATE KEY``.
+
+    A private key file is ASCII throughout, so it is decoded strictly and a
+    file holding any other byte is reported as unrecognised rather than having
+    that byte dropped -- dropping it could make a corrupt body decode as a
+    clean one, answering this question from bytes that are not in the file.
     """
     try:
-        text = path.read_text(errors="ignore")
-    except OSError:
+        text = path.read_bytes().decode("ascii")
+    except (OSError, UnicodeDecodeError):
         return None
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines:
@@ -778,13 +927,21 @@ def private_key_is_encrypted(path: Path) -> bool | None:
 
 
 def looks_like_private_key(path: Path) -> bool:
-    """Cheap header check so we only run ssh-keygen on plausible private keys."""
+    """Cheap header check so we only run ssh-keygen on plausible private keys.
+
+    Compares the first 64 bytes against the header markers as bytes, for the
+    same reason `_is_openssh_format` does: a private key file is ASCII from end
+    to end, so the bytes in the file are the question being asked. Decoding the
+    head first with undecodable bytes dropped would join the text on either
+    side of such a byte back together, and answer from a header line that was
+    never in the file.
+    """
     try:
         with path.open("rb") as fh:
-            head = fh.read(64).decode("ascii", errors="ignore")
+            head = fh.read(64)
     except OSError:
         return False
-    return head.lstrip().startswith(PRIVATE_KEY_HEADERS)
+    return head.lstrip().startswith(PRIVATE_KEY_HEADERS_BYTES)
 
 
 # --------------------------------------------------------------------------- #
@@ -1362,7 +1519,16 @@ def audit_authorized_keys(
             file_finding.issues.extend(check_strictmodes_path(path, user))
 
             try:
-                lines = path.read_text(errors="ignore").splitlines()
+                # A comment field can hold whatever the person who wrote it
+                # typed, so a byte that does not decode is replaced with
+                # U+FFFD rather than dropped. In a comment that only changes
+                # how the line is displayed; inside a key's base64 it makes
+                # the blob unreadable, so the line is reported as unparseable
+                # -- which is what sshd does with it too. The encoding is named
+                # rather than left to the locale: what this file holds is a
+                # property of the file, so the audit must not change with the
+                # LANG the operator happens to be running under.
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError as exc:
                 file_finding.issues.append(Issue("LOW", f"could not read file: {exc}"))
                 files.append(file_finding)

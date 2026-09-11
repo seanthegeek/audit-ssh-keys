@@ -627,6 +627,78 @@ def test_public_key_from_private_is_none_with_a_second_end_marker_in_the_body(ke
     assert audit.fingerprint_private_key(key) == (None, None)
 
 
+def _splice_non_ascii_byte(source: Path, dest: Path) -> Path:
+    """Copy a real OpenSSH private key, splicing one 0xFF byte into the middle of its base64 body.
+
+    Nothing else about the file changes. A private key file is ASCII from end
+    to end, so OpenSSH rejects this one outright -- but reading it with
+    undecodable bytes dropped joins the base64 on either side of the byte back
+    together, and the file then decodes exactly as the original did.
+    """
+    lines = source.read_bytes().split(b"\n")
+    body = [i for i, ln in enumerate(lines) if ln and not ln.startswith(b"-----")]
+    mid = body[len(body) // 2]
+    line = lines[mid]
+    cut = len(line) // 2
+    lines[mid] = line[:cut] + b"\xff" + line[cut:]
+    dest.write_bytes(b"\n".join(lines))
+    dest.chmod(0o600)
+    return dest
+
+
+def test_private_key_with_a_non_ascii_byte_in_its_body_is_not_repaired_while_reading(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """One byte that is not ASCII spliced into the base64 body makes a key OpenSSH will not load.
+
+    Reading the file with undecodable bytes dropped silently repaired it: the
+    base64 on either side joined up, the body decoded cleanly, and a file ssh
+    refuses to load was reported as a healthy key. A valid `.pub` file sits
+    beside it to prove there is no fallback to that either.
+    """
+    key = _splice_non_ascii_byte(keys["ed25519"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    assert audit.public_key_from_private(key) is None
+    assert audit.fingerprint_private_key(key) == (None, None)
+    assert audit.private_key_is_encrypted(key) is None
+
+
+def _splice_non_ascii_byte_into_the_header(source: Path, dest: Path) -> Path:
+    """Copy a real OpenSSH private key with one 0xFF byte stuck on the end of its header line."""
+    raw = source.read_bytes()
+    header = audit.OPENSSH_PRIVATE_KEY_HEADER.encode("ascii")
+    assert raw.startswith(header)
+    dest.write_bytes(header + b"\xff" + raw[len(header) :])
+    dest.chmod(0o600)
+    return dest
+
+
+def test_private_key_with_a_mangled_header_line_is_not_reported_as_an_unrelated_pub(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """A stray byte on the header line must not send the file down the legacy `.pub` fallback.
+
+    The file is still an attempt at the current OpenSSH format, so it counts as
+    one -- and nothing in it can be trusted, so it is reported as
+    unfingerprintable rather than handed to the fallback meant for the older
+    PEM/PKCS#8 formats, which would answer with whatever unrelated key happens
+    to be sitting in the `.pub` file beside it. Comparing the header line as
+    decoded text (with undecodable bytes replaced) made one stray byte in it
+    answer "not this format", which is the exact hole this check closes.
+    """
+    key = _splice_non_ascii_byte_into_the_header(keys["ed25519"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_text(pub(keys["rsa2048"]) + "\n")  # a valid, but unrelated, key
+
+    assert audit.looks_like_private_key(key) is True  # so the file is audited at all
+    assert audit._is_openssh_format(key) is True
+    # The full format is not met: the header line is not the header, and a
+    # private key file holding a byte that is not ASCII is corrupt either way.
+    assert audit.public_key_from_private(key) is None
+    assert audit.fingerprint_private_key(key) == (None, None)
+    assert audit.private_key_is_encrypted(key) is None
+
+
 def test_fingerprint_private_key_prefers_the_private_key_over_a_stale_pub(keys: dict[str, Path], tmp_path: Path):
     key = tmp_path / "id_ed25519"
     key.write_bytes(keys["encrypted"].read_bytes())
@@ -818,6 +890,162 @@ def test_fingerprint_private_key_corrupt_openssh_body_is_not_reported_as_an_unre
     assert audit.fingerprint_private_key(key) == (None, None)
 
 
+def _corrupt_the_public_half(source: Path, dest: Path) -> Path:
+    """Copy a real OpenSSH private key, replacing its public half with a type name and then garbage.
+
+    Every field in the file still parses -- the type name reads as
+    `ssh-ed25519`, and the private half is left exactly as it was -- so the
+    file passes every whole-file check. What it does not hold is a public key
+    ssh-keygen can fingerprint.
+    """
+    blob = _decode_openssh_body(source)
+    _, public_start, public_end = _public_half_bounds(blob)
+    corrupt = _ssh_string(b"ssh-ed25519") + b"garbage"
+    return _write_openssh_key(dest, blob[:public_start] + _ssh_string(corrupt) + blob[public_end:])
+
+
+def test_fingerprint_private_key_is_none_when_the_embedded_public_half_cannot_be_fingerprinted(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """A current-format key whose public half reads but cannot be fingerprinted is corrupt, `.pub` or no `.pub`.
+
+    public_key_from_private takes only the type name out of the embedded
+    public blob, so a blob whose remaining bytes are garbage still yields a
+    "<type> <base64>" line -- one ssh-keygen then refuses. Before the fix that
+    sent the key down the path meant for legacy PEM keys, and it was reported
+    as whatever `.pub` file happened to sit beside it.
+    """
+    key = _corrupt_the_public_half(keys["ed25519"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    line = audit.public_key_from_private(key)
+    assert line is not None and line.startswith("ssh-ed25519 ")  # the type name still reads
+    assert audit.fingerprint_line(line) is None  # but the blob is not a key
+    assert audit.fingerprint_private_key(key) == (None, None)
+
+
+def _corrupt_the_private_half(source: Path, dest: Path) -> Path:
+    """Copy a real OpenSSH private key with the first byte of its private half flipped.
+
+    That byte belongs to the first of the two check integers ssh compares when
+    it loads a key, and the private half keeps the exact length it had, so
+    every field in the file still parses and the public half still reads
+    perfectly. Only ssh's own loader can tell this file from a good one.
+    """
+    blob = _decode_openssh_body(source)
+    _, _, public_end = _public_half_bounds(blob)
+    private, end = audit._read_string(blob, public_end)
+    assert end == len(blob)
+    flipped = bytes([private[0] ^ 0xFF]) + private[1:]
+    return _write_openssh_key(dest, blob[:public_end] + _ssh_string(flipped))
+
+
+def test_fingerprint_private_key_is_none_when_ssh_cannot_load_the_private_half(keys: dict[str, Path], tmp_path: Path):
+    """A key whose private half ssh cannot load is not a usable key, however well its public half reads.
+
+    ssh builds the key it actually uses out of the private half, so a file
+    whose private half ssh refuses to load authenticates nobody. The clean case --
+    an intact unencrypted key at mode 0600, still fingerprinted and still
+    reporting no problem -- is covered by test_private_keys_end_to_end, which
+    audits exactly such a key.
+    """
+    key = _corrupt_the_private_half(keys["ed25519"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    # The whole point of this corruption: the public half is untouched and reads as it always did.
+    assert audit.public_key_from_private(key) == audit.public_key_from_private(keys["ed25519"])
+    # `ssh-keygen -l` cannot see the problem: handed a private key file in this
+    # format it answers from the public half inside it, writing the private
+    # half's failure to its debug log only. That is why the check below asks
+    # ssh-keygen for the public key derived from the private half instead.
+    assert audit._fingerprint_private_file_alone(key) is not None
+    assert audit._ssh_keygen_would_refuse(key) is False  # mode 0600, so the check really does run
+    assert audit._ssh_can_load_private_key(key) is False
+    assert audit.fingerprint_private_key(key) == (None, None)
+
+
+def test_fingerprint_private_key_cannot_check_the_private_half_of_an_encrypted_key(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """Documents a limitation: the private half of a passphrase-protected key cannot be checked at all.
+
+    Loading it needs the passphrase, which this tool never has, so the very
+    corruption caught above goes undetected here and the key is still reported
+    from its public half.
+    """
+    key = _corrupt_the_private_half(keys["encrypted"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_bytes(keys["encrypted"].with_name("encrypted.pub").read_bytes())
+
+    result, mismatch = audit.fingerprint_private_key(key)
+    assert result is not None and result[0] == "ED25519"
+    assert mismatch is None
+
+
+@needs_non_root
+def test_fingerprint_private_key_cannot_check_the_private_half_of_a_key_ssh_keygen_refuses(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """Documents a limitation: ssh-keygen will not open a key the running account owns and others can see.
+
+    There is no way to ask ssh to load such a file, so corruption inside its
+    private half goes undetected and the key is still reported from its public
+    half. The same file at mode 0600 is read fine, which is what the first
+    assertion pins down.
+    """
+    key = _corrupt_the_private_half(keys["ed25519"], tmp_path / "id_ed25519")
+    assert audit._ssh_keygen_would_refuse(key) is False  # as written: mode 0600
+    key.chmod(0o644)
+    assert audit._ssh_keygen_would_refuse(key) is True
+
+    result, mismatch = audit.fingerprint_private_key(key)
+    assert result is not None and result[0] == "ED25519"
+    assert mismatch is None
+
+
+def test_ssh_keygen_would_refuse_a_file_it_cannot_stat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A file that cannot be stat'd must be assumed unreadable by ssh-keygen, not assumed fine.
+
+    Answering False would send the caller on to run ssh-keygen over the key and
+    read the refusal as "ssh cannot load this key", turning a problem with the
+    file's permissions into a wrong answer about the key itself.
+    """
+    key = tmp_path / "id_ed25519"
+    key.write_text(audit.OPENSSH_PRIVATE_KEY_HEADER + "\n")
+    key.chmod(0o600)
+    assert audit._ssh_keygen_would_refuse(key) is False  # nothing wrong with it as written
+
+    def raise_oserror(*args: object, **kwargs: object) -> os.stat_result:
+        raise OSError("cannot stat this")
+
+    monkeypatch.setattr(Path, "stat", raise_oserror)
+    assert audit._ssh_keygen_would_refuse(key) is True
+
+
+def test_fingerprint_private_key_survives_a_comment_that_is_not_utf8(tmp_path: Path):
+    """A key whose embedded comment is not valid UTF-8 must not take the whole audit down.
+
+    `ssh-keygen -y` prints the key's comment exactly as the bytes sit in the
+    file (unlike `ssh-keygen -l`, which escapes them), so collecting its output
+    as decoded text raised UnicodeDecodeError out of subprocess.run and aborted
+    the run. Only the exit status is wanted, so the output is never decoded.
+    """
+    key = tmp_path / "id_ed25519"
+    subprocess.run(
+        # Latin-1 bytes straight into the comment, which ssh-keygen stores as given.
+        [b"ssh-keygen", b"-q", b"-t", b"ed25519", b"-N", b"", b"-C", b"M\xfcller", b"-f", os.fsencode(key)],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert b"M\xfcller" in audit.pub_sibling(key).read_bytes()  # the comment really is not UTF-8
+    assert audit._ssh_keygen_would_refuse(key) is False  # mode 0600, so the private-half check runs
+    assert audit._ssh_can_load_private_key(key) is True
+
+    result, mismatch = audit.fingerprint_private_key(key)
+    assert result is not None and result[0] == "ED25519"
+    assert mismatch is None
+
+
 def test_private_key_is_encrypted(keys: dict[str, Path]):
     assert audit.private_key_is_encrypted(keys["ed25519"]) is False
     assert audit.private_key_is_encrypted(keys["encrypted"]) is True
@@ -884,6 +1112,19 @@ def test_looks_like_private_key(keys: dict[str, Path], tmp_path: Path):
     cfg.write_text("Host foo\n  User bar\n")
     assert audit.looks_like_private_key(cfg) is False
     assert audit.looks_like_private_key(tmp_path / "missing") is False
+
+
+@needs_non_root
+def test_is_openssh_format_is_false_for_a_file_that_cannot_be_read(tmp_path: Path):
+    """An unreadable file cannot be claimed to be in this format, and the check must not raise."""
+    key = tmp_path / "id_ed25519"
+    key.write_text(audit.OPENSSH_PRIVATE_KEY_HEADER + "\n")
+    assert audit._is_openssh_format(key) is True  # readable as written
+    key.chmod(0o000)
+    try:
+        assert audit._is_openssh_format(key) is False
+    finally:
+        key.chmod(0o600)
 
 
 # --- audit_host_keys ----------------------------------------------------------
@@ -1010,6 +1251,23 @@ def test_host_key_stale_pub_is_flagged_and_the_private_key_wins(keys: dict[str, 
     mismatches = [i for i in finding.issues if i.severity == "LOW" and "does not match" in i.message]
     assert len(mismatches) == 1
     assert mismatches[0].message.startswith("ssh_host_ed25519_key.pub does not match this private key")
+
+
+def test_host_key_whose_private_half_ssh_cannot_load_is_not_fingerprinted(keys: dict[str, Path], tmp_path: Path):
+    """A host key ssh cannot load is reported as unfingerprintable, however well its public half reads.
+
+    `sshd` builds the key it serves out of the private half, so a host key whose
+    private half ssh refuses to load is not a working host key -- and a matching
+    `.pub` file beside it must not make it look like one.
+    """
+    host_key = _corrupt_the_private_half(keys["ed25519"], tmp_path / "ssh_host_ed25519_key")
+    audit.pub_sibling(host_key).write_text(pub(keys["ed25519"]) + "\n")
+    assert audit._ssh_keygen_would_refuse(host_key) is False  # mode 0600, so the check really runs
+
+    findings = audit.audit_host_keys({"hostkey": [str(host_key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    finding = next(f for f in findings if f.path == str(host_key))
+    assert (finding.key_type, finding.bits, finding.fingerprint) == ("?", 0, "")
+    assert "could not fingerprint host key" in _by_sev(finding.issues)["LOW"]
 
 
 def test_host_keys_defaults_when_unconfigured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1370,6 +1628,56 @@ def test_unparseable_key_material_with_bad_options_reports_only_the_unparseable_
     assert found == []
     assert files[0].key_count == 0
     assert _by_sev(files[0].issues)["LOW"] == ["line 1: unparseable entry (ignored by sshd)"]
+
+
+def _rewrite_ak_key_line(ak: Path, blob_byte: bytes = b"", comment: bytes = b"") -> None:
+    """Rewrite the single key line in an authorized_keys file, splicing raw bytes into it.
+
+    blob_byte goes into the middle of the key's base64; comment replaces the
+    comment field. Written as bytes, because the point is bytes that are not
+    valid UTF-8 and so cannot come from write_text.
+    """
+    type_name, blob, old_comment = ak.read_bytes().split(b" ", 2)
+    cut = len(blob) // 2
+    spliced = blob[:cut] + blob_byte + blob[cut:]
+    ak.write_bytes(type_name + b" " + spliced + b" " + (comment or old_comment.strip() + b"\n"))
+
+
+def test_authorized_keys_non_ascii_byte_in_a_key_blob_is_unparseable(keys: dict[str, Path], tmp_path: Path):
+    """A byte that is not ASCII inside a key's base64 leaves a line sshd cannot read, and nor can this tool.
+
+    The file is read with undecodable bytes replaced rather than dropped:
+    dropping this one would join the base64 on either side of it back into a
+    working key, reporting a line sshd throws away as a key that grants access.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _rewrite_ak_key_line(_write_ak(alice, [pub(keys["ed25519"])]), blob_byte=b"\xff")
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert found == []
+    assert files[0].key_count == 0
+    assert _by_sev(files[0].issues)["LOW"] == ["line 1: unparseable entry (ignored by sshd)"]
+
+
+def test_authorized_keys_non_ascii_byte_in_a_comment_is_still_a_key(keys: dict[str, Path], tmp_path: Path):
+    """A byte that is not ASCII in the comment field is shown as a replacement character, not dropped.
+
+    sshd does not care what a comment holds, so the line is a working key and
+    has to be counted as one -- only its comment looks different in the report.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _rewrite_ak_key_line(_write_ak(alice, [pub(keys["ed25519"])]), comment=b"wh\xffo@host\n")
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 1
+    assert len(found) == 1
+    assert found[0].key_type == "ED25519"
+    assert found[0].comment == "wh\ufffdo@host"
+    assert files[0].issues == []
 
 
 def test_authorized_keys_custom_absolute_pattern_and_dedup(keys: dict[str, Path], tmp_path: Path):
@@ -1786,8 +2094,13 @@ def test_private_keys_end_to_end(keys: dict[str, Path], tmp_path: Path):
     assert sev["MEDIUM"] == ["private key has no passphrase"]
 
     root_key = by_path[str(r_ssh / "id_ed25519")]
+    # An intact, unencrypted, current-format key at mode 0600: ssh can load it,
+    # so the private-half check leaves it fingerprinted as usual.
+    assert (root_key.key_type, root_key.bits) == ("ED25519", 256)
+    assert root_key.fingerprint
     sev = _by_sev(root_key.issues)
     assert "private key has no passphrase" in sev["HIGH"]
+    assert not any("could not fingerprint" in i.message for i in root_key.issues)
 
 
 @needs_non_root
@@ -1927,6 +2240,25 @@ def test_private_key_corrupt_openssh_body_with_unrelated_pub_is_unfingerprinted(
     assert "could not fingerprint private key; algorithm and size were not checked" in lows
     assert not any("does not match" in m for m in lows)
     assert audit.fingerprint_private_key(captured["path"]) == (None, None)
+
+
+def test_private_key_ssh_cannot_load_is_reported_as_unfingerprintable(keys: dict[str, Path], tmp_path: Path):
+    """End to end: a key whose private half ssh cannot load gets the LOW `could not fingerprint` finding.
+
+    Same corruption as test_fingerprint_private_key_is_none_when_ssh_cannot_load_the_private_half,
+    but through audit_private_keys, to prove it also reaches the finding that
+    actually gets reported.
+    """
+
+    def write(a_ssh: Path) -> None:
+        key = _corrupt_the_private_half(keys["ed25519"], a_ssh / "id_ed25519")
+        audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    finding = _one_private_key(tmp_path, write)
+    assert (finding.key_type, finding.bits, finding.fingerprint) == ("?", 0, "")
+    lows = [i.message for i in finding.issues if i.severity == "LOW"]
+    assert "could not fingerprint private key; algorithm and size were not checked" in lows
+    assert not any("does not match" in m for m in lows)
 
 
 def test_private_key_encrypted_without_a_pub_is_still_fingerprinted(keys: dict[str, Path], tmp_path: Path):
