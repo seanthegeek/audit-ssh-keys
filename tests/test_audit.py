@@ -478,6 +478,45 @@ def test_fingerprint_private_key_falls_back_when_the_pub_sibling_is_unparsable(t
     assert mismatch is None
 
 
+def test_fingerprint_private_key_pem_with_its_own_matching_pub_is_fingerprinted_via_it(tmp_path: Path):
+    """A legacy PEM key with its real, matching .pub still in place is read from that .pub.
+
+    Confirms the .pub fallback still works for PEM keys after restricting it
+    away from corrupt OpenSSH-format keys below: PEM keys have no readable
+    public half at all, so the fallback is the intended, only path for them.
+    """
+    encrypted = _pem_key(tmp_path / "encrypted_pem", passphrase="hunter2")
+    result, mismatch = audit.fingerprint_private_key(encrypted)
+    assert result is not None and result[:2] == ("RSA", 2048)
+    assert mismatch is None
+
+
+def test_fingerprint_private_key_corrupt_openssh_body_is_not_reported_as_an_unrelated_pub(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """A corrupt OpenSSH-format key must not be reported as whatever .pub file happens to sit next to it.
+
+    The .pub fallback exists for legacy PEM/PKCS#8 keys, which have no
+    readable public half at all. A truncated *current*-format key also has no
+    readable public half, but it is corrupt, not merely an old format -- so
+    grading it as the key described by a neighbouring .pub (which could
+    belong to any other key) would misattribute it.
+    """
+    # Same truncated body as the "truncated" case in test_public_key_from_private_is_none_for_corrupt_bodies.
+    payload = (
+        _ssh_string(b"none")
+        + _ssh_string(b"none")
+        + _ssh_string(b"")
+        + (1).to_bytes(4, "big")
+        + (99).to_bytes(4, "big")
+    )
+    key = _openssh_key_file(tmp_path / "id_ed25519", payload)
+    audit.pub_sibling(key).write_text(pub(keys["rsa2048"]) + "\n")  # a valid, but unrelated, key
+    key.chmod(0o600)
+
+    assert audit.fingerprint_private_key(key) == (None, None)
+
+
 def test_private_key_is_encrypted(keys: dict[str, Path]):
     assert audit.private_key_is_encrypted(keys["ed25519"]) is False
     assert audit.private_key_is_encrypted(keys["encrypted"]) is True
@@ -606,6 +645,55 @@ def test_host_keys_encrypted_key_is_low(keys: dict[str, Path], tmp_path: Path):
     assert any(i.severity == "LOW" and "passphrase" in i.message for i in findings[0].issues)
     # The .pub sibling matches, so nothing is said about it.
     assert not any("does not match" in i.message for i in findings[0].issues)
+
+
+def test_host_key_that_cannot_be_fingerprinted_still_gets_perms_and_passphrase_checked(tmp_path: Path):
+    """A host key ssh-keygen can't read at all must still get its permission and passphrase checks.
+
+    An encrypted, legacy-PEM host key with no .pub sibling cannot be
+    fingerprinted by any of the tool's methods (ssh-keygen refuses to read an
+    encrypted key without its passphrase, whatever the file's mode -- see the
+    mode-0600 case below). That must not skip the checks that do not depend
+    on fingerprinting: file permissions and whether a passphrase is set.
+    """
+    host_key = tmp_path / "ssh_host_rsa_key"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "rsa", "-b", "2048", "-m", "PEM", "-N", "somepass", "-f", str(host_key)],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    audit.pub_sibling(host_key).unlink()  # no .pub: nothing to fall back to
+    host_key.chmod(0o644)
+
+    findings = audit.audit_host_keys({"hostkey": [str(host_key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    finding = next(f for f in findings if f.path == str(host_key))
+    assert (finding.key_type, finding.bits, finding.fingerprint) == ("?", 0, "")
+    sev = _by_sev(finding.issues)
+    assert "could not fingerprint host key" in sev["LOW"]
+    assert any("passphrase" in m for m in sev["LOW"])
+    assert sev["CRITICAL"] == ["world-accessible private key (mode 0644); sshd refuses to load it"]
+
+
+def test_host_key_that_cannot_be_fingerprinted_clean_perms_only_gets_the_lows(tmp_path: Path):
+    """Same undecodable host key, but mode 0600: no CRITICAL/HIGH, just the two LOWs."""
+    host_key = tmp_path / "ssh_host_rsa_key"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "rsa", "-b", "2048", "-m", "PEM", "-N", "somepass", "-f", str(host_key)],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    audit.pub_sibling(host_key).unlink()
+    host_key.chmod(0o600)
+
+    findings = audit.audit_host_keys({"hostkey": [str(host_key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    finding = next(f for f in findings if f.path == str(host_key))
+    assert (finding.key_type, finding.bits, finding.fingerprint) == ("?", 0, "")
+    sev = _by_sev(finding.issues)
+    assert set(sev) == {"LOW"}
+    assert "could not fingerprint host key" in sev["LOW"]
+    assert any("passphrase" in m for m in sev["LOW"])
 
 
 def test_host_key_stale_pub_is_flagged_and_the_private_key_wins(keys: dict[str, Path], tmp_path: Path):
@@ -920,6 +1008,37 @@ def test_private_key_stale_pub_is_flagged_and_the_private_key_wins(keys: dict[st
     assert len([m for m in lows if m.startswith("id_ed25519.pub does not match")]) == 1
 
 
+def test_private_key_corrupt_openssh_body_with_unrelated_pub_is_unfingerprinted(keys: dict[str, Path], tmp_path: Path):
+    """End to end: a corrupt current-format key is reported as unfingerprintable, not as its .pub neighbour.
+
+    Same scenario as test_fingerprint_private_key_corrupt_openssh_body_is_not_reported_as_an_unrelated_pub,
+    but through audit_private_keys, to prove the fix also holds for the finding
+    that actually gets reported.
+    """
+    captured: dict[str, Path] = {}
+
+    def write(a_ssh: Path) -> None:
+        # Same truncated body as the "truncated" case in test_public_key_from_private_is_none_for_corrupt_bodies.
+        payload = (
+            _ssh_string(b"none")
+            + _ssh_string(b"none")
+            + _ssh_string(b"")
+            + (1).to_bytes(4, "big")
+            + (99).to_bytes(4, "big")
+        )
+        key = _openssh_key_file(a_ssh / "id_ed25519", payload)
+        (a_ssh / "id_ed25519.pub").write_text(pub(keys["rsa2048"]) + "\n")  # a valid, but unrelated, key
+        key.chmod(0o600)
+        captured["path"] = key
+
+    finding = _one_private_key(tmp_path, write)
+    assert (finding.key_type, finding.fingerprint) == ("?", "")
+    lows = [i.message for i in finding.issues if i.severity == "LOW"]
+    assert "could not fingerprint private key; algorithm and size were not checked" in lows
+    assert not any("does not match" in m for m in lows)
+    assert audit.fingerprint_private_key(captured["path"]) == (None, None)
+
+
 def test_private_key_encrypted_without_a_pub_is_still_fingerprinted(keys: dict[str, Path], tmp_path: Path):
     def write(a_ssh: Path) -> None:
         key = a_ssh / "id_ed25519"
@@ -1020,7 +1139,6 @@ def test_run_audit_and_report_smoke(
     cfg = tmp_path / "sshd_config"
     cfg.write_text("AuthorizedKeysFile none\nPasswordAuthentication no\n")
     monkeypatch.setattr(audit, "SSHD_CONFIG", cfg)
-    monkeypatch.setattr(audit, "SSHD_CONFIG_D", tmp_path / "nope.d")
     monkeypatch.setattr(audit, "_find_sshd", lambda: None)
     monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nokey")])
     monkeypatch.setattr(audit.pwd, "getpwall", lambda: [])
@@ -1151,6 +1269,70 @@ def test_verbose_report_lists_every_key_grouped_by_file(keys, tmp_path, capsys):
     # Clean private key: "user: path" line, then "type bits fingerprint passphrase" line, then "  ok".
     i_priv_clean = next(i for i, ln in enumerate(lines) if ln == "alice: /home/alice/.ssh/id_ed25519_clean")
     assert lines[i_priv_clean + 2] == "  ok"
+
+
+def test_verbose_report_groups_shared_file_by_account_not_just_by_path(capsys):
+    """A shared absolute AuthorizedKeysFile gets a FileFinding per account; keys must not bleed across them.
+
+    Grouping keys by file_path alone would put both accounts' keys under both
+    accounts' headers, since a shared file has the same file_path for every
+    account that reads it.
+    """
+    shared_path = "/etc/ssh/authorized_keys"
+    files = [
+        audit.FileFinding(user="root", file_path=shared_path, key_count=1),
+        audit.FileFinding(user="alice", file_path=shared_path, key_count=1),
+    ]
+    keys = [
+        audit.AuthorizedKeyFinding(
+            user="root",
+            file_path=shared_path,
+            line_number=1,
+            key_type="ED25519",
+            bits=256,
+            fingerprint="SHA256:root",
+            comment="root-only@test",
+            options=[],
+        ),
+        audit.AuthorizedKeyFinding(
+            user="alice",
+            file_path=shared_path,
+            line_number=1,
+            key_type="ED25519",
+            bits=256,
+            fingerprint="SHA256:alice",
+            comment="alice-only@test",
+            options=[],
+        ),
+    ]
+    report = audit.Report(
+        config_source="sshd -T",
+        effective_authorized_keys_file=[shared_path],
+        coverage_warnings=[],
+        server_config_issues=[],
+        host_keys=[],
+        authorized_key_files=files,
+        authorized_keys=keys,
+        duplicate_authorized_keys={},
+        private_keys=[],
+    )
+
+    audit.print_report(report, verbose=True)
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+
+    assert out.count("root-only@test") == 1
+    assert out.count("alice-only@test") == 1
+
+    i_root_header = next(i for i, ln in enumerate(lines) if ln.startswith("root: "))
+    i_alice_header = next(i for i, ln in enumerate(lines) if ln.startswith("alice: "))
+    i_root_comment = next(i for i, ln in enumerate(lines) if "root-only@test" in ln)
+    i_alice_comment = next(i for i, ln in enumerate(lines) if "alice-only@test" in ln)
+
+    if i_root_header < i_alice_header:
+        assert i_root_header < i_root_comment < i_alice_header < i_alice_comment
+    else:
+        assert i_alice_header < i_alice_comment < i_root_header < i_root_comment
 
 
 def test_cli_verbose_flag(keys, tmp_path, monkeypatch, capsys):

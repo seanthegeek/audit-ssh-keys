@@ -5,6 +5,8 @@ from __future__ import annotations
 import stat
 from pathlib import Path
 
+import pytest
+
 from audit_ssh_keys import audit
 
 
@@ -126,6 +128,126 @@ def test_fallback_parser_reads_multiple_files_in_order(tmp_path: Path):
 def test_fallback_parser_ignores_missing_files(tmp_path: Path):
     config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[tmp_path / "nope"])
     assert config == {}
+
+
+def _drop_in(tmp_path: Path, name: str, text: str) -> Path:
+    """Write a drop-in config file into tmp_path/"d", creating the directory."""
+    directory = tmp_path / "d"
+    directory.mkdir(exist_ok=True)
+    (directory / name).write_text(text)
+    return directory
+
+
+def test_fallback_parser_include_is_expanded_in_place(tmp_path: Path):
+    directory = _drop_in(tmp_path, "10-a.conf", "PermitRootLogin no\n")
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f"Include {directory}/*.conf\nPermitRootLogin yes\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    # The included file is read where the Include line sits, so its value is
+    # the first one seen and the main file's later line does not override it.
+    assert config["permitrootlogin"] == ["no"]
+
+
+def test_fallback_parser_include_glob_matches_in_sorted_order(tmp_path: Path):
+    # Written out of order on purpose: a parser that used directory order
+    # instead of sorted order would pick the 20- file here.
+    _drop_in(tmp_path, "20-b.conf", "PasswordAuthentication yes\n")
+    directory = _drop_in(tmp_path, "10-a.conf", "PasswordAuthentication no\n")
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f"Include {directory}/*.conf\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["passwordauthentication"] == ["no"]
+
+
+def test_fallback_parser_include_inside_match_is_not_followed(tmp_path: Path):
+    directory = _drop_in(tmp_path, "10-a.conf", "PermitRootLogin yes\n")
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f"StrictModes yes\nMatch User alice\n    Include {directory}/*.conf\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["strictmodes"] == ["yes"]
+    assert "permitrootlogin" not in config
+
+
+def test_fallback_parser_without_include_ignores_sibling_drop_ins(tmp_path: Path):
+    drop_ins = tmp_path / "sshd_config.d"
+    drop_ins.mkdir()
+    (drop_ins / "10-a.conf").write_text("PermitRootLogin yes\n")
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("StrictModes yes\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["strictmodes"] == ["yes"]
+    # No Include directive, so sshd never looks in sshd_config.d, and neither
+    # does the fallback parser.
+    assert "permitrootlogin" not in config
+
+
+def test_fallback_parser_default_reads_only_the_main_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """With no config_paths given, only /etc/ssh/sshd_config is read on its own."""
+    drop_ins = tmp_path / "sshd_config.d"
+    drop_ins.mkdir()
+    (drop_ins / "10-a.conf").write_text("PermitRootLogin yes\n")
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("StrictModes yes\n")
+    monkeypatch.setattr(audit, "SSHD_CONFIG", cfg)
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="")
+    assert config["strictmodes"] == ["yes"]
+    assert "permitrootlogin" not in config
+
+
+def test_fallback_parser_include_with_no_matches_is_ignored(tmp_path: Path):
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f"Include {tmp_path}/no-such-dir/*.conf\nStrictModes yes\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["strictmodes"] == ["yes"]
+
+
+def test_fallback_parser_self_include_terminates(tmp_path: Path):
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f"Include {cfg}\nStrictModes yes\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["strictmodes"] == ["yes"]
+
+
+def test_fallback_parser_later_include_does_not_override_an_earlier_value(tmp_path: Path):
+    directory = _drop_in(tmp_path, "10-a.conf", "PermitRootLogin yes\n")
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f"PermitRootLogin no\nInclude {directory}/*.conf\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    # First occurrence still wins across the Include boundary.
+    assert config["permitrootlogin"] == ["no"]
+
+
+def test_fallback_parser_include_path_with_a_space_can_be_quoted(tmp_path: Path):
+    """sshd splits Include arguments the way a shell does, so a path with a space can be quoted."""
+    directory = tmp_path / "sp ace"
+    directory.mkdir()
+    (directory / "10-a.conf").write_text("PermitRootLogin no\n")
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f'Include "{directory}/*.conf"\nPermitRootLogin yes\n')
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["permitrootlogin"] == ["no"]
+
+
+def test_fallback_parser_include_with_an_unbalanced_quote_is_skipped(tmp_path: Path):
+    """An Include sshd would reject outright is skipped, without stopping the parse."""
+    directory = _drop_in(tmp_path, "10-a.conf", "PermitRootLogin yes\n")
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f'Include "{directory}/*.conf\nStrictModes yes\n')
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert "permitrootlogin" not in config
+    assert config["strictmodes"] == ["yes"]
+
+
+def test_fallback_parser_relative_include_is_read_from_the_config_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A relative Include argument is looked for in sshd's config directory."""
+    _drop_in(tmp_path, "10-a.conf", "PermitRootLogin no\n")
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("Include d/*.conf\nPermitRootLogin yes\n")
+    monkeypatch.setattr(audit, "SSHD_CONFIG_DIR", tmp_path)
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert config["permitrootlogin"] == ["no"]
 
 
 # --- audit_server_config ------------------------------------------------------

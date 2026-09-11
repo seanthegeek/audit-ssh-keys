@@ -32,11 +32,13 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import glob
 import json
 import logging
 import os
 import pwd
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -70,18 +72,12 @@ DEFAULT_HOST_KEYS = [
     "/etc/ssh/ssh_host_dsa_key",  # not a modern default, but audit it if present
 ]
 SSHD_CONFIG = Path("/etc/ssh/sshd_config")
-SSHD_CONFIG_D = Path("/etc/ssh/sshd_config.d")
-
-# Key-type tokens that can start a bare (option-less) authorized_keys entry.
-KEY_TYPE_PREFIXES = (
-    "ssh-rsa",
-    "ssh-dss",
-    "ssh-ed25519",
-    "ecdsa-sha2-",
-    "sk-ecdsa-sha2-",
-    "sk-ssh-ed25519",
-    "ssh-xmss",
-)
+# Where sshd looks for the files named by a relative Include argument. This is
+# the directory sshd was compiled with, and it does not change when sshd is
+# pointed at another config file with -f, so it is not derived from SSHD_CONFIG.
+SSHD_CONFIG_DIR = Path("/etc/ssh")
+# How many levels of Include an sshd_config may nest; sshd's own limit.
+MAX_INCLUDE_DEPTH = 16
 
 # Signature algorithm names in sshd's *Algorithms lists that should not be accepted.
 WEAK_SIG_ALGORITHMS = {
@@ -198,8 +194,9 @@ def read_effective_sshd_config(
     config maps each lowercased keyword to a list of values (a list because
     some keywords, like HostKey, legitimately repeat). Prefers `sshd -T`,
     which resolves Include directives and gives the effective (non-Match)
-    values. Falls back to a naive parse of sshd_config + sshd_config.d/*.conf
-    when sshd isn't installed or -T fails.
+    values. When sshd isn't installed or -T fails, falls back to a naive parse
+    of sshd_config, following Include directives in place the way sshd does;
+    ignores Match blocks.
     """
     config: dict[str, list[str]] = defaultdict(list)
     sshd_error = ""
@@ -221,36 +218,80 @@ def read_effective_sshd_config(
     else:
         sshd_error = "sshd binary not found"
 
-    # Fallback: naive parse. Ignores Match blocks. First occurrence wins for
-    # single-valued keywords; HostKey accumulates.
+    # Fallback: naive parse of the config files themselves, Includes and all
+    # (see _parse_sshd_config_file).
     if config_paths is None:
         config_paths = [SSHD_CONFIG]
-        if SSHD_CONFIG_D.is_dir():
-            config_paths.extend(sorted(SSHD_CONFIG_D.glob("*.conf")))
     for cfg in config_paths:
-        if not cfg.is_file():
-            continue
-        try:
-            text = cfg.read_text(errors="ignore")
-        except OSError:
-            continue
-        in_match = False
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = re.split(r"\s+|=", line, maxsplit=1)
-            if len(parts) != 2:
-                continue
-            key, value = parts[0].lower(), parts[1].strip()
-            if key == "match":
-                in_match = True
-                continue
-            if in_match:
-                continue
-            if key == "hostkey" or key not in config:
-                config[key].append(value)
+        _parse_sshd_config_file(cfg, config)
     return dict(config), "parsed sshd_config (sshd -T unavailable)", sshd_error
+
+
+def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int = 0) -> None:
+    """Read one sshd_config file into config, following the Include directives in it.
+
+    Keeps the first value seen for each keyword, except HostKey, which
+    accumulates -- the same rule sshd uses. Match blocks are not evaluated, so
+    everything from the first Match line to the end of the file is skipped,
+    including any Include inside it. A file that is missing or unreadable is
+    skipped. depth counts how many Includes deep this file is; nesting stops at
+    MAX_INCLUDE_DEPTH, which is also what stops a file that includes itself.
+    """
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return
+
+    in_match = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = re.split(r"\s+|=", line, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        key, value = parts[0].lower(), parts[1].strip()
+        if key == "match":
+            in_match = True
+            continue
+        if in_match:
+            continue
+        if key == "include":
+            # Read the included files here, where the Include line sits, rather
+            # than after the rest of this file. It matters because the first
+            # value seen for a keyword is the one that counts: a drop-in
+            # included near the top of a file beats a value set further down in
+            # that same file. That is how the stock Ubuntu config works -- its
+            # Include line comes before everything else, so a setting in
+            # /etc/ssh/sshd_config.d wins over the rest of sshd_config.
+            if depth >= MAX_INCLUDE_DEPTH:
+                logger.debug("ignoring Include in %s: more than %s levels deep", path, MAX_INCLUDE_DEPTH)
+                continue
+            try:
+                # sshd splits the arguments the way a shell would, so a path
+                # with a space in it can be quoted. An unbalanced quote makes
+                # sshd refuse the whole config; there is nothing sensible to
+                # read here, so skip the line.
+                arguments = shlex.split(value)
+            except ValueError as exc:
+                logger.debug("ignoring unparseable Include in %s: %s", path, exc)
+                continue
+            for argument in arguments:
+                # sshd leaves an argument that starts with / or ~ alone (it
+                # does not expand ~, and neither does glob below) and prefixes
+                # anything else with its config directory. Each argument may be
+                # a shell glob pattern, and the files it matches are read in
+                # sorted order. Path.glob cannot do this: the whole pattern is
+                # one string here, and is usually an absolute path, which
+                # Path.glob refuses.
+                pattern = argument if argument.startswith(("/", "~")) else str(SSHD_CONFIG_DIR / argument)
+                for match in sorted(glob.glob(pattern)):  # noqa: PTH207
+                    _parse_sshd_config_file(Path(match), config, depth + 1)
+            continue
+        if key == "hostkey" or key not in config:
+            config.setdefault(key, []).append(value)
 
 
 def _parse_sshd_t_output(stdout: str) -> dict[str, list[str]]:
@@ -406,12 +447,12 @@ def _read_string(buf: bytes, offset: int) -> tuple[bytes, int]:
     return buf[offset:end], end
 
 
-def _openssh_key_blob(path: Path) -> bytes | None:
-    """Decode an OpenSSH-format private key file and return everything after the magic string.
+def _openssh_private_key_lines(path: Path) -> list[str] | None:
+    """Read a file's stripped, non-blank lines if it is an OpenSSH-format private key.
 
-    Returns None when the file cannot be read, is not in OpenSSH's own private
-    key format, or its base64 body is corrupt or does not start with the
-    expected "openssh-key-v1" marker.
+    Returns None when the file cannot be read, or its first non-blank line is
+    not the OpenSSH private-key header (for example a PEM/PKCS#8 key, or
+    anything that is not a key at all).
     """
     try:
         text = path.read_text(errors="ignore")
@@ -419,6 +460,30 @@ def _openssh_key_blob(path: Path) -> bytes | None:
         return None
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines or lines[0] != "-----BEGIN OPENSSH PRIVATE KEY-----":
+        return None
+    return lines
+
+
+def _is_openssh_format(path: Path) -> bool:
+    """True when the file's first non-blank line is the OpenSSH private-key header.
+
+    Used to tell a corrupt OpenSSH-format key (which must be reported as
+    unfingerprintable, not confused with whatever `.pub` file happens to sit
+    next to it) apart from the older PEM/PKCS#8 formats, where falling back
+    to a `.pub` file is the intended behaviour.
+    """
+    return _openssh_private_key_lines(path) is not None
+
+
+def _openssh_key_blob(path: Path) -> bytes | None:
+    """Decode an OpenSSH-format private key file and return everything after the magic string.
+
+    Returns None when the file cannot be read, is not in OpenSSH's own private
+    key format, or its base64 body is corrupt or does not start with the
+    expected "openssh-key-v1" marker.
+    """
+    lines = _openssh_private_key_lines(path)
+    if lines is None:
         return None
     body = "".join(ln for ln in lines[1:] if not ln.startswith("-----"))
     try:
@@ -476,11 +541,17 @@ def fingerprint_private_key(path: Path) -> tuple[tuple[str, int, str, str] | Non
     `.pub` file is stale or belongs to a different key, and anything copied out
     of it authorises the wrong key.
 
-    Keys in the older PEM formats do not carry a readable public half, so for
-    those the `.pub` file is used, and failing that ssh-keygen is asked to read
-    the private key directly (which works only when it has no passphrase).
+    The fallbacks below apply only to keys in the older PEM/PKCS#8 formats,
+    which do not carry a readable public half: for those, the `.pub` file is
+    used, and failing that ssh-keygen is asked to read the private key
+    directly (which works only when it has no passphrase). A key in the
+    current OpenSSH format whose embedded public half cannot be read is
+    corrupt, and is reported as unfingerprintable no matter what `.pub` file
+    sits next to it -- that file says nothing about which key this one is.
     """
     line = public_key_from_private(path)
+    if line is None and _is_openssh_format(path):
+        return None, None
     result = fingerprint_line(line) if line else None
 
     pub = pub_sibling(path)
@@ -565,16 +636,42 @@ def looks_like_private_key(path: Path) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+def _is_bare_key_line(stripped: str) -> bool:
+    """True when an authorized_keys line starts with a key rather than with options.
+
+    This is the same test sshd makes before it goes looking for options: the
+    second field has to be base64 whose first item (a 4-byte length, then that
+    many bytes) spells out the same type name as the first field. Every OpenSSH
+    public key -- plain, certificate, security-key, and whatever is added next
+    -- is built that way, so key types this tool has never heard of are still
+    recognised, which a list of known type names could not do.
+    """
+    fields = stripped.split(None, 2)
+    if len(fields) < 2:
+        return False
+    type_name, blob = fields[0], fields[1]
+    try:
+        raw = base64.b64decode(blob, validate=True)
+        embedded, _ = _read_string(raw, 0)
+        return embedded == type_name.encode("ascii")
+    except (binascii.Error, ValueError, UnicodeEncodeError):
+        # Not base64, too short to hold a length-prefixed string, or a type
+        # name with non-ASCII characters in it: whatever this line is, it does
+        # not start with a key.
+        return False
+
+
 def split_options(line: str) -> tuple[list[str], str]:
     """Split an authorized_keys line into (options, key-material-and-comment).
 
     Options are comma-separated and may contain quoted strings with commas
-    or escaped quotes (e.g. command="foo,bar"). A line that starts directly
-    with a key type has no options.
+    or escaped quotes (e.g. command="foo,bar"). A line whose second field is a
+    key blob naming the same type as its first field has no options -- the same
+    test sshd applies before it looks for options, so key types this tool has
+    never seen still parse.
     """
     stripped = line.strip()
-    first_token = stripped.split(None, 1)[0]
-    if any(first_token.startswith(p) for p in KEY_TYPE_PREFIXES):
+    if _is_bare_key_line(stripped):
         return [], stripped
 
     options: list[str] = []
@@ -814,13 +911,16 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
 
         result, mismatch = fingerprint_private_key(path)
         if result is None:
-            findings.append(HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", "could not fingerprint host key")]))
-            continue
-        key_type, bits, fingerprint, _ = result
-        types_present.add(key_type.upper())
+            finding = HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", "could not fingerprint host key")])
+        else:
+            key_type, bits, fingerprint, _ = result
+            types_present.add(key_type.upper())
+            finding = HostKeyFinding(str(path), key_type, bits, fingerprint)
+            finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
 
-        finding = HostKeyFinding(str(path), key_type, bits, fingerprint)
-        finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
+        # These checks apply regardless of whether the key could be fingerprinted:
+        # an unreadable or corrupt key can still be world-readable, wrongly owned,
+        # or passphrase-protected, and sshd rejects it for those reasons too.
         if mismatch is not None:
             finding.issues.append(mismatch)
         perm_issues = check_private_key_perms(path, expected_uid=owner_uid)
@@ -1120,13 +1220,13 @@ def print_report(report: Report, verbose: bool = False) -> None:
         print(f"\n=== authorized_keys ({n_files} file(s), {n_keys} key(s)) ===")
         print(f"AuthorizedKeysFile: {' '.join(report.effective_authorized_keys_file) or 'none'}")
         if verbose:
-            keys_by_file: dict[str, list[AuthorizedKeyFinding]] = defaultdict(list)
+            keys_by_account_file: dict[tuple[str, str], list[AuthorizedKeyFinding]] = defaultdict(list)
             for k in report.authorized_keys:
-                keys_by_file[k.file_path].append(k)
+                keys_by_account_file[k.user, k.file_path].append(k)
             for f in report.authorized_key_files:
                 print(f"\n{f.user}: {f.file_path} ({f.key_count} key(s))")
                 _print_issues(f.issues)
-                for k in sorted(keys_by_file[f.file_path], key=lambda k: k.line_number):
+                for k in sorted(keys_by_account_file[f.user, f.file_path], key=lambda k: k.line_number):
                     _print_key_entry(k)
         else:
             for f in (f for f in report.authorized_key_files if f.issues):

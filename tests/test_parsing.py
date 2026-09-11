@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import struct
 from pathlib import Path
 
 import pytest
@@ -12,18 +14,55 @@ from tests.conftest import make_user
 # --- split_options -----------------------------------------------------------
 
 
+def _blob(type_name: str) -> str:
+    """A base64 public-key blob that names type_name, the way a real key does.
+
+    Every OpenSSH public key starts with its own type name as the first piece
+    of wire data: a 32-bit length followed by that many bytes. The four bytes
+    after it stand in for the rest of the key, which nothing here looks at.
+    """
+    raw = struct.pack(">I", len(type_name)) + type_name.encode("ascii") + struct.pack(">I", 4) + b"xxxx"
+    return base64.b64encode(raw).decode("ascii")
+
+
 @pytest.mark.parametrize(
     "line",
     [
-        "ssh-ed25519 AAAA comment",
-        "ssh-rsa AAAA",
-        "ecdsa-sha2-nistp256 AAAA c",
-        "sk-ssh-ed25519@openssh.com AAAA c",
-        "ssh-rsa-cert-v01@openssh.com AAAA c",
+        f"ssh-ed25519 {_blob('ssh-ed25519')} comment",
+        f"ssh-rsa {_blob('ssh-rsa')}",
+        f"ecdsa-sha2-nistp256 {_blob('ecdsa-sha2-nistp256')} c",
+        f"sk-ssh-ed25519@openssh.com {_blob('sk-ssh-ed25519@openssh.com')} c",
+        f"ssh-rsa-cert-v01@openssh.com {_blob('ssh-rsa-cert-v01@openssh.com')} c",
+        # Added in OpenSSH 10.4 (July 2026); never in any prefix list this
+        # tool had, so it proves the structural check.
+        f"ssh-mldsa44-ed25519@openssh.com {_blob('ssh-mldsa44-ed25519@openssh.com')} c",
+        f"ssh-mldsa44-ed25519-cert-v01@openssh.com {_blob('ssh-mldsa44-ed25519-cert-v01@openssh.com')} c",
     ],
 )
 def test_split_options_bare_key_has_no_options(line: str):
     assert audit.split_options(line) == ([], line)
+
+
+def test_split_options_type_name_not_matching_blob_is_treated_as_options():
+    """A first field that the blob does not name is not a key, so it reads as options.
+
+    sshd would then fail to parse the rest as a key and skip the line; this
+    tool reports it as an unparseable entry.
+    """
+    opts, rest = audit.split_options(f"ssh-rsa {_blob('ssh-ed25519')} c")
+    assert opts == ["ssh-rsa"]
+    assert rest == f"{_blob('ssh-ed25519')} c"
+
+
+def test_split_options_quoted_option_containing_a_type_name():
+    blob = _blob("ssh-ed25519")
+    opts, rest = audit.split_options(f'command="ssh-rsa x" ssh-ed25519 {blob} c')
+    assert opts == ['command="ssh-rsa x"']
+    assert rest == f"ssh-ed25519 {blob} c"
+
+
+def test_split_options_single_field_line_falls_through():
+    assert audit.split_options("ssh-ed25519") == (["ssh-ed25519"], "")
 
 
 def test_split_options_simple():
