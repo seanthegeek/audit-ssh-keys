@@ -54,8 +54,8 @@ sudo audit-ssh-keys --json     # machine-readable, for pipelines and fleet rollu
 | Section | Checks |
 | ------- | ------ |
 | Server configuration | Weak signature algorithms still accepted (`ssh-dss`, SHA-1 `ssh-rsa`); `StrictModes no`; `PermitRootLogin yes`; password auth enabled |
-| Host keys | Algorithm and size; ownership and mode (`sshd` refuses group/other-accessible host keys); a `.pub` file next to the key checked against the key itself; configured-but-missing keys; passphrase-protected keys; missing Ed25519 key |
-| `authorized_keys` | Every account, every configured path; algorithm and size; what `StrictModes` would reject (the file and every directory above it, up to `$HOME` for a file inside the home directory and otherwise up to `/`, must be owned by the user or root and not group/world-writable); the same key reused across accounts; unrestricted keys on uid-0 accounts; malformed lines |
+| Host keys | Algorithm and size; ownership and mode (`sshd` refuses group/other-accessible host keys); a `.pub` file next to the key checked against the key itself; configured-but-missing keys; passphrase-protected keys; missing Ed25519 key; recently changed keys (opt-in) |
+| `authorized_keys` | Every account, every configured path; algorithm and size; what `StrictModes` would reject (the file and every directory above it, up to `$HOME` for a file inside the home directory and otherwise up to `/`, must be owned by the user or root and not group/world-writable); the same key reused across accounts; unrestricted keys on uid-0 accounts; malformed lines; files changed or unchanged within a chosen window (opt-in) |
 | Private keys in `~/.ssh` | Algorithm and size; ownership and mode; whether a passphrase is set; a `.pub` file next to the key checked against the key itself |
 
 Every finding has a severity (CRITICAL, HIGH, MEDIUM, LOW, INFO). See

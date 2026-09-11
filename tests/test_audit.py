@@ -13,6 +13,7 @@ import pwd
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
@@ -48,6 +49,11 @@ def _write_ak(user: pwd.struct_passwd, lines: list[str], mode: int = 0o600) -> P
     ak.write_text("\n".join(lines) + "\n")
     ak.chmod(mode)
     return ak
+
+
+# Fixed "now" for the modification-time checks below, so they never depend on the wall clock.
+_A_DAY = 86400
+_FAKE_NOW = 1_700_000_000.0
 
 
 # --- filesystem helpers -------------------------------------------------
@@ -1311,6 +1317,68 @@ def test_host_keys_unstattable_path_is_low_not_a_crash(tmp_path: Path):
     assert finding.issues[0].message.startswith("could not stat host key")
 
 
+# --- audit_host_keys changed-within check --------------------------------------
+
+
+def test_host_keys_changed_within_fires_with_the_medium_message(keys: dict[str, Path], tmp_path: Path):
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o600)
+    mtime = _FAKE_NOW - 2 * _A_DAY
+    os.utime(ed, (mtime, mtime))
+
+    findings = audit.audit_host_keys(
+        {"hostkey": [str(ed)]}, min_rsa_bits=3072, owner_uid=os.getuid(), changed_within_days=7, now=_FAKE_NOW
+    )
+
+    date = time.strftime("%Y-%m-%d", time.localtime(mtime))
+    expected = (
+        f"modified within the last {audit._days(7)} (last change {date}); clients now see a new fingerprint, "
+        "confirm this was a planned rotation"
+    )
+    finding = next(f for f in findings if f.path == str(ed))
+    assert [i.message for i in finding.issues if i.severity == "MEDIUM"] == [expected]
+
+
+def test_host_keys_changed_within_does_not_fire_outside_the_window(keys: dict[str, Path], tmp_path: Path):
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o600)
+    mtime = _FAKE_NOW - 10 * _A_DAY
+    os.utime(ed, (mtime, mtime))
+
+    findings = audit.audit_host_keys(
+        {"hostkey": [str(ed)]}, min_rsa_bits=3072, owner_uid=os.getuid(), changed_within_days=7, now=_FAKE_NOW
+    )
+
+    finding = next(f for f in findings if f.path == str(ed))
+    assert not any("modified within" in i.message for i in finding.issues)
+
+
+def test_host_keys_changed_within_does_not_fire_when_none(keys: dict[str, Path], tmp_path: Path):
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o600)
+    mtime = _FAKE_NOW - 2 * _A_DAY
+    os.utime(ed, (mtime, mtime))
+
+    findings = audit.audit_host_keys({"hostkey": [str(ed)]}, min_rsa_bits=3072, owner_uid=os.getuid(), now=_FAKE_NOW)
+
+    finding = next(f for f in findings if f.path == str(ed))
+    assert not any("modified within" in i.message for i in finding.issues)
+
+
+def test_host_keys_changed_within_missing_configured_key_gets_no_age_issue(tmp_path: Path):
+    missing = tmp_path / "ssh_host_ed25519_key"
+
+    findings = audit.audit_host_keys(
+        {"hostkey": [str(missing)]}, min_rsa_bits=3072, changed_within_days=7, now=_FAKE_NOW
+    )
+
+    finding = next(f for f in findings if f.path == str(missing))
+    assert [i.message for i in finding.issues] == ["configured HostKey does not exist"]
+
+
 # --- audit_authorized_keys ---------------------------------------------------
 
 
@@ -2066,6 +2134,201 @@ def test_authorized_keys_empty_file_still_reports_file_issues(tmp_path: Path):
     assert any(i.severity == "HIGH" and str(ak) in i.message for i in files[0].issues)
 
 
+# --- authorized_keys modification-time checks -----------------------------------
+
+
+def test_authorized_keys_unchanged_for_fires_on_a_stale_file(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+    mtime = _FAKE_NOW - 400 * _A_DAY
+    os.utime(ak, (mtime, mtime))
+
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], unchanged_for_days=365, now=_FAKE_NOW)
+
+    date = time.strftime("%Y-%m-%d", time.localtime(mtime))
+    expected = (
+        "not modified in 365 days (last change "
+        f"{date}); every key in it is at least that old and may never have been reviewed"
+    )
+    assert [i.message for i in files[0].issues if i.severity == "LOW"] == [expected]
+
+
+def test_authorized_keys_unchanged_for_message_uses_the_singular_day(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+    mtime = _FAKE_NOW - 2 * _A_DAY
+    os.utime(ak, (mtime, mtime))
+
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], unchanged_for_days=1, now=_FAKE_NOW)
+
+    date = time.strftime("%Y-%m-%d", time.localtime(mtime))
+    expected = (
+        f"not modified in 1 day (last change {date}); every key in it is at least "
+        "that old and may never have been reviewed"
+    )
+    assert [i.message for i in files[0].issues if i.severity == "LOW"] == [expected]
+
+
+def test_authorized_keys_unchanged_for_does_not_fire_when_not_old_enough(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+    mtime = _FAKE_NOW - 300 * _A_DAY
+    os.utime(ak, (mtime, mtime))
+
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], unchanged_for_days=365, now=_FAKE_NOW)
+
+    assert files[0].issues == []
+
+
+def test_authorized_keys_unchanged_for_does_not_fire_when_the_option_is_off(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+    mtime = _FAKE_NOW - 400 * _A_DAY
+    os.utime(ak, (mtime, mtime))
+
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], now=_FAKE_NOW)
+
+    assert files[0].issues == []
+
+
+def test_authorized_keys_unchanged_for_does_not_fire_on_a_file_with_no_keys(tmp_path: Path):
+    """A file that grants nothing has no stale keys to flag, however old it is."""
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, ["# only a comment"])
+    mtime = _FAKE_NOW - 400 * _A_DAY
+    os.utime(ak, (mtime, mtime))
+
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], unchanged_for_days=365, now=_FAKE_NOW)
+
+    assert files[0].key_count == 0
+    assert not any("not modified in" in i.message for i in files[0].issues)
+
+
+def test_authorized_keys_unchanged_for_does_not_fire_on_a_file_with_only_an_unparseable_line(tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, ["ssh-rsa notreallyakey garbage@x"])
+    mtime = _FAKE_NOW - 400 * _A_DAY
+    os.utime(ak, (mtime, mtime))
+
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], unchanged_for_days=365, now=_FAKE_NOW)
+
+    assert files[0].key_count == 0
+    assert not any("not modified in" in i.message for i in files[0].issues)
+
+
+def test_authorized_keys_unchanged_for_boundary_is_strictly_greater_than(keys: dict[str, Path], tmp_path: Path):
+    """Exactly DAYS days old must not fire; one second older must."""
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+
+    exactly = _FAKE_NOW - 365 * _A_DAY
+    os.utime(ak, (exactly, exactly))
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], unchanged_for_days=365, now=_FAKE_NOW)
+    assert not any("not modified in" in i.message for i in files[0].issues)
+
+    one_second_older = exactly - 1
+    os.utime(ak, (one_second_older, one_second_older))
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], unchanged_for_days=365, now=_FAKE_NOW)
+    assert any("not modified in" in i.message for i in files[0].issues)
+
+
+def test_authorized_keys_changed_within_fires_on_a_recently_modified_file(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+    mtime = _FAKE_NOW - 2 * _A_DAY
+    os.utime(ak, (mtime, mtime))
+
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], changed_within_days=7, now=_FAKE_NOW)
+
+    date = time.strftime("%Y-%m-%d", time.localtime(mtime))
+    expected = f"modified within the last 7 days (last change {date}); confirm the change was expected"
+    assert [i.message for i in files[0].issues if i.severity == "MEDIUM"] == [expected]
+
+
+def test_authorized_keys_changed_within_does_not_fire_when_older_than_the_window(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+    mtime = _FAKE_NOW - 10 * _A_DAY
+    os.utime(ak, (mtime, mtime))
+
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], changed_within_days=7, now=_FAKE_NOW)
+
+    assert not any("modified within" in i.message for i in files[0].issues)
+
+
+def test_authorized_keys_changed_within_does_not_fire_when_the_option_is_off(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+    mtime = _FAKE_NOW - 2 * _A_DAY
+    os.utime(ak, (mtime, mtime))
+
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], now=_FAKE_NOW)
+
+    assert not any("modified within" in i.message for i in files[0].issues)
+
+
+def test_authorized_keys_changed_within_fires_on_a_comment_only_file(tmp_path: Path):
+    """Any change counts, even when the file has zero active keys."""
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, ["# only a comment"])
+    mtime = _FAKE_NOW - 2 * _A_DAY
+    os.utime(ak, (mtime, mtime))
+
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], changed_within_days=7, now=_FAKE_NOW)
+
+    assert files[0].key_count == 0
+    assert any("modified within" in i.message for i in files[0].issues)
+
+
+def test_authorized_keys_changed_within_boundary_is_less_than_or_equal(keys: dict[str, Path], tmp_path: Path):
+    """Exactly DAYS days old must fire; one second older must not."""
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+
+    exactly = _FAKE_NOW - 7 * _A_DAY
+    os.utime(ak, (exactly, exactly))
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], changed_within_days=7, now=_FAKE_NOW)
+    assert any("modified within" in i.message for i in files[0].issues)
+
+    one_second_older = exactly - 1
+    os.utime(ak, (one_second_older, one_second_older))
+    _, files, _, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice], changed_within_days=7, now=_FAKE_NOW)
+    assert not any("modified within" in i.message for i in files[0].issues)
+
+
+def test_authorized_keys_both_options_set_a_file_gets_only_the_applicable_one(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+
+    recent = _write_ak(alice, [pub(keys["ed25519"])])
+    recent_mtime = _FAKE_NOW - 2 * _A_DAY
+    os.utime(recent, (recent_mtime, recent_mtime))
+    _, files, _, _, _ = audit.audit_authorized_keys(
+        {}, 3072, users=[alice], unchanged_for_days=7, changed_within_days=7, now=_FAKE_NOW
+    )
+    assert [i.severity for i in files[0].issues] == ["MEDIUM"]
+
+    stale = _write_ak(alice, [pub(keys["ed25519"])])
+    stale_mtime = _FAKE_NOW - 10 * _A_DAY
+    os.utime(stale, (stale_mtime, stale_mtime))
+    _, files, _, _, _ = audit.audit_authorized_keys(
+        {}, 3072, users=[alice], unchanged_for_days=7, changed_within_days=7, now=_FAKE_NOW
+    )
+    assert [i.severity for i in files[0].issues] == ["LOW"]
+
+
 # --- audit_private_keys --------------------------------------------------------
 
 
@@ -2398,6 +2661,39 @@ def test_run_audit_and_report_smoke(
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["host_keys"] == []
     assert "coverage_warnings" in parsed
+
+
+@pytest.mark.parametrize(
+    "flag", ["--authorized-keys-unchanged-for", "--authorized-keys-changed-within", "--host-keys-changed-within"]
+)
+def test_main_modification_time_option_below_one_is_rejected(flag: str):
+    with pytest.raises(SystemExit):
+        audit.main([flag, "0"])
+
+
+def test_main_modification_time_options_run_together(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("AuthorizedKeysFile none\n")
+    monkeypatch.setattr(audit, "SSHD_CONFIG", cfg)
+    monkeypatch.setattr(audit, "_find_sshd", lambda: None)
+    monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nope")])
+    monkeypatch.setattr(audit.pwd, "getpwall", lambda: [])
+
+    audit.main(
+        [
+            "--json",
+            "--authorized-keys-unchanged-for",
+            "365",
+            "--authorized-keys-changed-within",
+            "7",
+            "--host-keys-changed-within",
+            "7",
+        ]
+    )
+
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["authorized_key_files"] == []
+    assert parsed["host_keys"] == []
 
 
 def test_main_without_ssh_keygen_raises(monkeypatch: pytest.MonkeyPatch):
