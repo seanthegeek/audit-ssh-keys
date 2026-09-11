@@ -1240,17 +1240,21 @@ def split_options(line: str) -> tuple[list[str], str]:
     for options, so key types this tool has never seen still parse.
 
     An empty option (an empty string between two commas, or before the first
-    comma) is kept in the returned list, because sshd treats it as a real,
-    unrecognized option name and throws the whole line out for it -- a leading
-    comma or a doubled comma is a broken line, not a no-op. The one exception
-    is a single trailing empty option made by a comma sitting right before the
-    space that ends the options. sshd's option loop stops as soon as it sees
-    that space, before it ever tries to read another option name, so a
-    trailing comma there is accepted and produces no empty option; this
-    function drops it too, so its result matches what sshd actually parsed. A
-    comma at the very end of a line with nothing after it is different: sshd
-    calls that "unexpected end-of-options" and rejects the line, so the empty
-    option is kept there (such a line has no key on it anyway).
+    comma) is dropped from the returned list rather than kept. sshd's option
+    loop (sshauthopt_parse() in auth-options.c) has no final "else" after its
+    chain of option-name matches: when a token matches none of them, the only
+    reason the line is rejected is that the character right after the token
+    is not a comma. An empty token -- from a leading comma or a doubled comma
+    -- leaves the loop looking at a comma, which it just skips, so the line
+    is accepted with that option ignored. A live OpenSSH 10.2 login test
+    confirmed it: ",no-pty <key>" and "no-pty,,restrict <key>" were both
+    accepted, while "no-pty,bogus <key>" was rejected. Dropping empty
+    elements here matches that; keeping them would make this tool reject
+    lines sshd accepts. The one edge that doesn't matter for this function:
+    a comma at the very end of an options-only string (nothing after it at
+    all) is "unexpected end-of-options" to sshd -- but a line like that has
+    no key material after the options, so it is already reported as
+    malformed before options are even checked.
     """
     stripped = line.strip()
     if _is_bare_key_line(stripped):
@@ -1282,22 +1286,13 @@ def split_options(line: str) -> tuple[list[str], str]:
             options.append("".join(current))
             current = []
         elif ch in " \t":
-            # The space or tab that ends the options: a trailing comma just
-            # before it (current is empty) is dropped, not kept as an empty
-            # option -- see the docstring.
-            tail = "".join(current)
-            if tail:
-                options.append(tail)
-            return options, stripped[i:].strip()
+            options.append("".join(current))
+            return [o for o in options if o], stripped[i:].strip()
         else:
             current.append(ch)
         i += 1
-    # End of the line while still reading options (no key material follows).
-    # A trailing comma here is kept as an empty option: sshd rejects it as
-    # "unexpected end-of-options" rather than stopping quietly -- see the
-    # docstring.
     options.append("".join(current))
-    return options, ""
+    return [o for o in options if o], ""
 
 
 # Options that take no value. sshd accepts each of these on its own, and each
