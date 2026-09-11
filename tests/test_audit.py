@@ -318,6 +318,10 @@ def test_strictmodes_empty_pw_dir_does_not_stop_the_walk_early(tmp_path: Path):
         (0o604, ["CRITICAL"]),
         (0o644, ["CRITICAL"]),
         (0o666, ["CRITICAL"]),
+        (0o601, ["LOW"]),
+        (0o610, ["LOW"]),
+        (0o602, ["LOW"]),
+        (0o710, ["LOW"]),
     ],
 )
 def test_private_key_perms_modes(tmp_path: Path, mode: int, expected: list[str]):
@@ -326,6 +330,18 @@ def test_private_key_perms_modes(tmp_path: Path, mode: int, expected: list[str])
     key.chmod(mode)
     issues = audit.check_private_key_perms(key, expected_uid=os.getuid())
     assert [i.severity for i in issues] == expected
+
+
+@pytest.mark.parametrize("mode", [0o601, 0o610, 0o602])
+def test_private_key_perms_unreadable_group_other_bits_message(tmp_path: Path, mode: int):
+    """A group/other bit that isn't a read bit gets its own LOW, not the CRITICAL/HIGH read-disclosure message."""
+    key = tmp_path / "key"
+    key.write_text("x")
+    key.chmod(mode)
+    issues = audit.check_private_key_perms(key, expected_uid=os.getuid())
+    assert len(issues) == 1
+    assert issues[0].severity == "LOW"
+    assert issues[0].message == f"group/other bits set but not readable by them (mode {mode:04o})"
 
 
 def test_private_key_perms_wrong_owner(tmp_path: Path):
@@ -1249,6 +1265,10 @@ def test_host_keys_from_config(keys: dict[str, Path], tmp_path: Path):
 
     assert [i.message for i in by_path[str(tmp_path / "missing")].issues] == ["configured HostKey does not exist"]
     assert "(none)" not in by_path  # an Ed25519 key is present, so no "missing Ed25519" entry
+    # A missing configured HostKey gets its own per-file finding, never the
+    # "no default host key" aggregate -- that one only applies when nothing
+    # was configured at all.
+    assert not any("no host key exists at any default path" in i.message for f in findings for i in f.issues)
 
 
 def test_host_key_naming_a_public_key_file_with_an_agent_is_info(keys: dict[str, Path], tmp_path: Path):
@@ -1557,6 +1577,25 @@ def test_host_key_that_cannot_be_fingerprinted_clean_perms_only_gets_the_lows(tm
     assert any("passphrase" in m for m in sev["LOW"])
 
 
+def test_host_key_unreadable_group_other_bits_gets_the_sshd_refuses_suffix(tmp_path: Path):
+    """Mode 0601 on a host key gets the new LOW, with the same 'sshd refuses to load it' suffix as the others."""
+    host_key = tmp_path / "ssh_host_rsa_key"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "rsa", "-b", "2048", "-N", "", "-f", str(host_key)],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    host_key.chmod(0o601)
+
+    findings = audit.audit_host_keys({"hostkey": [str(host_key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    finding = next(f for f in findings if f.path == str(host_key))
+    sev = _by_sev(finding.issues)
+    assert sev["LOW"] == ["group/other bits set but not readable by them (mode 0601); sshd refuses to load it"]
+    assert "CRITICAL" not in sev
+    assert "HIGH" not in sev
+
+
 def test_host_key_stale_pub_is_flagged_and_the_private_key_wins(keys: dict[str, Path], tmp_path: Path):
     """The .pub file next to a host key is only checked against the key, never trusted over it."""
     host_key = tmp_path / "ssh_host_ed25519_key"
@@ -1590,9 +1629,38 @@ def test_host_key_whose_private_half_ssh_cannot_load_is_not_fingerprinted(keys: 
 
 
 def test_host_keys_defaults_when_unconfigured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """No HostKey configured and none of the defaults exist: sshd has no host key at all and won't start."""
     monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nope")])
-    # Unconfigured + missing default is silently skipped (no LOW), and no Ed25519 nag without any keys.
-    assert audit.audit_host_keys({}, min_rsa_bits=3072) == []
+    findings = audit.audit_host_keys({}, min_rsa_bits=3072)
+    assert [(f.path, f.key_type, f.bits, f.fingerprint) for f in findings] == [("(none)", "?", 0, "")]
+    assert [(i.severity, i.message) for i in findings[0].issues] == [
+        ("LOW", "no host key exists at any default path; sshd has no host key and will not start")
+    ]
+    # The aggregate stands on its own; it must not be followed by the Ed25519 nag too.
+    assert not any("no Ed25519 host key present" in i.message for f in findings for i in f.issues)
+
+
+def test_host_keys_defaults_all_unstattable_reports_only_the_stat_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A default path that could not even be stat'd must not be reported as 'no host key exists'.
+
+    Not knowing whether the file is there is different from knowing it is not:
+    the aggregate "no host key exists at any default path" finding requires
+    every default path to have been confirmed absent.
+    """
+
+    def raise_permission_denied(path: Path) -> bool:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nope")])
+    monkeypatch.setattr(audit, "_is_regular_file", raise_permission_denied)
+
+    findings = audit.audit_host_keys({}, min_rsa_bits=3072)
+
+    messages = [i.message for f in findings for i in f.issues]
+    assert any("could not stat host key" in m for m in messages)
+    assert not any("no host key exists at any default path" in m for m in messages)
 
 
 def test_host_keys_defaults_mixed_missing_and_present(
@@ -1610,6 +1678,7 @@ def test_host_keys_defaults_mixed_missing_and_present(
 
     assert [f.path for f in findings] == [str(present)]
     assert findings[0].key_type == "ED25519"
+    assert not any("no host key exists at any default path" in i.message for f in findings for i in f.issues)
 
 
 def test_host_key_none_on_its_own_is_reported_as_no_host_key_at_all():
@@ -2855,13 +2924,16 @@ def test_run_audit_and_report_smoke(
     monkeypatch.setattr(audit.pwd, "getpwall", lambda: [])
 
     report = audit.run_audit(3072, do_host=True, do_authorized=True, do_private=True)
-    assert report.host_keys == [] and report.authorized_keys == [] and report.private_keys == []
+    # No HostKey is configured and the (monkeypatched) default doesn't exist,
+    # so sshd has no host key at all -- that is itself a finding, not silence.
+    assert [(f.path, f.key_type) for f in report.host_keys] == [("(none)", "?")]
+    assert report.authorized_keys == [] and report.private_keys == []
     assert any("AuthorizedKeysFile is 'none'" in w for w in report.coverage_warnings)
 
     audit.print_report(report)
     out = capsys.readouterr().out
     assert "Coverage warnings" in out
-    assert out.strip().endswith("Totals: no issues")
+    assert out.strip().endswith("Totals: LOW: 1")
 
     audit.main(["--json", "--skip-host"])
     import json

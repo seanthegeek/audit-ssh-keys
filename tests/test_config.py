@@ -353,8 +353,13 @@ def test_fallback_parser_expands_a_tilde_account_name(tmp_path: Path):
     assert config["authorizedkeysfile"] == [f"{running.pw_dir.rstrip('/')}/keys"]
 
 
-def test_fallback_parser_leaves_an_unknown_tilde_account_alone(tmp_path: Path):
+def test_fallback_parser_leaves_an_unknown_tilde_account_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """There is no home directory to expand to for an account that does not exist, and sshd refuses the config."""
+
+    def no_such_account(name: str) -> pwd.struct_passwd:
+        raise KeyError(f"getpwnam(): name not found: {name}")
+
+    monkeypatch.setattr(audit.pwd, "getpwnam", no_such_account)
     cfg = tmp_path / "sshd_config"
     cfg.write_text("AuthorizedKeysFile ~no-such-account-here/keys\n")
     config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])

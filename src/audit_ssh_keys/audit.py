@@ -74,7 +74,11 @@ DEFAULT_HOST_KEYS = [
     # Post-quantum hybrid signature key, added to sshd's default HostKey list in
     # OpenSSH 10.x (pathnames.h's _PATH_HOST_MLDSA44_ED25519_KEY_FILE, servconf.c).
     "/etc/ssh/ssh_host_mldsa44_ed25519_key",
-    "/etc/ssh/ssh_host_dsa_key",  # not a modern default, but audit it if present
+    # Not a default since OpenSSH 7.0, and DSA support was removed in 10.0, but
+    # sshd releases before 7.0 did load this key by default. This list is only
+    # used when `sshd -T` is unavailable, which is where such old releases land,
+    # so the file is audited whenever it is present.
+    "/etc/ssh/ssh_host_dsa_key",
 ]
 SSHD_CONFIG = Path("/etc/ssh/sshd_config")
 # Where sshd looks for the files named by a relative Include argument. This is
@@ -1504,8 +1508,17 @@ def check_strictmodes_path(path: Path, owner: pwd.struct_passwd) -> list[Issue]:
 def check_private_key_perms(path: Path, expected_uid: int) -> list[Issue]:
     """Private keys must be owned by the expected user (or root) and unreadable by group/others.
 
-    sshd applies the same rule to host keys: a host key with any group/other
-    permission bits is refused with "UNPROTECTED PRIVATE KEY FILE".
+    Only the read bits raise the severity that assumes someone else can copy
+    the key out: world- or group-readable is CRITICAL/HIGH because that is a
+    straight disclosure. A write or execute bit with no matching read bit
+    discloses nothing, but it is not a clean file either -- `sshkey_perm_ok()`
+    in ssh's authfile.c (see `_ssh_keygen_would_refuse()` above) refuses to
+    load a key owned by the account running the program if it has any
+    group/other bit at all, read or not, and sshd applies the same rule to a
+    root-owned host key. A write bit also lets that group or anyone replace
+    the file, though ssh refuses to load the replacement for the same reason.
+    Such a mode gets its own LOW finding instead of being folded into the
+    read-based ones.
     """
     issues: list[Issue] = []
     try:
@@ -1515,10 +1528,12 @@ def check_private_key_perms(path: Path, expected_uid: int) -> list[Issue]:
     mode = stat.S_IMODE(st.st_mode)
     if st.st_uid not in (expected_uid, 0):
         issues.append(Issue("HIGH", f"owned by {uid_name(st.st_uid)}, expected {_owner_phrase(expected_uid)}"))
-    if mode & 0o007:
+    if mode & 0o004:
         issues.append(Issue("CRITICAL", f"world-accessible private key (mode {mode:04o})"))
-    elif mode & 0o070:
+    elif mode & 0o040:
         issues.append(Issue("HIGH", f"group-accessible private key (mode {mode:04o})"))
+    elif mode & 0o077:
+        issues.append(Issue("LOW", f"group/other bits set but not readable by them (mode {mode:04o})"))
     return issues
 
 
@@ -1779,7 +1794,7 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
         # produces is what says which case this is.
         wrong_owner = any(issue.message.startswith("owned by ") for issue in perm_issues)
         for issue in perm_issues:
-            if "accessible" in issue.message:
+            if issue.message.startswith(("world-accessible", "group-accessible", "group/other bits")):
                 issue.message += (
                     "; sshd still loads it because root does not own it" if wrong_owner else "; sshd refuses to load it"
                 )
@@ -1788,6 +1803,27 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
         if enc is True:
             finding.issues.append(Issue("LOW", "host key is passphrase-protected; sshd cannot load it unattended"))
         findings.append(finding)
+
+    if not configured and not findings:
+        # No HostKey was configured at all, so the fallback DEFAULT_HOST_KEYS
+        # paths were tried instead -- and none of them exist. `not findings` is
+        # the right guard: if any default path could not even be stat'd, that
+        # already produced a "could not stat host key" finding above, and then
+        # this tool cannot say no key exists, only that it could not check.
+        # With nothing here at all, sshd has no host key to offer and exits
+        # with "no hostkeys available -- exiting" (verified against OpenSSH
+        # 10.2), so this is returned on its own rather than falling through to
+        # the Ed25519 note below, which has nothing to say about a host with
+        # no key at all.
+        return [
+            HostKeyFinding(
+                "(none)",
+                "?",
+                0,
+                "",
+                [Issue("LOW", "no host key exists at any default path; sshd has no host key and will not start")],
+            )
+        ]
 
     # Only say an Ed25519 host key is missing when every key file that is there
     # was identified. A key this tool could not stat or could not fingerprint --
