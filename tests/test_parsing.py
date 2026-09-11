@@ -280,6 +280,29 @@ def test_expand_pattern_empty_pw_dir_uses_filesystem_root():
     assert audit.expand_authorized_keys_pattern("%h/.ssh/authorized_keys", nohome) == "/.ssh/authorized_keys"
 
 
+def test_expand_pattern_does_not_rescan_substituted_text():
+    """sshd's percent_expand() (misc.c) makes a single left-to-right pass: each %x token is replaced by its
+    value and the scan continues after the inserted text, so that text is never itself rescanned for more
+    tokens. A chained str.replace() implementation gets this wrong -- it replaces %h with the home directory
+    and then, as a separate step, replaces any %u/%U left in the *whole* string, including inside the home
+    directory it just inserted. A home of "/srv/%u" must come out literally, not with the username spliced in.
+    """
+    user = pwd.struct_passwd(("srvuser", "x", 1000, 1000, "srvuser", "/srv/%u", "/bin/sh"))
+    assert audit.expand_authorized_keys_pattern("%h/.ssh/authorized_keys", user) == "/srv/%u/.ssh/authorized_keys"
+
+
+def test_expand_pattern_double_percent_is_not_username():
+    """%%u is the literal-percent token %% followed by a literal 'u', not %% followed by the %u token."""
+    alice = make_user("alice", 1000, Path("/home/alice"))
+    assert audit.expand_authorized_keys_pattern("/k/%%u", alice) == "/k/%u"
+
+
+def test_expand_pattern_username_containing_percent_h_is_not_reexpanded():
+    """A username that happens to contain the text '%h' is inserted as-is, not expanded a second time."""
+    user = pwd.struct_passwd(("a%hb", "x", 1000, 1000, "a%hb", "/home/a%hb", "/bin/sh"))
+    assert audit.expand_authorized_keys_pattern("/keys/%u", user) == "/keys/a%hb"
+
+
 # --- cfg_value ---------------------------------------------------------------
 
 

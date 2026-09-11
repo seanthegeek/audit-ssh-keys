@@ -70,6 +70,9 @@ DEFAULT_HOST_KEYS = [
     "/etc/ssh/ssh_host_rsa_key",
     "/etc/ssh/ssh_host_ecdsa_key",
     "/etc/ssh/ssh_host_ed25519_key",
+    # Post-quantum hybrid signature key, added to sshd's default HostKey list in
+    # OpenSSH 10.x (pathnames.h's _PATH_HOST_MLDSA44_ED25519_KEY_FILE, servconf.c).
+    "/etc/ssh/ssh_host_mldsa44_ed25519_key",
     "/etc/ssh/ssh_host_dsa_key",  # not a modern default, but audit it if present
 ]
 SSHD_CONFIG = Path("/etc/ssh/sshd_config")
@@ -247,7 +250,7 @@ def read_effective_sshd_config(
     sshd = sshd_bin if sshd_bin is not None else _find_sshd()
     if sshd:
         try:
-            proc = subprocess.run([sshd, "-T"], capture_output=True, text=True, check=False)
+            proc = subprocess.run([sshd, "-T"], capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
         except OSError as exc:
             proc = None
             sshd_error = str(exc)
@@ -385,6 +388,7 @@ def read_user_sshd_config(user_name: str, sshd_bin: str) -> dict[str, list[str]]
             capture_output=True,
             text=True,
             check=False,
+            stdin=subprocess.DEVNULL,
         )
     except OSError as exc:
         logger.debug("could not run sshd -T -C user=%s: %s", user_name, exc)
@@ -436,14 +440,32 @@ def home_dir(user: pwd.struct_passwd) -> Path:
 
 
 def expand_authorized_keys_pattern(pattern: str, user: pwd.struct_passwd) -> str:
-    """Expand sshd AuthorizedKeysFile tokens (%%, %h, %u, %U) for one account."""
-    path = (
-        pattern.replace("%%", "\x00")
-        .replace("%h", user.pw_dir)
-        .replace("%u", user.pw_name)
-        .replace("%U", str(user.pw_uid))
-        .replace("\x00", "%")
-    )
+    """Expand sshd AuthorizedKeysFile tokens (%%, %h, %u, %U) for one account.
+
+    This has to match sshd's percent_expand() (misc.c), which makes a single
+    left-to-right pass over the pattern: each %x token is replaced by its
+    value and the scan continues right after the inserted text, so that text
+    is never itself rescanned for more tokens. Chained str.replace() calls
+    get this wrong -- replacing %h with the home directory and then, as a
+    separate step, replacing %u/%U anywhere in the string would also expand
+    a %u or %U that the home directory itself happens to contain.
+    """
+
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if token == "%":
+            return "%"
+        if token == "h":
+            return user.pw_dir
+        if token == "u":
+            return user.pw_name
+        if token == "U":
+            return str(user.pw_uid)
+        # sshd rejects any other %token while loading the config, so this
+        # tool never sees one; left untouched rather than raising, just in case.
+        return match.group(0)
+
+    path = re.sub(r"%(.)", repl, pattern)
     if not path.startswith("/"):
         path = str(home_dir(user) / path)
     return path

@@ -409,6 +409,7 @@ def _pem_key(path: Path, passphrase: str = "") -> Path:
         ["ssh-keygen", "-q", "-t", "rsa", "-b", "2048", "-m", "PEM", "-N", passphrase, "-f", str(path)],
         check=True,
         capture_output=True,
+        stdin=subprocess.DEVNULL,
     )
     return path
 
@@ -1274,6 +1275,23 @@ def test_host_keys_defaults_when_unconfigured(tmp_path: Path, monkeypatch: pytes
     monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nope")])
     # Unconfigured + missing default is silently skipped (no LOW), and no Ed25519 nag without any keys.
     assert audit.audit_host_keys({}, min_rsa_bits=3072) == []
+
+
+def test_host_keys_defaults_mixed_missing_and_present(
+    keys: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The fallback list is used when no `HostKey` is configured: a missing entry in it is skipped silently,
+
+    while an entry that does exist is audited exactly as a configured one would be. This is what makes it
+    safe to add a new default path (such as the ML-DSA hybrid key) that most hosts do not have yet.
+    """
+    present = keys["ed25519"]
+    monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nope"), str(present)])
+
+    findings = audit.audit_host_keys({}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    assert [f.path for f in findings] == [str(present)]
+    assert findings[0].key_type == "ED25519"
 
 
 @needs_non_root
@@ -2403,6 +2421,7 @@ def test_audit_py_runs_standalone_without_the_package(tmp_path: Path):
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == "audit-ssh-keys unknown"

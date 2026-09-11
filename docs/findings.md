@@ -33,6 +33,7 @@ Algorithm checks only run when `sshd -T` succeeds, because only it prints the fu
 | `group-accessible private key` | HIGH | `sshd` refuses to load it ("UNPROTECTED PRIVATE KEY FILE") | `chmod 600` |
 | `owned by X, expected root` | HIGH | `sshd` refuses to load it | `chown root:root` |
 | `configured HostKey does not exist` | LOW | `sshd` logs an error at start; harmless if another key is present | Remove the line or `ssh-keygen -A` |
+| `could not stat host key` | LOW | The tool could not even tell whether the file is there — for example, permission denied on a directory above it, which happens when the tool is not running as root. Different from a configured key that is confirmed absent, which has its own row above | Run as root, or fix the directory permissions |
 | `host key is passphrase-protected` | LOW | `sshd` cannot load it at boot | Regenerate without a passphrase |
 | `<name>.pub does not match this private key` | LOW | The public file next to the key is stale or belongs to a different key, so anything copied out of it — into an `authorized_keys` file, a config-management repo, a `known_hosts` entry — authorises the wrong key | Regenerate it: `ssh-keygen -y -f <key> > <key>.pub` |
 | `no Ed25519 host key present` | LOW | Ed25519 is the current best-practice host key | `ssh-keygen -A` |

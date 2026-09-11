@@ -65,7 +65,7 @@ def keygen(path: Path, key_type: str, bits: int | None = None, passphrase: str =
     cmd = ["ssh-keygen", "-q", "-t", key_type, "-f", str(path), "-N", passphrase, "-C", comment]
     if bits:
         cmd += ["-b", str(bits)]
-    subprocess.run(cmd, check=True, capture_output=True)
+    subprocess.run(cmd, check=True, capture_output=True, stdin=subprocess.DEVNULL)
     return path
 
 
