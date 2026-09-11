@@ -48,7 +48,7 @@ The exit code does not reflect findings, so the tool is safe to run from cron or
 | `authorized_key_files` | One entry per file: `user`, `file_path`, `key_count`, `issues` |
 | `authorized_keys` | One entry per key: `user`, `file_path`, `line_number`, `key_type`, `bits`, `fingerprint`, `comment`, `options`, `issues` |
 | `duplicate_authorized_keys` | `{fingerprint: ["user path:line", ...]}` for keys authorised in more than one place |
-| `private_keys` | One entry per private key: `user`, `path`, `key_type`, `bits`, `fingerprint`, `encrypted`, `issues` |
+| `private_keys` | One entry per private key: `user`, `path`, `key_type`, `bits`, `fingerprint`, `encrypted` (`true`, `false`, or `null` when the file format was not recognised), `issues` |
 
 Every `issues` entry is `{"severity": "...", "message": "..."}`.
 
@@ -56,7 +56,13 @@ Fingerprints are SHA256, as printed by `ssh-keygen -l`, so they can be joined ag
 
 ## Fleet use
 
-The tool is a single stdlib-only package, so it can be copied to a host and run with `python3 -m audit_ssh_keys` without installing anything beyond `openssh-client`. A typical rollup:
+The tool is stdlib-only, so there is no install step required to run it on a host. Three ways to do that:
+
+- Copy the whole `src/audit_ssh_keys/` directory to the host and run `python3 -m audit_ssh_keys` from the directory that contains it.
+- Copy just `audit.py` (it has no other files it depends on) and run `python3 audit.py`. Run this way, `--version` reports `unknown` because the package's version file was not copied along with it.
+- Install the wheel (`pip install audit-ssh-keys`) and use the `audit-ssh-keys` console script.
+
+A typical rollup:
 
 ```bash
 for h in host1 host2 host3; do

@@ -51,6 +51,41 @@ def test_no_sshd_binary_reports_missing(tmp_path: Path):
     assert err == "sshd binary not found"
 
 
+def _fake_sshd_with_match(tmp_path: Path) -> str:
+    """A fake sshd whose -T output depends on `-C user=`, the way a Match User block would."""
+    script = tmp_path / "sshd_match"
+    script.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *user=bob*) echo 'authorizedkeysfile /custom/%u' ;;\n"
+        "  *) echo 'authorizedkeysfile .ssh/authorized_keys' ;;\n"
+        "esac\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    return str(script)
+
+
+# --- read_user_sshd_config --------------------------------------------------
+
+
+def test_read_user_sshd_config_applies_match_blocks(tmp_path: Path):
+    sshd = _fake_sshd_with_match(tmp_path)
+    assert audit.read_user_sshd_config("bob", sshd) == {"authorizedkeysfile": ["/custom/%u"]}
+    assert audit.read_user_sshd_config("alice", sshd) == {"authorizedkeysfile": [".ssh/authorized_keys"]}
+
+
+def test_read_user_sshd_config_is_none_when_sshd_fails(tmp_path: Path):
+    assert audit.read_user_sshd_config("bob", _fake_sshd(tmp_path, stdout="strictmodes yes", rc=255)) is None
+
+
+def test_read_user_sshd_config_is_none_when_sshd_prints_nothing(tmp_path: Path):
+    assert audit.read_user_sshd_config("bob", _fake_sshd(tmp_path)) is None
+
+
+def test_read_user_sshd_config_is_none_when_sshd_cannot_be_run(tmp_path: Path):
+    assert audit.read_user_sshd_config("bob", str(tmp_path / "no-such-sshd")) is None
+
+
 # --- read_effective_sshd_config: fallback parser ----------------------------
 
 
@@ -117,6 +152,8 @@ def test_weak_algorithms_flagged_only_with_sshd_t():
     issues, coverage = audit.audit_server_config(config, "parsed sshd_config", "boom")
     assert not any("accepts" in m for m in _msgs(issues))
     assert coverage and "boom" in coverage[0]
+    # The fallback parser skips Match blocks, so the warning has to say so.
+    assert "Match blocks were not applied" in coverage[0]
 
 
 def test_coverage_warnings_for_external_key_sources():

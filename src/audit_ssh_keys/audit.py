@@ -42,10 +42,17 @@ import stat
 import subprocess
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from audit_ssh_keys import __version__
+try:
+    from audit_ssh_keys import __version__
+except ImportError:
+    # audit.py can be copied to a host on its own (see docs/usage.md, "Fleet
+    # use") and run without the rest of the package, so this lookup must not
+    # be a hard dependency.
+    __version__ = "unknown"
 
 logger = logging.getLogger(__name__)
 
@@ -147,14 +154,18 @@ class FileFinding:
 
 @dataclass
 class PrivateKeyFinding:
-    """A private key found in a user's ~/.ssh."""
+    """A private key found in a user's ~/.ssh.
+
+    encrypted is True (passphrase-protected), False (no passphrase), or None
+    when the file format could not be recognised and neither could be determined.
+    """
 
     user: str
     path: str
     key_type: str
     bits: int
     fingerprint: str
-    encrypted: bool
+    encrypted: bool | None
     issues: list[Issue] = field(default_factory=list)
 
 
@@ -182,13 +193,13 @@ def read_effective_sshd_config(
     sshd_bin: str | None = None,
     config_paths: list[Path] | None = None,
 ) -> tuple[dict[str, list[str]], str, str]:
-    """Return ({lowercased keyword: [values]}, source) for the effective sshd config.
+    """Return (config, source, sshd_error) for the effective sshd config.
 
-    Returns (config, source, sshd_error). Values are lists because some
-    keywords (HostKey) legitimately repeat.
-    Prefers `sshd -T`, which resolves Include directives and gives the
-    effective (non-Match) values. Falls back to a naive parse of
-    sshd_config + sshd_config.d/*.conf when sshd isn't installed or -T fails.
+    config maps each lowercased keyword to a list of values (a list because
+    some keywords, like HostKey, legitimately repeat). Prefers `sshd -T`,
+    which resolves Include directives and gives the effective (non-Match)
+    values. Falls back to a naive parse of sshd_config + sshd_config.d/*.conf
+    when sshd isn't installed or -T fails.
     """
     config: dict[str, list[str]] = defaultdict(list)
     sshd_error = ""
@@ -201,11 +212,7 @@ def read_effective_sshd_config(
             proc = None
             sshd_error = str(exc)
         if proc is not None and proc.returncode == 0 and proc.stdout.strip():
-            for line in proc.stdout.splitlines():
-                parts = line.split(None, 1)
-                if len(parts) == 2:
-                    config[parts[0].lower()].append(parts[1].strip())
-            return dict(config), "sshd -T", ""
+            return _parse_sshd_t_output(proc.stdout), "sshd -T", ""
         if proc is not None:
             logger.debug("sshd -T exited %s: %s", proc.returncode, proc.stderr.strip())
             # sshd -T validates the whole config, so its stderr is itself a finding.
@@ -246,6 +253,49 @@ def read_effective_sshd_config(
     return dict(config), "parsed sshd_config (sshd -T unavailable)", sshd_error
 
 
+def _parse_sshd_t_output(stdout: str) -> dict[str, list[str]]:
+    """Turn the output of `sshd -T` into {lowercased keyword: [values]}.
+
+    Each line is "keyword value". Values are collected in a list because a few
+    keywords (HostKey, for one) can appear more than once.
+    """
+    config: dict[str, list[str]] = defaultdict(list)
+    for line in stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            config[parts[0].lower()].append(parts[1].strip())
+    return dict(config)
+
+
+def read_user_sshd_config(user_name: str, sshd_bin: str) -> dict[str, list[str]] | None:
+    """Return the effective sshd config for one account, or None if it cannot be read.
+
+    Plain `sshd -T` prints the configuration with no `Match` block applied.
+    Adding `-C user=<name>` tells sshd to work out the configuration it would
+    use for that account, so `Match User` and `Match Group` blocks that change
+    AuthorizedKeysFile are honoured. Criteria that depend on an actual
+    connection (`Match Address`, `LocalPort`, and friends) cannot be evaluated
+    here, so sshd treats them as not matching.
+
+    Returns None when sshd cannot be run, exits non-zero, or prints nothing;
+    the caller then falls back to the global configuration.
+    """
+    try:
+        proc = subprocess.run(
+            [sshd_bin, "-T", "-C", f"user={user_name}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        logger.debug("could not run sshd -T -C user=%s: %s", user_name, exc)
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        logger.debug("sshd -T -C user=%s exited %s: %s", user_name, proc.returncode, proc.stderr.strip())
+        return None
+    return _parse_sshd_t_output(proc.stdout)
+
+
 def _find_sshd() -> str | None:
     """Locate the sshd binary; it usually lives in a sbin dir that is not on a user's PATH."""
     found = shutil.which("sshd")
@@ -280,6 +330,17 @@ def expand_authorized_keys_pattern(pattern: str, user: pwd.struct_passwd) -> str
 # --------------------------------------------------------------------------- #
 # ssh-keygen helpers
 # --------------------------------------------------------------------------- #
+
+
+def pub_sibling(path: Path) -> Path:
+    """The public-key file that would sit next to a private key: the full name plus '.pub'.
+
+    Not `path.with_suffix(".pub")` — that replaces text after the last dot in
+    the name, which mangles a private key file whose name already contains a
+    dot (for example, ``host.key`` becomes ``host.pub`` instead of
+    ``host.key.pub``).
+    """
+    return path.with_name(path.name + ".pub")
 
 
 def parse_fingerprint_output(out: str) -> tuple[str, int, str, str] | None:
@@ -322,6 +383,125 @@ def fingerprint_file(path: Path) -> tuple[str, int, str, str] | None:
     return parse_fingerprint_output(proc.stdout)
 
 
+def _read_uint32(buf: bytes, offset: int) -> tuple[int, int]:
+    """Read a big-endian 32-bit number at offset; return (value, offset after it).
+
+    Raises ValueError if the four bytes are not all present.
+    """
+    if offset < 0 or offset + 4 > len(buf):
+        raise ValueError(f"want 4 bytes at offset {offset}, buffer is {len(buf)} bytes")
+    return int.from_bytes(buf[offset : offset + 4], "big"), offset + 4
+
+
+def _read_string(buf: bytes, offset: int) -> tuple[bytes, int]:
+    """Read one SSH wire-format string (a 32-bit length then that many bytes).
+
+    Returns (bytes, offset after them). Raises ValueError if the length field
+    or the bytes it promises run past the end of buf.
+    """
+    length, offset = _read_uint32(buf, offset)
+    end = offset + length
+    if end > len(buf):
+        raise ValueError(f"string of {length} bytes at offset {offset} runs past the end of a {len(buf)}-byte buffer")
+    return buf[offset:end], end
+
+
+def _openssh_key_blob(path: Path) -> bytes | None:
+    """Decode an OpenSSH-format private key file and return everything after the magic string.
+
+    Returns None when the file cannot be read, is not in OpenSSH's own private
+    key format, or its base64 body is corrupt or does not start with the
+    expected "openssh-key-v1" marker.
+    """
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines or lines[0] != "-----BEGIN OPENSSH PRIVATE KEY-----":
+        return None
+    body = "".join(ln for ln in lines[1:] if not ln.startswith("-----"))
+    try:
+        raw = base64.b64decode(body, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    magic = b"openssh-key-v1\x00"
+    if not raw.startswith(magic):
+        return None
+    return raw[len(magic) :]
+
+
+def public_key_from_private(path: Path) -> str | None:
+    """Return the "<type> <base64>" public-key line stored inside an OpenSSH private key file.
+
+    An OpenSSH-format private key file keeps the public half in the clear at
+    the front of the file, even when the private half is passphrase-protected.
+    That means the key's type, size and fingerprint can be read without the
+    passphrase and without ssh-keygen having to open the file (which it refuses
+    to do when the file is readable by anyone else).
+
+    Returns None for anything that is not an OpenSSH-format private key, or
+    whose contents are truncated or otherwise unreadable.
+    """
+    blob = _openssh_key_blob(path)
+    if blob is None:
+        return None
+    try:
+        _cipher, offset = _read_string(blob, 0)
+        _kdf, offset = _read_string(blob, offset)
+        _kdf_options, offset = _read_string(blob, offset)
+        nkeys, offset = _read_uint32(blob, offset)
+        if nkeys < 1:
+            return None
+        public_blob, _ = _read_string(blob, offset)
+        key_type, _ = _read_string(public_blob, 0)
+        name = key_type.decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not name:
+        return None
+    return f"{name} {base64.b64encode(public_blob).decode()}"
+
+
+def fingerprint_private_key(path: Path) -> tuple[tuple[str, int, str, str] | None, Issue | None]:
+    """Fingerprint a private key, and check any `.pub` file next to it against it.
+
+    Returns (result, mismatch_issue). result is the (type, bits, fingerprint,
+    comment) tuple, or None when the key could not be fingerprinted at all.
+
+    The public half stored inside the private key file is the authoritative
+    answer: it is there even when the key is passphrase-protected, and reading
+    it does not depend on the file's permissions. A `<name>.pub` file sitting
+    next to the key is only compared against it — if the two disagree, the
+    `.pub` file is stale or belongs to a different key, and anything copied out
+    of it authorises the wrong key.
+
+    Keys in the older PEM formats do not carry a readable public half, so for
+    those the `.pub` file is used, and failing that ssh-keygen is asked to read
+    the private key directly (which works only when it has no passphrase).
+    """
+    line = public_key_from_private(path)
+    result = fingerprint_line(line) if line else None
+
+    pub = pub_sibling(path)
+    pub_result = fingerprint_file(pub) if pub.is_file() else None
+
+    mismatch: Issue | None = None
+    if result is not None and pub_result is not None and result[2] != pub_result[2]:
+        mismatch = Issue(
+            "LOW",
+            f"{pub.name} does not match this private key (public file is {pub_result[0]} {pub_result[2]})",
+        )
+
+    if result is None:
+        result = pub_result
+        if result is None and not pub.is_file():
+            # ssh-keygen prefers a .pub sibling when one exists, so this is only
+            # worth trying when there is none.
+            result = fingerprint_file(path)
+    return result, mismatch
+
+
 def private_key_is_encrypted(path: Path) -> bool | None:
     """True if a passphrase is required, False if not, None if the format is unrecognised.
 
@@ -343,19 +523,17 @@ def private_key_is_encrypted(path: Path) -> bool | None:
     header = lines[0]
 
     if header == "-----BEGIN OPENSSH PRIVATE KEY-----":
-        body = "".join(ln for ln in lines[1:] if not ln.startswith("-----"))
+        blob = _openssh_key_blob(path)
+        if blob is None:
+            return None
         try:
-            raw = base64.b64decode(body, validate=True)
-        except (binascii.Error, ValueError):
+            cipher, _ = _read_string(blob, 0)
+        except ValueError:
+            # Truncated or corrupt body: the cipher name field itself is missing or
+            # cut short, so we cannot tell "none" (unencrypted) from an actual cipher.
             return None
-        magic = b"openssh-key-v1\x00"
-        if not raw.startswith(magic):
+        if not cipher:
             return None
-        offset = len(magic)
-        if len(raw) < offset + 4:
-            return None
-        cipher_len = int.from_bytes(raw[offset : offset + 4], "big")
-        cipher = raw[offset + 4 : offset + 4 + cipher_len]
         return cipher != b"none"
 
     if header == "-----BEGIN ENCRYPTED PRIVATE KEY-----":
@@ -456,32 +634,54 @@ def grade_options(options: list[str], user: pwd.struct_passwd) -> list[Issue]:
     return []
 
 
-def check_strictmodes_path(path: Path, owner: pwd.struct_passwd) -> list[Issue]:
-    """Replicate what sshd StrictModes enforces for the file, ~/.ssh and $HOME.
+def _check_one_strictmodes_path(p: Path, owner: pwd.struct_passwd) -> list[Issue]:
+    """Apply sshd's owner-and-mode rule to a single file or directory.
 
-    sshd refuses a file if it, its directory, or the home directory is
-    group- or world-writable, or owned by anyone other than the user or root.
+    The rule: it must be owned by the account or by root, and must not be
+    writable by group or others. Read bits are irrelevant. A path that cannot
+    be stat'ed is reported LOW, because the tool could not check it.
+    """
+    try:
+        st = p.stat()
+    except OSError as exc:
+        return [Issue("LOW", f"could not stat {p}: {exc}")]
+    issues: list[Issue] = []
+    mode = stat.S_IMODE(st.st_mode)
+    if st.st_uid not in (owner.pw_uid, 0):
+        issues.append(Issue("HIGH", f"{p} is owned by {uid_name(st.st_uid)}, not {_owner_phrase(owner.pw_uid)}"))
+    if mode & 0o022:
+        issues.append(Issue("HIGH", f"{p} is group/world-writable (mode {mode:04o})"))
+    return issues
+
+
+def check_strictmodes_path(path: Path, owner: pwd.struct_passwd) -> list[Issue]:
+    """Replicate what sshd StrictModes enforces for an authorized_keys file.
+
+    sshd follows any symbolic links first, then checks the file itself and
+    every directory above it in turn. Each one must be owned by the account or
+    by root and must not be writable by group or others. The walk stops once it
+    has checked the account's home directory, if the file is inside it; a file
+    somewhere else (say under /etc) is checked all the way up to /, which is
+    why an authorized_keys file under a world-writable directory such as /tmp
+    is rejected outright.
+
     Anything that would be rejected is HIGH: either the key is silently
     unusable (StrictModes yes) or another account can inject keys
     (StrictModes no).
     """
-    issues: list[Issue] = []
-    to_check = [path, path.parent]
-    home = Path(owner.pw_dir)
-    if path.is_relative_to(home) and home not in to_check:
-        to_check.append(home)
+    try:
+        real = path.resolve(strict=True)
+    except OSError as exc:
+        return [Issue("LOW", f"could not resolve {path}: {exc}")]
 
-    for p in to_check:
-        try:
-            st = p.stat()
-        except OSError as exc:
-            issues.append(Issue("LOW", f"could not stat {p}: {exc}"))
-            continue
-        mode = stat.S_IMODE(st.st_mode)
-        if st.st_uid not in (owner.pw_uid, 0):
-            issues.append(Issue("HIGH", f"{p} is owned by {uid_name(st.st_uid)}, not {owner.pw_name} or root"))
-        if mode & 0o022:
-            issues.append(Issue("HIGH", f"{p} is group/world-writable (mode {mode:04o})"))
+    home = Path(owner.pw_dir)
+    home_real = home.resolve() if home.exists() else None
+
+    issues = _check_one_strictmodes_path(real, owner)
+    for parent in real.parents:
+        issues.extend(_check_one_strictmodes_path(parent, owner))
+        if home_real is not None and parent == home_real:
+            break
     return issues
 
 
@@ -498,7 +698,7 @@ def check_private_key_perms(path: Path, expected_uid: int) -> list[Issue]:
         return [Issue("LOW", f"could not stat {path}: {exc}")]
     mode = stat.S_IMODE(st.st_mode)
     if st.st_uid not in (expected_uid, 0):
-        issues.append(Issue("HIGH", f"owned by {uid_name(st.st_uid)}, expected {uid_name(expected_uid)} or root"))
+        issues.append(Issue("HIGH", f"owned by {uid_name(st.st_uid)}, expected {_owner_phrase(expected_uid)}"))
     if mode & 0o007:
         issues.append(Issue("CRITICAL", f"world-accessible private key (mode {mode:04o})"))
     elif mode & 0o070:
@@ -512,6 +712,17 @@ def uid_name(uid: int) -> str:
         return pwd.getpwuid(uid).pw_name
     except KeyError:
         return str(uid)
+
+
+def _owner_phrase(uid: int) -> str:
+    """Phrase describing an accepted owner: just 'root' for uid 0, else 'name or root'.
+
+    sshd always accepts root as an alternate owner, so a plain uid-0 case
+    should read as "expected root", not the redundant "expected root or root".
+    """
+    if uid == 0:
+        return "root"
+    return f"{uid_name(uid)} or root"
 
 
 # --------------------------------------------------------------------------- #
@@ -540,7 +751,10 @@ def audit_server_config(
                     if weak in accepted:
                         issues.append(Issue("MEDIUM", f"{label} accepts {weak} ({desc})"))
     else:
-        coverage.append(f"sshd -T failed ({sshd_error}); accepted-algorithm lists were not checked.")
+        coverage.append(
+            f"sshd -T failed ({sshd_error}); accepted-algorithm lists were not checked "
+            "and Match blocks were not applied."
+        )
 
     if cfg_value(config, "authorizedkeyscommand", "none").lower() != "none":
         coverage.append(
@@ -557,15 +771,26 @@ def audit_server_config(
     if cfg_value(config, "pubkeyauthentication", "yes").lower() == "no":
         coverage.append("PubkeyAuthentication is 'no'; authorized_keys entries are currently inert.")
     if cfg_value(config, "permitrootlogin", "prohibit-password").lower() == "yes":
-        issues.append(Issue("MEDIUM", "PermitRootLogin is 'yes' (password login as root allowed)"))
+        issues.append(
+            Issue(
+                "MEDIUM",
+                "PermitRootLogin is 'yes'; permits password login as root when PasswordAuthentication is enabled",
+            )
+        )
     if cfg_value(config, "passwordauthentication", "yes").lower() == "yes":
         issues.append(Issue("INFO", "PasswordAuthentication is 'yes'; keys are not the only login path"))
 
     return issues, coverage
 
 
-def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int) -> list[HostKeyFinding]:
-    """Fingerprint and grade each configured (or default) host key."""
+def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_uid: int = 0) -> list[HostKeyFinding]:
+    """Fingerprint and grade each configured (or default) host key.
+
+    Host keys must be owned by root, so owner_uid defaults to 0. It is
+    injectable (like the repo's other audit functions take users=,
+    config_paths=, sshd_bin=) so tests can run as an ordinary user and still
+    exercise the ownership check without needing real root-owned files.
+    """
     paths = config.get("hostkey") or DEFAULT_HOST_KEYS
     findings: list[HostKeyFinding] = []
     seen: set[str] = set()
@@ -584,9 +809,7 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int) -> list[Hos
                 )
             continue
 
-        result = fingerprint_file(path.with_suffix(".pub")) if path.with_suffix(".pub").is_file() else None
-        if result is None:
-            result = fingerprint_file(path)
+        result, mismatch = fingerprint_private_key(path)
         if result is None:
             findings.append(HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", "could not fingerprint host key")]))
             continue
@@ -595,7 +818,9 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int) -> list[Hos
 
         finding = HostKeyFinding(str(path), key_type, bits, fingerprint)
         finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
-        perm_issues = check_private_key_perms(path, expected_uid=0)
+        if mismatch is not None:
+            finding.issues.append(mismatch)
+        perm_issues = check_private_key_perms(path, expected_uid=owner_uid)
         for issue in perm_issues:
             if "accessible" in issue.message:
                 issue.message += "; sshd refuses to load it"
@@ -623,8 +848,17 @@ def audit_authorized_keys(
     config: dict[str, list[str]],
     min_rsa_bits: int,
     users: list[pwd.struct_passwd] | None = None,
+    user_config: Callable[[pwd.struct_passwd], dict[str, list[str]] | None] | None = None,
 ) -> tuple[list[str], list[FileFinding], list[AuthorizedKeyFinding], dict[str, list[str]], list[str]]:
-    """Scan every account's authorized_keys files per the effective AuthorizedKeysFile."""
+    """Scan every account's authorized_keys files per the effective AuthorizedKeysFile.
+
+    user_config, when given, is asked for each account's own effective config
+    (see read_user_sshd_config), so a Match block that changes
+    AuthorizedKeysFile for some accounts is honoured. It may return None for an
+    account, in which case the global configuration is used for it.
+
+    The returned pattern list is the global one, not any per-account override.
+    """
     patterns = cfg_value(config, "authorizedkeysfile", " ".join(DEFAULT_AUTHORIZED_KEYS_PATTERNS)).split()
     coverage: list[str] = []
     if patterns == ["none"]:
@@ -634,14 +868,33 @@ def audit_authorized_keys(
     files: list[FileFinding] = []
     keys: list[AuthorizedKeyFinding] = []
     fp_locations: dict[str, list[str]] = defaultdict(list)
-    seen_paths: set[str] = set()
+    # (account, path): sshd consults a shared absolute path for every account,
+    # so the same file has to be scanned once per account -- but a pattern
+    # listed twice for one account is still only scanned once.
+    seen_paths: set[tuple[str, str]] = set()
+    # One ssh-keygen call per distinct key line, not per account that has it.
+    fingerprints: dict[str, tuple[str, int, str, str] | None] = {}
 
     for user in sorted(users if users is not None else pwd.getpwall(), key=lambda u: u.pw_uid):
-        for pattern in patterns:
+        user_patterns = patterns
+        if user_config is not None:
+            account_config = user_config(user)
+            if account_config is not None:
+                user_patterns = cfg_value(
+                    account_config, "authorizedkeysfile", " ".join(DEFAULT_AUTHORIZED_KEYS_PATTERNS)
+                ).split()
+        if user_patterns == ["none"]:
+            coverage.append(
+                f"AuthorizedKeysFile is 'none' for {user.pw_name} (Match block); "
+                "sshd reads no authorized_keys files for that account."
+            )
+            continue
+
+        for pattern in user_patterns:
             path = Path(expand_authorized_keys_pattern(pattern, user))
-            if str(path) in seen_paths or not path.is_file():
+            if (user.pw_name, str(path)) in seen_paths or not path.is_file():
                 continue
-            seen_paths.add(str(path))
+            seen_paths.add((user.pw_name, str(path)))
 
             file_finding = FileFinding(user=user.pw_name, file_path=str(path), key_count=0)
             file_finding.issues.extend(check_strictmodes_path(path, user))
@@ -658,7 +911,13 @@ def audit_authorized_keys(
                 if not line or line.startswith("#"):
                     continue
                 options, key_material = split_options(line)
-                result = fingerprint_line(key_material) if key_material else None
+                if not key_material:
+                    result = None
+                elif key_material in fingerprints:
+                    result = fingerprints[key_material]
+                else:
+                    result = fingerprint_line(key_material)
+                    fingerprints[key_material] = result
                 if result is None:
                     file_finding.issues.append(Issue("LOW", f"line {idx}: unparseable entry (ignored by sshd)"))
                     continue
@@ -727,16 +986,18 @@ def audit_private_keys(
                 key_type="?",
                 bits=0,
                 fingerprint="",
-                encrypted=bool(encrypted),
+                encrypted=encrypted,
             )
-            # Fingerprint from the .pub sibling if present (works even when the private key is encrypted).
-            pub = path.with_name(path.name + ".pub")
-            result = fingerprint_file(pub) if pub.is_file() else None
-            if result is None and encrypted is False:
-                result = fingerprint_file(path)
+            result, mismatch = fingerprint_private_key(path)
             if result is not None:
                 finding.key_type, finding.bits, finding.fingerprint, _ = result
                 finding.issues.extend(grade_key(finding.key_type, finding.bits, min_rsa_bits))
+            else:
+                finding.issues.append(
+                    Issue("LOW", "could not fingerprint private key; algorithm and size were not checked")
+                )
+            if mismatch is not None:
+                finding.issues.append(mismatch)
 
             finding.issues.extend(check_private_key_perms(path, expected_uid=user.pw_uid))
             if encrypted is False:
@@ -766,7 +1027,20 @@ def run_audit(min_rsa_bits: int, do_host: bool, do_authorized: bool, do_private:
     keys: list[AuthorizedKeyFinding] = []
     duplicates: dict[str, list[str]] = {}
     if do_authorized:
-        patterns, files, keys, duplicates, ak_coverage = audit_authorized_keys(config, min_rsa_bits)
+        # sshd -T alone shows the config with no Match block applied, so ask
+        # sshd again per account to pick up Match User / Match Group changes.
+        user_config: Callable[[pwd.struct_passwd], dict[str, list[str]] | None] | None = None
+        if config_source == "sshd -T":
+            sshd_bin = _find_sshd()
+            if sshd_bin is not None:
+
+                def read_for_user(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+                    return read_user_sshd_config(user.pw_name, sshd_bin)
+
+                user_config = read_for_user
+        patterns, files, keys, duplicates, ak_coverage = audit_authorized_keys(
+            config, min_rsa_bits, user_config=user_config
+        )
         coverage.extend(ak_coverage)
 
     private_keys = audit_private_keys(min_rsa_bits, host_key_paths) if do_private else []
@@ -819,12 +1093,15 @@ def print_report(report: Report, verbose: bool = False) -> None:
 
     if report.host_keys:
         print(f"\n=== Host keys ({len(report.host_keys)}) ===")
-        for hk in report.host_keys:
+        shown_host_keys = report.host_keys if verbose else [hk for hk in report.host_keys if hk.issues]
+        for hk in shown_host_keys:
             line = f"\n{hk.path}"
             if hk.fingerprint:
                 line += f"\n  {hk.key_type} {hk.bits}-bit  {hk.fingerprint}"
             print(line)
             _print_issues(hk.issues) if hk.issues else print("  ok")
+        if not shown_host_keys:
+            print("  no findings")
 
     if report.effective_authorized_keys_file or report.authorized_key_files:
         n_files, n_keys = len(report.authorized_key_files), len(report.authorized_keys)
@@ -855,11 +1132,20 @@ def print_report(report: Report, verbose: bool = False) -> None:
 
     if report.private_keys:
         print(f"\n=== Private keys in ~/.ssh ({len(report.private_keys)}) ===")
-        for pk in sorted(report.private_keys, key=lambda p: _worst(p.issues)):
+        shown_private_keys = report.private_keys if verbose else [pk for pk in report.private_keys if pk.issues]
+        for pk in sorted(shown_private_keys, key=lambda p: _worst(p.issues)):
             print(f"\n{pk.user}: {pk.path}")
             desc = f"{pk.key_type} {pk.bits}-bit  {pk.fingerprint}" if pk.fingerprint else "(unfingerprinted)"
-            print(f"  {desc}  {'passphrase-protected' if pk.encrypted else 'NO passphrase'}")
+            if pk.encrypted is True:
+                passphrase_desc = "passphrase-protected"
+            elif pk.encrypted is False:
+                passphrase_desc = "NO passphrase"
+            else:
+                passphrase_desc = "passphrase: unknown"
+            print(f"  {desc}  {passphrase_desc}")
             _print_issues(pk.issues) if pk.issues else print("  ok")
+        if not shown_private_keys:
+            print("  no findings")
 
     counts: dict[str, int] = defaultdict(int)
     all_issues = (

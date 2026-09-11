@@ -17,7 +17,7 @@ Every finding has a severity. The scale is about *what an attacker gets* or *wha
 | `*Algorithms accepts ssh-dss` | MEDIUM | DSA signatures; 1024-bit only, removed from OpenSSH defaults | Remove `ssh-dss` from `HostKeyAlgorithms` / `PubkeyAcceptedAlgorithms` / `CASignatureAlgorithms` |
 | `*Algorithms accepts ssh-rsa` | MEDIUM | `ssh-rsa` is RSA with SHA-1 signatures (the key itself is fine; the signature scheme is not). Disabled by default since OpenSSH 8.8 | Remove `ssh-rsa`; RSA keys keep working via `rsa-sha2-256`/`rsa-sha2-512` |
 | `StrictModes is 'no'` | MEDIUM | `sshd` will read key files another account can write to | Set `StrictModes yes` and fix whatever permission problem prompted turning it off |
-| `PermitRootLogin is 'yes'` | MEDIUM | Allows password login as root | `PermitRootLogin prohibit-password` (or `no`) |
+| `PermitRootLogin is 'yes'` | MEDIUM | Permits password-based login as root when `PasswordAuthentication` is enabled | `PermitRootLogin prohibit-password` (or `no`) |
 | `PasswordAuthentication is 'yes'` | INFO | Keys are not the only way in | Consider `PasswordAuthentication no` once all users have keys |
 
 Algorithm checks only run when `sshd -T` succeeds, because only it prints the fully expanded effective lists.
@@ -34,6 +34,7 @@ Algorithm checks only run when `sshd -T` succeeds, because only it prints the fu
 | `owned by X, expected root` | HIGH | `sshd` refuses to load it | `chown root:root` |
 | `configured HostKey does not exist` | LOW | `sshd` logs an error at start; harmless if another key is present | Remove the line or `ssh-keygen -A` |
 | `host key is passphrase-protected` | LOW | `sshd` cannot load it at boot | Regenerate without a passphrase |
+| `<name>.pub does not match this private key` | LOW | The public file next to the key is stale or belongs to a different key, so anything copied out of it — into an `authorized_keys` file, a config-management repo, a `known_hosts` entry — authorises the wrong key | Regenerate it: `ssh-keygen -y -f <key> > <key>.pub` |
 | `no Ed25519 host key present` | LOW | Ed25519 is the current best-practice host key | `ssh-keygen -A` |
 
 ## authorized_keys — file level
@@ -43,9 +44,9 @@ Algorithm checks only run when `sshd -T` succeeds, because only it prints the fu
 | `<file/dir/home> is group/world-writable` | HIGH | With `StrictModes yes` (default) `sshd` ignores the file and the account's keys silently stop working. With `StrictModes no` another account can add keys | `chmod g-w,o-w` on the offending path |
 | `<path> is owned by X, not <user> or root` | HIGH | Same as above; `sshd` requires the user or root to own the whole path | `chown` |
 | `line N: unparseable entry` | LOW | `sshd` skips it; usually a corrupted paste | Remove or re-add the key |
-| `could not stat` / `could not read` | LOW | Tool could not check it | Run as root |
+| `could not resolve` / `could not stat` / `could not read` | LOW | Tool could not check it | Run as root |
 
-The tool checks the file, its directory, and the home directory — the same three things `sshd` checks — and only looks at *write* bits for group/other. Mode 644 on `authorized_keys` or 755 on `~/.ssh` is accepted by `sshd` and is not flagged.
+The tool follows any symbolic links, then checks the file and every directory above it, stopping once it has checked the home directory if the file is inside it and otherwise carrying on up to `/`. That is the same walk `sshd`'s `safe_path()` does, which is why an `authorized_keys` file placed outside the home under a world-writable directory such as `/tmp` is rejected outright. Only *write* bits for group/other matter: mode 644 on `authorized_keys` or 755 on `~/.ssh` is accepted by `sshd` and is not flagged.
 
 ## authorized_keys — key level
 
@@ -69,3 +70,5 @@ The tool checks the file, its directory, and the home directory — the same thr
 | `private key has no passphrase` (other) | MEDIUM | Same, smaller blast radius. Automation keys are often legitimately passphrase-less; pair them with `from=`/`command=` on the receiving side | Same |
 | `RSA N-bit ...`, `DSA key` | as above | | Rotate |
 | `could not determine whether the key is passphrase-protected` | LOW | Unrecognised file format | Inspect manually |
+| `<name>.pub does not match this private key` | LOW | The public file next to the key is stale or belongs to a different key, so anything copied out of it — for example into an `authorized_keys` file — authorises the wrong key | Regenerate it: `ssh-keygen -y -f <key> > <key>.pub` |
+| `could not fingerprint private key` | LOW | A passphrase-protected key in the old PEM format with no `.pub` file beside it cannot be read without the passphrase, so its algorithm and size were not graded | Write the public file (`ssh-keygen -y -f <key> > <key>.pub`), or convert the key to the current format with `ssh-keygen -p -o -f <key>` |

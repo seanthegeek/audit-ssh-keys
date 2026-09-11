@@ -13,4 +13,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Server-configuration checks for weak accepted signature algorithms, `StrictModes`, `PermitRootLogin`, and password authentication
 - Coverage warnings when keys come from `AuthorizedKeysCommand` or `TrustedUserCAKeys`
 - `--json` output for fleet rollups; `-v/--verbose` to list every key including clean ones; `--skip-host`, `--skip-authorized`, `--skip-private`, `--min-rsa-bits`, `--debug`
-- Test suite; CI, CodeQL, and release workflows; and docs
+- Test suite and docs

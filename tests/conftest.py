@@ -30,6 +30,24 @@ def make_user(name: str, uid: int, home: Path) -> pwd.struct_passwd:
     return pwd.struct_passwd((name, "x", uid, uid, name, str(home), "/bin/sh"))
 
 
+def mkdir_clean(path: Path, root: Path, mode: int = 0o755) -> Path:
+    """Create path (and any missing parents), then force an exact mode regardless of the caller's umask.
+
+    A bare `mkdir()` (or `mkdir(parents=True)`) inherits the umask, so under
+    umask 002 it yields a group-writable directory (mode 0775) even when the
+    call site never asked for one. sshd -- and this tool's own permission
+    checks -- reject a group-writable home directory or `~/.ssh`, so tests
+    that build fake accounts need a umask-independent layout. This chmods
+    `path` and every parent directory up to (but not including) `root`.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    p = path
+    while p != root and p.is_relative_to(root):
+        p.chmod(mode)
+        p = p.parent
+    return path
+
+
 def keygen(path: Path, key_type: str, bits: int | None = None, passphrase: str = "", comment: str = "") -> Path:
     """Generate a key pair with ssh-keygen and return the private key path."""
     cmd = ["ssh-keygen", "-q", "-t", key_type, "-f", str(path), "-N", passphrase, "-C", comment]
@@ -71,5 +89,5 @@ def current_user_at(tmp_path: Path) -> pwd.struct_passwd:
     Using the real uid means files we create are owned by the "user" without chown.
     """
     home = tmp_path / "home"
-    home.mkdir()
+    mkdir_clean(home, tmp_path)
     return make_user("tester", os.getuid(), home)

@@ -52,6 +52,17 @@ def test_split_options_only_options_is_malformed():
     assert rest == ""
 
 
+# --- pub_sibling ---------------------------------------------------------------
+
+
+def test_pub_sibling_on_name_with_a_dot():
+    assert audit.pub_sibling(Path("/etc/ssh/host.key")) == Path("/etc/ssh/host.key.pub")
+
+
+def test_pub_sibling_on_plain_name():
+    assert audit.pub_sibling(Path("/etc/ssh/ssh_host_rsa_key")) == Path("/etc/ssh/ssh_host_rsa_key.pub")
+
+
 # --- parse_fingerprint_output ------------------------------------------------
 
 
