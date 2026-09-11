@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "audit-ssh-keys"
+dynamic = ["version"]
+description = "Audit sshd host keys, every account's authorized_keys, and ~/.ssh private keys on a Linux server"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sean Whalen" }]
+requires-python = ">=3.10"
+keywords = ["ssh", "openssh", "security", "audit", "authorized_keys", "host-keys"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Security",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/seanthegeek/audit-ssh-keys"
+Issues = "https://github.com/seanthegeek/audit-ssh-keys/issues"
+Changelog = "https://github.com/seanthegeek/audit-ssh-keys/blob/main/CHANGELOG.md"
+
+[project.scripts]
+audit-ssh-keys = "audit_ssh_keys.audit:run"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff", "pyright"]
+
+[tool.hatch.version]
+path = "src/audit_ssh_keys/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "docs/", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ANN", "RUF", "SIM", "PTH"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,3338 @@
+"""Tests for permission checks and the host-key, authorized_keys, and private-key sections.
+
+These generate real keys with ssh-keygen and lay out fake home directories
+under tmp_path, then feed fake passwd entries to the audit functions.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import os
+import pwd
+import stat
+import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import asdict
+from pathlib import Path
+
+import pytest
+
+from audit_ssh_keys import audit
+from tests.conftest import (
+    RICH_VALID_OPTIONS,
+    USER_UID,
+    make_user,
+    mkdir_clean,
+    needs_non_root,
+    needs_root,
+    needs_ssh_keygen,
+    pub,
+)
+
+pytestmark = needs_ssh_keygen
+
+
+def _by_sev(issues: list[audit.Issue]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for i in issues:
+        out.setdefault(i.severity, []).append(i.message)
+    return out
+
+
+def _write_ak(user: pwd.struct_passwd, lines: list[str], mode: int = 0o600) -> Path:
+    ssh_dir = Path(user.pw_dir) / ".ssh"
+    ssh_dir.mkdir(mode=0o700, exist_ok=True)
+    ak = ssh_dir / "authorized_keys"
+    ak.write_text("\n".join(lines) + "\n")
+    ak.chmod(mode)
+    return ak
+
+
+# --- filesystem helpers -------------------------------------------------
+
+
+def test_stat_if_present_missing_path_is_none(tmp_path: Path):
+    assert audit._stat_if_present(tmp_path / "nope") is None
+
+
+def test_stat_if_present_below_a_regular_file_is_none(tmp_path: Path):
+    """A path below a file rather than a directory raises NotADirectoryError, also treated as 'not there'."""
+    f = tmp_path / "file"
+    f.write_text("x")
+    assert audit._stat_if_present(f / "child") is None
+
+
+@needs_non_root
+def test_stat_if_present_raises_on_permission_denied(tmp_path: Path):
+    """A directory this account cannot read must raise, not be mistaken for 'not there'.
+
+    This is the regression this helper exists to fix: chmod 0o000 on a
+    directory above a path makes os.stat() raise EACCES for everything below
+    it, which a naive is_file()/exists() call would either crash on or
+    silently swallow depending on the Python version (see the module
+    docstring on _stat_if_present).
+    """
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    victim = blocked / "child"
+    blocked.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError):
+            audit._stat_if_present(victim)
+    finally:
+        blocked.chmod(0o700)
+
+
+def test_is_regular_file_true_for_a_file_false_for_a_directory_or_missing_path(tmp_path: Path):
+    f = tmp_path / "f"
+    f.write_text("x")
+    d = tmp_path / "d"
+    d.mkdir()
+    assert audit._is_regular_file(f) is True
+    assert audit._is_regular_file(d) is False
+    assert audit._is_regular_file(tmp_path / "missing") is False
+
+
+# --- check_strictmodes_path -------------------------------------------------
+
+
+def test_strictmodes_clean_layout_has_no_issues(current_user_at: pwd.struct_passwd):
+    ak = _write_ak(current_user_at, ["# empty"])
+    Path(current_user_at.pw_dir).chmod(0o755)
+    assert audit.check_strictmodes_path(ak, current_user_at) == []
+
+
+def test_strictmodes_644_and_755_are_accepted(current_user_at: pwd.struct_passwd):
+    # sshd only cares about write bits for group/other, not read bits.
+    ak = _write_ak(current_user_at, ["# empty"], mode=0o644)
+    ak.parent.chmod(0o755)
+    assert audit.check_strictmodes_path(ak, current_user_at) == []
+
+
+@pytest.mark.parametrize("target", ["file", "ssh_dir", "home"])
+def test_strictmodes_group_writable_anywhere_in_path_is_high(current_user_at: pwd.struct_passwd, target: str):
+    ak = _write_ak(current_user_at, ["# empty"])
+    victim = {"file": ak, "ssh_dir": ak.parent, "home": Path(current_user_at.pw_dir)}[target]
+    victim.chmod(victim.stat().st_mode | 0o020)
+    issues = audit.check_strictmodes_path(ak, current_user_at)
+    assert [i.severity for i in issues] == ["HIGH"]
+    assert str(victim) in issues[0].message
+    assert "writable" in issues[0].message
+
+
+def test_strictmodes_world_writable_is_high(current_user_at: pwd.struct_passwd):
+    ak = _write_ak(current_user_at, ["# empty"], mode=0o666)
+    issues = audit.check_strictmodes_path(ak, current_user_at)
+    assert [i.severity for i in issues] == ["HIGH"]
+
+
+def test_strictmodes_root_owned_is_fine(tmp_path: Path):
+    # Files created by root for another account are accepted by sshd.
+    alice = make_user("alice", 65534, tmp_path)  # some uid other than the creator's
+    ak = _write_ak(alice, ["# empty"])
+    issues = audit.check_strictmodes_path(ak, alice)
+    if os.getuid() == 0:
+        assert issues == []
+    else:
+        # Creator is neither alice nor root, so ownership is flagged for all three paths.
+        assert all(i.severity == "HIGH" and "owned by" in i.message for i in issues)
+        assert len(issues) == 3
+
+
+@needs_root
+def test_strictmodes_wrong_owner_is_high(tmp_path: Path):
+    alice = make_user("alice", 65531, tmp_path)
+    ak = _write_ak(alice, ["# empty"])
+    os.chown(ak, 65532, 65532)
+    issues = audit.check_strictmodes_path(ak, alice)
+    assert len(issues) == 1
+    assert issues[0].severity == "HIGH"
+    assert "owned by 65532" in issues[0].message
+
+
+def test_owner_phrase_collapses_for_root():
+    assert audit._owner_phrase(0) == "root"
+
+
+def test_owner_phrase_names_a_non_root_uid():
+    if os.getuid() == 0:
+        pytest.skip("current uid is root; this covers the non-root case")
+    name = pwd.getpwuid(os.getuid()).pw_name
+    assert audit._owner_phrase(os.getuid()) == f"{name} or root"
+
+
+def test_strictmodes_owner_phrase_collapses_for_root(tmp_path: Path):
+    """When the expected owner is root, the message says 'not root', not the redundant 'not root or root'."""
+    if os.getuid() == 0:
+        pytest.skip("running as root: the file is already root-owned, no mismatch to observe")
+    root_owner = make_user("root", 0, tmp_path)
+    ak = _write_ak(root_owner, ["# empty"])
+    tmp_path.chmod(0o755)
+
+    issues = audit.check_strictmodes_path(ak, root_owner)
+    assert issues
+    assert all(i.severity == "HIGH" and "not root" in i.message and "not root or root" not in i.message for i in issues)
+
+
+def test_strictmodes_missing_file_is_low(tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path)
+    issues = audit.check_strictmodes_path(tmp_path / ".ssh" / "authorized_keys", alice)
+    assert [i.severity for i in issues] == ["LOW"]
+    assert "could not resolve" in issues[0].message
+
+
+def test_strictmodes_unstattable_path_is_low(tmp_path: Path):
+    """A path the tool cannot stat is LOW, not a silent pass."""
+    alice = make_user("alice", os.getuid(), tmp_path)
+    issues = audit._check_one_strictmodes_path(tmp_path / "gone", alice)
+    assert [i.severity for i in issues] == ["LOW"]
+    assert "could not stat" in issues[0].message
+
+
+def _reported_path(issue: audit.Issue) -> Path:
+    """The path an owner/mode message is about: every such message starts with '<path> is '."""
+    return Path(issue.message.split(" is ", 1)[0])
+
+
+def _assert_only_victim_and_tmp_ancestors(issues: list[audit.Issue], victim: Path, tmp_path: Path) -> None:
+    """Allow findings about `victim` plus any about tmp_path and the directories above it.
+
+    A file outside the account's home is checked all the way up to /, and
+    pytest's tmp_path lives under /tmp, which is mode 1777. Those ancestors are
+    real findings, not test noise: sshd really does refuse an authorized_keys
+    file that sits under a world-writable directory.
+    """
+    top = tmp_path.resolve()
+    for issue in issues:
+        reported = _reported_path(issue)
+        assert reported == victim or top.is_relative_to(reported), issue.message
+
+
+def test_strictmodes_checks_every_directory_up_to_the_home(tmp_path: Path):
+    """A pattern deeper than ~/.ssh still has ~/.ssh itself checked."""
+    alice = make_user("alice", os.getuid(), tmp_path / "home" / "alice")
+    key_dir = mkdir_clean(Path(alice.pw_dir) / ".ssh" / "keys", tmp_path)
+    ak = key_dir / "authorized_keys"
+    ak.write_text("# empty\n")
+    ak.chmod(0o600)
+    ssh_dir = Path(alice.pw_dir) / ".ssh"
+    ssh_dir.chmod(0o775)
+
+    issues = audit.check_strictmodes_path(ak, alice)
+    assert [i.severity for i in issues] == ["HIGH"]
+    assert str(ssh_dir.resolve()) in issues[0].message
+    assert "group/world-writable" in issues[0].message
+
+
+def test_strictmodes_absolute_path_outside_the_home_is_checked_to_the_root(tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    etc_ssh = mkdir_clean(tmp_path / "etc" / "ssh", tmp_path)
+    mkdir_clean(etc_ssh / "ak", tmp_path)
+    ak = etc_ssh / "ak" / "alice"
+    ak.write_text("# empty\n")
+    ak.chmod(0o600)
+    etc_ssh.chmod(0o775)
+
+    issues = audit.check_strictmodes_path(ak, alice)
+    victim = etc_ssh.resolve()
+    assert any(
+        i.severity == "HIGH" and str(victim) in i.message and "group/world-writable" in i.message for i in issues
+    )
+    _assert_only_victim_and_tmp_ancestors(issues, victim, tmp_path)
+
+    # tmp_path lives under /tmp, which is mode 1777 on any normal system: prove
+    # the walk actually reaches / by asserting that finding is present, not
+    # merely tolerating it.
+    if stat.S_IMODE(Path("/tmp").stat().st_mode) & 0o022:
+        assert any(_reported_path(i) == Path("/tmp") for i in issues)
+
+
+def test_strictmodes_follows_symlinks_before_checking(tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "home" / "alice")
+    ssh_dir = mkdir_clean(Path(alice.pw_dir) / ".ssh", tmp_path)
+    target_dir = mkdir_clean(tmp_path / "target", tmp_path)
+    target = target_dir / "ak"
+    target.write_text("# empty\n")
+    target.chmod(0o600)
+    link = ssh_dir / "authorized_keys"
+    link.symlink_to(target)
+    target_dir.chmod(0o775)
+
+    issues = audit.check_strictmodes_path(link, alice)
+    victim = target_dir.resolve()
+    assert any(
+        i.severity == "HIGH" and str(victim) in i.message and "group/world-writable" in i.message for i in issues
+    )
+    _assert_only_victim_and_tmp_ancestors(issues, victim, tmp_path)
+
+
+def test_strictmodes_stops_at_the_home_directory(tmp_path: Path):
+    """A directory above the home is sshd's business, not this account's: the walk stops at the home."""
+    alice = make_user("alice", os.getuid(), tmp_path / "home" / "alice")
+    ssh_dir = mkdir_clean(Path(alice.pw_dir) / ".ssh", tmp_path)
+    ak = ssh_dir / "authorized_keys"
+    ak.write_text("# empty\n")
+    ak.chmod(0o600)
+    (tmp_path / "home").chmod(0o775)
+
+    assert audit.check_strictmodes_path(ak, alice) == []
+
+
+def test_strictmodes_empty_pw_dir_does_not_stop_the_walk_early(tmp_path: Path):
+    """Path("") resolves to the cwd, so an empty pw_dir must not silently stop the walk there.
+
+    make_user stringifies its home argument, so an empty Path("") can't be
+    built through it (it would come out as "."). Build the passwd entry by
+    hand instead, the way a real account with no home directory looks.
+    """
+    nohome = pwd.struct_passwd(("nohome", "x", os.getuid(), os.getuid(), "nohome", "", "/bin/sh"))
+    victim = mkdir_clean(tmp_path / "x", tmp_path)
+    ssh_dir = mkdir_clean(victim / ".ssh", tmp_path)
+    ak = ssh_dir / "authorized_keys"
+    ak.write_text("# empty\n")
+    ak.chmod(0o600)
+    victim.chmod(victim.stat().st_mode | 0o020)  # group-writable
+
+    issues = audit.check_strictmodes_path(ak, nohome)
+    victim_real = victim.resolve()
+    assert any(
+        i.severity == "HIGH" and str(victim_real) in i.message and "group/world-writable" in i.message for i in issues
+    )
+    _assert_only_victim_and_tmp_ancestors(issues, victim_real, tmp_path)
+
+
+# --- check_private_key_perms ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (0o600, []),
+        (0o400, []),
+        (0o640, ["HIGH"]),
+        (0o660, ["HIGH"]),
+        (0o604, ["CRITICAL"]),
+        (0o644, ["CRITICAL"]),
+        (0o666, ["CRITICAL"]),
+        (0o601, ["LOW"]),
+        (0o610, ["LOW"]),
+        (0o602, ["LOW"]),
+        (0o710, ["LOW"]),
+    ],
+)
+def test_private_key_perms_modes(tmp_path: Path, mode: int, expected: list[str]):
+    key = tmp_path / "key"
+    key.write_text("x")
+    key.chmod(mode)
+    issues = audit.check_private_key_perms(key, expected_uid=os.getuid())
+    assert [i.severity for i in issues] == expected
+
+
+@pytest.mark.parametrize("mode", [0o601, 0o610, 0o602])
+def test_private_key_perms_unreadable_group_other_bits_message(tmp_path: Path, mode: int):
+    """A group/other bit that isn't a read bit gets its own LOW, not the CRITICAL/HIGH read-disclosure message."""
+    key = tmp_path / "key"
+    key.write_text("x")
+    key.chmod(mode)
+    issues = audit.check_private_key_perms(key, expected_uid=os.getuid())
+    assert len(issues) == 1
+    assert issues[0].severity == "LOW"
+    assert issues[0].message == f"group/other bits set but not readable by them (mode {mode:04o})"
+
+
+def test_private_key_perms_wrong_owner(tmp_path: Path):
+    key = tmp_path / "key"
+    key.write_text("x")
+    key.chmod(0o600)
+    issues = audit.check_private_key_perms(key, expected_uid=os.getuid() + 1)
+    if os.getuid() == 0:
+        assert issues == []  # root-owned keys are accepted for any account
+    else:
+        assert [i.severity for i in issues] == ["HIGH"]
+        assert "owned by" in issues[0].message
+
+
+@needs_root
+def test_private_key_perms_wrong_owner_as_root(tmp_path: Path):
+    key = tmp_path / "key"
+    key.write_text("x")
+    key.chmod(0o600)
+    os.chown(key, 65532, 65532)
+    issues = audit.check_private_key_perms(key, expected_uid=65531)
+    assert [i.severity for i in issues] == ["HIGH"]
+    assert "owned by 65532" in issues[0].message
+
+
+def test_private_key_perms_owner_phrase_collapses_for_root(tmp_path: Path):
+    """expected_uid=0 renders 'expected root', not the redundant 'expected root or root'."""
+    key = tmp_path / "key"
+    key.write_text("x")
+    key.chmod(0o600)
+    issues = audit.check_private_key_perms(key, expected_uid=0)
+    if os.getuid() == 0:
+        pytest.skip("running as root: the file is already root-owned, no mismatch to observe")
+    assert len(issues) == 1
+    assert "expected root" in issues[0].message
+    assert "expected root or root" not in issues[0].message
+
+
+# --- fingerprinting and encryption detection --------------------------------
+
+
+def test_fingerprint_line_with_options(keys: dict[str, Path]):
+    line = f'from="10.0.0.0/8",command="/bin/true" {pub(keys["ed25519"])}'
+    _, key_material = audit.split_options(line)
+    result = audit.fingerprint_line(key_material)
+    assert result is not None
+    assert result[0] == "ED25519"
+    assert result[3] == "ed@test"
+
+
+def test_fingerprint_line_garbage_is_none():
+    assert audit.fingerprint_line("ssh-rsa notreallyakey garbage@x") is None
+
+
+def test_fingerprint_file_pub_and_private_match(keys: dict[str, Path]):
+    priv = keys["rsa4096"]
+    from_pub = audit.fingerprint_file(priv.with_name(priv.name + ".pub"))
+    from_priv = audit.fingerprint_file(priv)
+    assert from_pub is not None and from_priv is not None
+    assert from_pub[:3] == from_priv[:3] == ("RSA", 4096, from_pub[2])
+
+
+# The marker every OpenSSH-format private key body starts with.
+OPENSSH_MAGIC = b"openssh-key-v1\x00"
+
+
+def _ssh_string(payload: bytes) -> bytes:
+    """One SSH wire-format string: a big-endian 32-bit length, then the bytes."""
+    return len(payload).to_bytes(4, "big") + payload
+
+
+def _openssh_key_file(path: Path, payload: bytes) -> Path:
+    """Write a file that looks like an OpenSSH private key but carries an arbitrary body."""
+    body = base64.b64encode(OPENSSH_MAGIC + payload).decode()
+    path.write_text(f"-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----\n")
+    return path
+
+
+def _pem_key(path: Path, passphrase: str = "") -> Path:
+    """Generate an RSA key in the old PEM format, which has no readable public half."""
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "rsa", "-b", "2048", "-m", "PEM", "-N", passphrase, "-f", str(path)],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    return path
+
+
+def test_public_key_from_private_matches_the_pub_file(keys: dict[str, Path]):
+    """Every generated key, passphrase-protected included, fingerprints the same from either source."""
+    for name, priv in keys.items():
+        line = audit.public_key_from_private(priv)
+        assert line is not None, name
+        from_private = audit.fingerprint_line(line)
+        from_pub = audit.fingerprint_file(priv.with_name(priv.name + ".pub"))
+        assert from_private is not None and from_pub is not None, name
+        # Only the comment can differ: it lives in the encrypted part of the file.
+        assert from_private[:3] == from_pub[:3], name
+
+
+def test_public_key_from_private_works_on_world_readable_key(keys: dict[str, Path], tmp_path: Path):
+    # ssh-keygen refuses to load a 0644 key, so this must not depend on it.
+    copy = tmp_path / "id_ed25519"
+    copy.write_bytes(keys["encrypted"].read_bytes())
+    copy.chmod(0o644)
+    line = audit.public_key_from_private(copy)
+    assert line is not None
+    result = audit.fingerprint_line(line)
+    assert result is not None and result[0] == "ED25519"
+
+
+def test_public_key_from_private_is_none_for_pem_and_non_keys(tmp_path: Path):
+    assert audit.public_key_from_private(_pem_key(tmp_path / "pem")) is None
+    not_a_key = tmp_path / "config"
+    not_a_key.write_text("Host x\n  User y\n")
+    assert audit.public_key_from_private(not_a_key) is None
+    assert audit.public_key_from_private(tmp_path / "missing") is None
+
+
+@pytest.mark.parametrize(
+    ("name", "payload"),
+    [
+        # A public-key blob whose promised length runs off the end of the file.
+        (
+            "truncated",
+            _ssh_string(b"none")
+            + _ssh_string(b"none")
+            + _ssh_string(b"")
+            + (1).to_bytes(4, "big")
+            + (99).to_bytes(4, "big"),
+        ),
+        # Claims to hold no keys at all.
+        ("no_keys", _ssh_string(b"none") + _ssh_string(b"none") + _ssh_string(b"") + (0).to_bytes(4, "big")),
+        # Key type that is not ASCII.
+        (
+            "non_ascii_type",
+            _ssh_string(b"none")
+            + _ssh_string(b"none")
+            + _ssh_string(b"")
+            + (1).to_bytes(4, "big")
+            + _ssh_string(_ssh_string(b"\xff\xfe")),
+        ),
+        # Empty key type.
+        (
+            "empty_type",
+            _ssh_string(b"none")
+            + _ssh_string(b"none")
+            + _ssh_string(b"")
+            + (1).to_bytes(4, "big")
+            + _ssh_string(_ssh_string(b"")),
+        ),
+        # Nothing after the magic string at all.
+        ("empty", b""),
+    ],
+)
+def test_public_key_from_private_is_none_for_corrupt_bodies(tmp_path: Path, name: str, payload: bytes):
+    assert audit.public_key_from_private(_openssh_key_file(tmp_path / name, payload)) is None
+
+
+def _decode_openssh_body(source: Path) -> bytes:
+    """Everything after the "openssh-key-v1" marker in a real OpenSSH private key file."""
+    lines = [ln.strip() for ln in source.read_text().splitlines() if ln.strip()]
+    raw = base64.b64decode("".join(ln for ln in lines[1:] if not ln.startswith("-----")), validate=True)
+    assert raw.startswith(OPENSSH_MAGIC)
+    return raw[len(OPENSSH_MAGIC) :]
+
+
+def _write_openssh_key(dest: Path, blob: bytes) -> Path:
+    """Write a body back out as an OpenSSH private key file: marker, base64, and both marker lines."""
+    body = base64.b64encode(OPENSSH_MAGIC + blob).decode()
+    dest.write_text(f"-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----\n")
+    dest.chmod(0o600)
+    return dest
+
+
+def _public_half_bounds(blob: bytes) -> tuple[int, int, int]:
+    """Find the key count and the single public half in a decoded key body.
+
+    Returns (offset of the key-count field, start of the public half, end of it).
+    """
+    offset = 0
+    for _ in range(3):  # cipher name, kdf name, kdf options
+        _, offset = audit._read_string(blob, offset)
+    count_at = offset
+    nkeys, public_start = audit._read_uint32(blob, offset)
+    assert nkeys == 1
+    _, public_end = audit._read_string(blob, public_start)
+    return count_at, public_start, public_end
+
+
+def _truncate_after_public_half(source: Path, dest: Path) -> Path:
+    """Copy a real OpenSSH private key, cutting the copy off right after its public half.
+
+    The public half is intact, so the type, size and fingerprint can still be
+    read out of it -- but the private half that follows is gone, so ssh and
+    sshd cannot load the file at all.
+    """
+    blob = _decode_openssh_body(source)
+    _, _, public_end = _public_half_bounds(blob)
+    return _write_openssh_key(dest, blob[:public_end])
+
+
+def _duplicate_public_half(source: Path, dest: Path) -> Path:
+    """Copy a real OpenSSH private key, rewritten to claim two public halves instead of one.
+
+    The second one is just a copy of the first, so every field still parses --
+    but ssh only ever loads a file holding exactly one key, so this is not a
+    key anyone can use.
+    """
+    blob = _decode_openssh_body(source)
+    count_at, public_start, public_end = _public_half_bounds(blob)
+    public_half = blob[public_start:public_end]
+    rewritten = blob[:count_at] + (2).to_bytes(4, "big") + public_half + public_half + blob[public_end:]
+    return _write_openssh_key(dest, rewritten)
+
+
+def test_public_key_from_private_is_none_for_a_key_truncated_after_the_public_half(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """A key file cut short after its public half is unusable and must not be reported as healthy.
+
+    `ssh-keygen -lf` prints a fingerprint for such a file, so the check cannot
+    lean on ssh-keygen either.
+    """
+    key = _truncate_after_public_half(keys["ed25519"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    assert audit.public_key_from_private(key) is None
+    # A good .pub file beside a broken key says nothing about the key, so no fallback.
+    assert audit.fingerprint_private_key(key) == (None, None)
+    # The cipher name sits well before the cut, so this answer is still available.
+    assert audit.private_key_is_encrypted(key) is False
+
+
+def test_public_key_from_private_is_none_when_the_end_line_is_missing(keys: dict[str, Path], tmp_path: Path):
+    """No `-----END OPENSSH PRIVATE KEY-----` line means the file was cut short."""
+    key = tmp_path / "id_ed25519"
+    key.write_text(keys["ed25519"].read_text().replace("-----END OPENSSH PRIVATE KEY-----\n", ""))
+    key.chmod(0o600)
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    assert audit.public_key_from_private(key) is None
+    # Still recognised as a corrupt OpenSSH-format key, not as a format whose .pub may stand in.
+    assert audit.fingerprint_private_key(key) == (None, None)
+    # Without the closing line the base64 body itself may stop mid-line, so nothing
+    # decoded from it -- the cipher name included -- can be trusted.
+    assert audit.private_key_is_encrypted(key) is None
+
+
+def test_public_key_from_private_is_none_for_a_file_claiming_two_keys(keys: dict[str, Path], tmp_path: Path):
+    """ssh loads a private key file only when it holds exactly one key, so this tool accepts no other count."""
+    key = _duplicate_public_half(keys["ed25519"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    assert audit.public_key_from_private(key) is None
+    assert audit.fingerprint_private_key(key) == (None, None)
+
+
+def test_public_key_from_private_is_none_when_bytes_follow_the_private_half(keys: dict[str, Path], tmp_path: Path):
+    """ssh refuses a key file with anything after the private half, so this tool must not pass it as healthy."""
+    key = _write_openssh_key(tmp_path / "id_ed25519", _decode_openssh_body(keys["ed25519"]) + b"\x00\x00\x00\x00")
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    assert audit.public_key_from_private(key) is None
+    assert audit.fingerprint_private_key(key) == (None, None)
+
+
+def _insert_marker_line(source: Path, dest: Path, marker: str) -> Path:
+    """Copy a real OpenSSH private key, splicing an extra marker line into the middle of its base64 body."""
+    lines = source.read_text().splitlines()
+    body_start, body_end = 1, len(lines) - 1  # header is lines[0], footer is lines[-1]
+    mid = body_start + (body_end - body_start) // 2
+    lines.insert(mid, marker)
+    dest.write_text("\n".join(lines) + "\n")
+    dest.chmod(0o600)
+    return dest
+
+
+def test_public_key_from_private_is_none_with_a_stray_marker_line_in_the_body(keys: dict[str, Path], tmp_path: Path):
+    """A "-----...-----"-shaped line stuck in the middle of the base64 body corrupts it; OpenSSH rejects such a file.
+
+    Stripping every line that starts with "-----" (instead of only the real
+    header and footer) would silently drop this line and let the file decode
+    as if it were never there -- reporting a corrupt key as healthy. A valid
+    `.pub` file sits beside it to prove there is no fallback either.
+    """
+    key = _insert_marker_line(keys["ed25519"], tmp_path / "id_ed25519", "-----FOO-----")
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    assert audit.public_key_from_private(key) is None
+    assert audit.fingerprint_private_key(key) == (None, None)
+
+
+def test_public_key_from_private_is_none_with_a_second_end_marker_in_the_body(keys: dict[str, Path], tmp_path: Path):
+    """A second "-----END OPENSSH PRIVATE KEY-----" line stuck mid-body must not be silently dropped either."""
+    key = _insert_marker_line(keys["ed25519"], tmp_path / "id_ed25519", audit.OPENSSH_PRIVATE_KEY_FOOTER)
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    assert audit.public_key_from_private(key) is None
+    assert audit.fingerprint_private_key(key) == (None, None)
+
+
+def _splice_non_ascii_byte(source: Path, dest: Path) -> Path:
+    """Copy a real OpenSSH private key, splicing one 0xFF byte into the middle of its base64 body.
+
+    Nothing else about the file changes. A private key file is ASCII from end
+    to end, so OpenSSH rejects this one outright -- but reading it with
+    undecodable bytes dropped joins the base64 on either side of the byte back
+    together, and the file then decodes exactly as the original did.
+    """
+    lines = source.read_bytes().split(b"\n")
+    body = [i for i, ln in enumerate(lines) if ln and not ln.startswith(b"-----")]
+    mid = body[len(body) // 2]
+    line = lines[mid]
+    cut = len(line) // 2
+    lines[mid] = line[:cut] + b"\xff" + line[cut:]
+    dest.write_bytes(b"\n".join(lines))
+    dest.chmod(0o600)
+    return dest
+
+
+def test_private_key_with_a_non_ascii_byte_in_its_body_is_not_repaired_while_reading(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """One byte that is not ASCII spliced into the base64 body makes a key OpenSSH will not load.
+
+    Reading the file with undecodable bytes dropped silently repaired it: the
+    base64 on either side joined up, the body decoded cleanly, and a file ssh
+    refuses to load was reported as a healthy key. A valid `.pub` file sits
+    beside it to prove there is no fallback to that either.
+    """
+    key = _splice_non_ascii_byte(keys["ed25519"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    assert audit.public_key_from_private(key) is None
+    assert audit.fingerprint_private_key(key) == (None, None)
+    assert audit.private_key_is_encrypted(key) is None
+
+
+def _splice_non_ascii_byte_into_the_header(source: Path, dest: Path) -> Path:
+    """Copy a real OpenSSH private key with one 0xFF byte stuck on the end of its header line."""
+    raw = source.read_bytes()
+    header = audit.OPENSSH_PRIVATE_KEY_HEADER.encode("ascii")
+    assert raw.startswith(header)
+    dest.write_bytes(header + b"\xff" + raw[len(header) :])
+    dest.chmod(0o600)
+    return dest
+
+
+def test_private_key_with_a_mangled_header_line_is_not_reported_as_an_unrelated_pub(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """A stray byte on the header line must not send the file down the legacy `.pub` fallback.
+
+    The file is still an attempt at the current OpenSSH format, so it counts as
+    one -- and nothing in it can be trusted, so it is reported as
+    unfingerprintable rather than handed to the fallback meant for the older
+    PEM/PKCS#8 formats, which would answer with whatever unrelated key happens
+    to be sitting in the `.pub` file beside it. Comparing the header line as
+    decoded text (with undecodable bytes replaced) made one stray byte in it
+    answer "not this format", which is the exact hole this check closes.
+    """
+    key = _splice_non_ascii_byte_into_the_header(keys["ed25519"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_text(pub(keys["rsa2048"]) + "\n")  # a valid, but unrelated, key
+
+    assert audit.looks_like_private_key(key) is True  # so the file is audited at all
+    assert audit._private_key_format(key) == "openssh"
+    # The full format is not met: the header line is not the header, and a
+    # private key file holding a byte that is not ASCII is corrupt either way.
+    assert audit.public_key_from_private(key) is None
+    assert audit.fingerprint_private_key(key) == (None, None)
+    assert audit.private_key_is_encrypted(key) is None
+
+
+def test_empty_or_unrecognised_key_file_is_not_reported_as_the_pub_beside_it(keys: dict[str, Path], tmp_path: Path):
+    """A readable file that holds no private-key header must not borrow the answer from a `.pub` file.
+
+    The `.pub` fallback exists for the old PEM and PKCS#8 formats, which carry
+    no public half inside them, so the `.pub` file beside one of those is the
+    only thing left to read. A zero-byte file is not one of those formats, and
+    neither is a file holding arbitrary text. Answering from the `.pub` file put
+    a healthy-looking Ed25519 host key in the report for a zero-byte
+    `ssh_host_ed25519_key` that `sshd` can load nothing at all from.
+    """
+    empty = tmp_path / "ssh_host_ed25519_key"
+    empty.write_bytes(b"")
+    empty.chmod(0o600)
+    audit.pub_sibling(empty).write_text(pub(keys["ed25519"]) + "\n")
+    assert audit.fingerprint_private_key(empty) == (None, None)
+    assert audit._private_key_format(empty) is None
+
+    # The same file as the audit meets it: reported as unfingerprintable, not as
+    # the key in the `.pub` file.
+    findings = audit.audit_host_keys({"hostkey": [str(empty)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    assert [(f.path, f.key_type, f.fingerprint) for f in findings if f.path == str(empty)] == [(str(empty), "?", "")]
+    assert "could not fingerprint host key" in [i.message for f in findings for i in f.issues]
+
+    garbage = tmp_path / "id_garbage"
+    garbage.write_text("this is not a key at all\nnor is this line\n")
+    garbage.chmod(0o600)
+    audit.pub_sibling(garbage).write_text(pub(keys["ed25519"]) + "\n")
+    assert audit.fingerprint_private_key(garbage) == (None, None)
+    assert audit._private_key_format(garbage) is None
+
+
+def test_fingerprint_private_key_prefers_the_private_key_over_a_stale_pub(keys: dict[str, Path], tmp_path: Path):
+    key = tmp_path / "id_ed25519"
+    key.write_bytes(keys["encrypted"].read_bytes())
+    key.chmod(0o600)
+    audit.pub_sibling(key).write_text(pub(keys["rsa2048"]) + "\n")
+
+    result, mismatch = audit.fingerprint_private_key(key)
+    assert result is not None and result[0] == "ED25519"
+    assert mismatch is not None and mismatch.severity == "LOW"
+    assert mismatch.message.startswith("id_ed25519.pub does not match this private key")
+    assert "RSA" in mismatch.message
+
+
+def test_fingerprint_private_key_matching_pub_reports_no_mismatch(keys: dict[str, Path], tmp_path: Path):
+    key = tmp_path / "id_ed25519"
+    key.write_bytes(keys["encrypted"].read_bytes())
+    key.chmod(0o600)
+    audit.pub_sibling(key).write_bytes(keys["encrypted"].with_name("encrypted.pub").read_bytes())
+
+    result, mismatch = audit.fingerprint_private_key(key)
+    assert result is not None and result[0] == "ED25519"
+    assert mismatch is None
+
+
+def test_fingerprint_private_key_falls_back_for_pem_keys(tmp_path: Path):
+    plain = _pem_key(tmp_path / "plain")
+    audit.pub_sibling(plain).unlink()
+    result, mismatch = audit.fingerprint_private_key(plain)
+    assert result is not None and result[:2] == ("RSA", 2048)
+    assert mismatch is None
+
+    encrypted = _pem_key(tmp_path / "encrypted_pem", passphrase="hunter2")
+    audit.pub_sibling(encrypted).unlink()
+    result, mismatch = audit.fingerprint_private_key(encrypted)
+    assert result is None and mismatch is None
+
+
+def test_fingerprint_private_key_pem_prefers_the_private_key_over_a_stale_pub(keys: dict[str, Path], tmp_path: Path):
+    """A stale .pub beside an unencrypted PEM key must not win: the private key itself is read first.
+
+    Regression test for a Copilot review finding: `ssh-keygen -lf` silently
+    prefers a `<path>.pub` sibling over the private key file itself, so
+    fingerprinting the private key in place -- as opposed to through the
+    symlink trick in `_fingerprint_private_file_alone`, which hides the .pub
+    from ssh-keygen -- would just echo the stale .pub instead of catching it.
+    Before the fix, this scenario silently graded the wrong key.
+    """
+    plain = _pem_key(tmp_path / "plain")
+    # Capture the PEM key's own fingerprint before overwriting its real .pub.
+    expected = audit.fingerprint_file(audit.pub_sibling(plain))
+    assert expected is not None
+    audit.pub_sibling(plain).write_text(pub(keys["ed25519"]) + "\n")
+
+    result, mismatch = audit.fingerprint_private_key(plain)
+    assert result is not None and result[:3] == ("RSA", 2048, expected[2])
+    assert mismatch is not None and mismatch.severity == "LOW"
+    assert mismatch.message.startswith(f"{plain.name}.pub does not match this private key")
+    assert "ED25519" in mismatch.message
+
+
+def test_fingerprint_private_key_encrypted_pem_with_stale_pub_cannot_be_detected(keys: dict[str, Path], tmp_path: Path):
+    """Documents a real limitation: when the private key can't be read at all, a stale .pub goes undetected.
+
+    A passphrase-protected PEM key has no readable embedded public half, and
+    ssh-keygen cannot fingerprint the encrypted file without the passphrase,
+    so the .pub file is the only thing left to report -- even when it
+    belongs to a different key entirely. There is nothing to compare it
+    against, so no mismatch can be raised.
+    """
+    encrypted = _pem_key(tmp_path / "encrypted_pem", passphrase="hunter2")
+    audit.pub_sibling(encrypted).write_text(pub(keys["ed25519"]) + "\n")
+
+    result, mismatch = audit.fingerprint_private_key(encrypted)
+    assert result is not None and result[0] == "ED25519"
+    assert mismatch is None
+
+
+def test_fingerprint_private_key_world_readable_pem_falls_back_to_its_own_pub(tmp_path: Path):
+    """ssh-keygen refuses to open a private key file that its owner has made group/other readable.
+
+    The key files this test writes are owned by the uid running the test
+    suite, and ssh-keygen refuses to load a key it owns once group or other
+    bits are set on it -- so this is deterministic whether the suite runs as
+    root or not. With the private file unreadable to ssh-keygen, its own
+    matching .pub is the only thing left to report from.
+    """
+    plain = _pem_key(tmp_path / "plain")
+    plain.chmod(0o644)
+    assert audit._fingerprint_private_file_alone(plain) is None  # confirms ssh-keygen actually refused it
+
+    result, mismatch = audit.fingerprint_private_key(plain)
+    assert result is not None and result[:2] == ("RSA", 2048)
+    assert mismatch is None
+
+
+def test_fingerprint_private_file_alone_returns_none_when_the_symlink_cannot_be_created(
+    keys: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A symlink that cannot be created leaves the .pub file as the only thing left to read."""
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError("no symlinks here")
+
+    plain = _pem_key(tmp_path / "plain")
+    audit.pub_sibling(plain).write_text(pub(keys["ed25519"]) + "\n")
+    monkeypatch.setattr(Path, "symlink_to", refuse)
+
+    assert audit._fingerprint_private_file_alone(plain) is None
+    result, mismatch = audit.fingerprint_private_key(plain)
+    # The unrelated .pub, which is all that is left once the private key cannot be reached.
+    assert result is not None and result[0] == "ED25519"
+    assert mismatch is None
+
+
+def test_fingerprint_private_file_alone_does_not_hide_a_missing_ssh_keygen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A host with no ssh-keygen must not look like a key that needs a passphrase.
+
+    FileNotFoundError is an OSError, so running the ssh-keygen call inside the
+    same try as the temporary directory and the symlink would turn "ssh-keygen
+    is not installed" into a silent fall back to whatever .pub file sits
+    beside the key.
+    """
+    plain = _pem_key(tmp_path / "plain")
+
+    def missing(path: Path) -> tuple[str, int, str, str] | None:
+        raise FileNotFoundError(2, "No such file or directory", "ssh-keygen")
+
+    monkeypatch.setattr(audit, "fingerprint_file", missing)
+
+    with pytest.raises(FileNotFoundError):
+        audit._fingerprint_private_file_alone(plain)
+
+
+def test_fingerprint_private_key_falls_back_when_the_pub_sibling_is_unparsable(tmp_path: Path):
+    """A PEM key is fingerprinted from the private file itself even when a garbage .pub sits beside it.
+
+    For PEM/PKCS#8 keys, the private key file is tried first -- not as a
+    fallback that only kicks in once the .pub turns out to be unparsable.
+    A garbage (not merely stale) .pub beside the key therefore changes
+    nothing about how the private key itself gets read.
+    """
+    plain = _pem_key(tmp_path / "plain")
+    audit.pub_sibling(plain).write_text("not a key\n")
+    result, mismatch = audit.fingerprint_private_key(plain)
+    assert result is not None and result[:2] == ("RSA", 2048)
+    assert mismatch is None
+
+
+def test_fingerprint_private_key_pem_with_its_own_matching_pub_is_fingerprinted_via_it(tmp_path: Path):
+    """A legacy PEM key with its real, matching .pub still in place is read from that .pub.
+
+    This only happens here because the key is passphrase-protected: with no
+    passphrase supplied, ssh-keygen cannot open the private file directly, so
+    the .pub file is the only thing left to read. An unencrypted PEM key is
+    fingerprinted from the private file itself instead -- see
+    test_fingerprint_private_key_pem_prefers_the_private_key_over_a_stale_pub.
+    """
+    encrypted = _pem_key(tmp_path / "encrypted_pem", passphrase="hunter2")
+    result, mismatch = audit.fingerprint_private_key(encrypted)
+    assert result is not None and result[:2] == ("RSA", 2048)
+    assert mismatch is None
+
+
+def test_fingerprint_private_key_corrupt_openssh_body_is_not_reported_as_an_unrelated_pub(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """A corrupt OpenSSH-format key must not be reported as whatever .pub file happens to sit next to it.
+
+    The .pub fallback exists for legacy PEM/PKCS#8 keys, which have no
+    readable public half at all. A truncated *current*-format key also has no
+    readable public half, but it is corrupt, not merely an old format -- so
+    grading it as the key described by a neighbouring .pub (which could
+    belong to any other key) would misattribute it.
+    """
+    # Same truncated body as the "truncated" case in test_public_key_from_private_is_none_for_corrupt_bodies.
+    payload = (
+        _ssh_string(b"none")
+        + _ssh_string(b"none")
+        + _ssh_string(b"")
+        + (1).to_bytes(4, "big")
+        + (99).to_bytes(4, "big")
+    )
+    key = _openssh_key_file(tmp_path / "id_ed25519", payload)
+    audit.pub_sibling(key).write_text(pub(keys["rsa2048"]) + "\n")  # a valid, but unrelated, key
+    key.chmod(0o600)
+
+    assert audit.fingerprint_private_key(key) == (None, None)
+
+
+def _corrupt_the_public_half(source: Path, dest: Path) -> Path:
+    """Copy a real OpenSSH private key, replacing its public half with a type name and then garbage.
+
+    Every field in the file still parses -- the type name reads as
+    `ssh-ed25519`, and the private half is left exactly as it was -- so the
+    file passes every whole-file check. What it does not hold is a public key
+    ssh-keygen can fingerprint.
+    """
+    blob = _decode_openssh_body(source)
+    _, public_start, public_end = _public_half_bounds(blob)
+    corrupt = _ssh_string(b"ssh-ed25519") + b"garbage"
+    return _write_openssh_key(dest, blob[:public_start] + _ssh_string(corrupt) + blob[public_end:])
+
+
+def test_fingerprint_private_key_is_none_when_the_embedded_public_half_cannot_be_fingerprinted(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """A current-format key whose public half reads but cannot be fingerprinted is corrupt, `.pub` or no `.pub`.
+
+    public_key_from_private takes only the type name out of the embedded
+    public blob, so a blob whose remaining bytes are garbage still yields a
+    "<type> <base64>" line -- one ssh-keygen then refuses. Before the fix that
+    sent the key down the path meant for legacy PEM keys, and it was reported
+    as whatever `.pub` file happened to sit beside it.
+    """
+    key = _corrupt_the_public_half(keys["ed25519"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    line = audit.public_key_from_private(key)
+    assert line is not None and line.startswith("ssh-ed25519 ")  # the type name still reads
+    assert audit.fingerprint_line(line) is None  # but the blob is not a key
+    assert audit.fingerprint_private_key(key) == (None, None)
+
+
+def _corrupt_the_private_half(source: Path, dest: Path) -> Path:
+    """Copy a real OpenSSH private key with the first byte of its private half flipped.
+
+    That byte belongs to the first of the two check integers ssh compares when
+    it loads a key, and the private half keeps the exact length it had, so
+    every field in the file still parses and the public half still reads
+    perfectly. Only ssh's own loader can tell this file from a good one.
+    """
+    blob = _decode_openssh_body(source)
+    _, _, public_end = _public_half_bounds(blob)
+    private, end = audit._read_string(blob, public_end)
+    assert end == len(blob)
+    flipped = bytes([private[0] ^ 0xFF]) + private[1:]
+    return _write_openssh_key(dest, blob[:public_end] + _ssh_string(flipped))
+
+
+def test_fingerprint_private_key_is_none_when_ssh_cannot_load_the_private_half(keys: dict[str, Path], tmp_path: Path):
+    """A key whose private half ssh cannot load is not a usable key, however well its public half reads.
+
+    ssh builds the key it actually uses out of the private half, so a file
+    whose private half ssh refuses to load authenticates nobody. The clean case --
+    an intact unencrypted key at mode 0600, still fingerprinted and still
+    reporting no problem -- is covered by test_private_keys_end_to_end, which
+    audits exactly such a key.
+    """
+    key = _corrupt_the_private_half(keys["ed25519"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    # The whole point of this corruption: the public half is untouched and reads as it always did.
+    assert audit.public_key_from_private(key) == audit.public_key_from_private(keys["ed25519"])
+    # `ssh-keygen -l` cannot see the problem: handed a private key file in this
+    # format it answers from the public half inside it, writing the private
+    # half's failure to its debug log only. That is why the check below asks
+    # ssh-keygen for the public key derived from the private half instead.
+    assert audit._fingerprint_private_file_alone(key) is not None
+    assert audit._ssh_keygen_would_refuse(key) is False  # mode 0600, so the check really does run
+    assert audit._ssh_can_load_private_key(key) is False
+    assert audit.fingerprint_private_key(key) == (None, None)
+
+
+def test_fingerprint_private_key_cannot_check_the_private_half_of_an_encrypted_key(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """Documents a limitation: the private half of a passphrase-protected key cannot be checked at all.
+
+    Loading it needs the passphrase, which this tool never has, so the very
+    corruption caught above goes undetected here and the key is still reported
+    from its public half.
+    """
+    key = _corrupt_the_private_half(keys["encrypted"], tmp_path / "id_ed25519")
+    audit.pub_sibling(key).write_bytes(keys["encrypted"].with_name("encrypted.pub").read_bytes())
+
+    result, mismatch = audit.fingerprint_private_key(key)
+    assert result is not None and result[0] == "ED25519"
+    assert mismatch is None
+
+
+@needs_non_root
+def test_fingerprint_private_key_cannot_check_the_private_half_of_a_key_ssh_keygen_refuses(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """Documents a limitation: ssh-keygen will not open a key the running account owns and others can see.
+
+    There is no way to ask ssh to load such a file, so corruption inside its
+    private half goes undetected and the key is still reported from its public
+    half. The same file at mode 0600 is read fine, which is what the first
+    assertion pins down.
+    """
+    key = _corrupt_the_private_half(keys["ed25519"], tmp_path / "id_ed25519")
+    assert audit._ssh_keygen_would_refuse(key) is False  # as written: mode 0600
+    key.chmod(0o644)
+    assert audit._ssh_keygen_would_refuse(key) is True
+
+    result, mismatch = audit.fingerprint_private_key(key)
+    assert result is not None and result[0] == "ED25519"
+    assert mismatch is None
+
+
+def test_ssh_keygen_would_refuse_a_file_it_cannot_stat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A file that cannot be stat'd must be assumed unreadable by ssh-keygen, not assumed fine.
+
+    Answering False would send the caller on to run ssh-keygen over the key and
+    read the refusal as "ssh cannot load this key", turning a problem with the
+    file's permissions into a wrong answer about the key itself.
+    """
+    key = tmp_path / "id_ed25519"
+    key.write_text(audit.OPENSSH_PRIVATE_KEY_HEADER + "\n")
+    key.chmod(0o600)
+    assert audit._ssh_keygen_would_refuse(key) is False  # nothing wrong with it as written
+
+    def raise_oserror(*args: object, **kwargs: object) -> os.stat_result:
+        raise OSError("cannot stat this")
+
+    monkeypatch.setattr(Path, "stat", raise_oserror)
+    assert audit._ssh_keygen_would_refuse(key) is True
+
+
+def test_fingerprint_private_key_survives_a_comment_that_is_not_utf8(tmp_path: Path):
+    """A key whose embedded comment is not valid UTF-8 must not take the whole audit down.
+
+    `ssh-keygen -y` prints the key's comment exactly as the bytes sit in the
+    file (unlike `ssh-keygen -l`, which escapes them), so collecting its output
+    as decoded text raised UnicodeDecodeError out of subprocess.run and aborted
+    the run. Only the exit status is wanted, so the output is never decoded.
+    """
+    key = tmp_path / "id_ed25519"
+    subprocess.run(
+        # Latin-1 bytes straight into the comment, which ssh-keygen stores as given.
+        [b"ssh-keygen", b"-q", b"-t", b"ed25519", b"-N", b"", b"-C", b"M\xfcller", b"-f", os.fsencode(key)],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert b"M\xfcller" in audit.pub_sibling(key).read_bytes()  # the comment really is not UTF-8
+    assert audit._ssh_keygen_would_refuse(key) is False  # mode 0600, so the private-half check runs
+    assert audit._ssh_can_load_private_key(key) is True
+
+    result, mismatch = audit.fingerprint_private_key(key)
+    assert result is not None and result[0] == "ED25519"
+    assert mismatch is None
+
+
+def test_private_key_is_encrypted(keys: dict[str, Path]):
+    assert audit.private_key_is_encrypted(keys["ed25519"]) is False
+    assert audit.private_key_is_encrypted(keys["encrypted"]) is True
+
+
+def test_private_key_is_encrypted_works_on_world_readable_key(keys: dict[str, Path], tmp_path: Path):
+    # ssh-keygen refuses to load a 0644 key, so detection must not depend on it.
+    for name, expected in (("ed25519", False), ("encrypted", True)):
+        copy = tmp_path / name
+        copy.write_bytes(keys[name].read_bytes())
+        copy.chmod(0o644)
+        assert audit.private_key_is_encrypted(copy) is expected
+
+
+@pytest.mark.parametrize(
+    ("header", "extra", "expected"),
+    [
+        ("-----BEGIN RSA PRIVATE KEY-----", "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n", True),
+        ("-----BEGIN RSA PRIVATE KEY-----", "", False),
+        ("-----BEGIN EC PRIVATE KEY-----", "Proc-Type: 4,ENCRYPTED\n", True),
+        ("-----BEGIN ENCRYPTED PRIVATE KEY-----", "", True),
+        ("-----BEGIN PRIVATE KEY-----", "", False),
+        ("-----BEGIN CERTIFICATE-----", "", None),
+    ],
+)
+def test_private_key_is_encrypted_pem_variants(tmp_path: Path, header: str, extra: str, expected: bool | None):
+    key = tmp_path / "k"
+    key.write_text(f"{header}\n{extra}AAAA\n-----END X-----\n")
+    assert audit.private_key_is_encrypted(key) is expected
+
+
+def test_private_key_is_encrypted_corrupt_openssh_body(tmp_path: Path):
+    key = tmp_path / "k"
+    key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nnot base64!!\n-----END OPENSSH PRIVATE KEY-----\n")
+    assert audit.private_key_is_encrypted(key) is None
+    key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n")
+    assert audit.private_key_is_encrypted(key) is None  # valid base64, wrong magic
+
+
+def test_private_key_is_encrypted_truncated_cipher_field_is_none(tmp_path: Path):
+    # cipher_len says 4 bytes follow, but only 2 are actually present: a truncated
+    # file must not be misread as "cipher present" (and so classified as encrypted).
+    magic = b"openssh-key-v1\x00"
+    body = base64.b64encode(magic + (4).to_bytes(4, "big") + b"no").decode()
+    key = tmp_path / "k"
+    key.write_text(f"-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----\n")
+    assert audit.private_key_is_encrypted(key) is None
+
+
+def test_private_key_is_encrypted_zero_length_cipher_field_is_none(tmp_path: Path):
+    magic = b"openssh-key-v1\x00"
+    body = base64.b64encode(magic + (0).to_bytes(4, "big")).decode()
+    key = tmp_path / "k"
+    key.write_text(f"-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----\n")
+    assert audit.private_key_is_encrypted(key) is None
+
+
+def test_looks_like_private_key(keys: dict[str, Path], tmp_path: Path):
+    assert audit.looks_like_private_key(keys["ed25519"]) is True
+    assert audit.looks_like_private_key(keys["encrypted"]) is True
+    pubfile = keys["ed25519"].with_name("ed25519.pub")
+    assert audit.looks_like_private_key(pubfile) is False
+    cfg = tmp_path / "config"
+    cfg.write_text("Host foo\n  User bar\n")
+    assert audit.looks_like_private_key(cfg) is False
+    assert audit.looks_like_private_key(tmp_path / "missing") is False
+
+
+@needs_non_root
+def test_private_key_format_is_none_for_a_file_that_cannot_be_read(tmp_path: Path):
+    """An unreadable file answers "cannot tell", never "one of the older formats", and must not raise.
+
+    The difference matters to the caller: only a "legacy" answer sends a file
+    down the fallback meant for the older PEM formats, which reports whatever
+    `.pub` file sits beside it.
+    """
+    key = tmp_path / "id_ed25519"
+    key.write_text(audit.OPENSSH_PRIVATE_KEY_HEADER + "\n")
+    assert audit._private_key_format(key) == "openssh"  # readable as written
+    key.chmod(0o000)
+    try:
+        assert audit._private_key_format(key) is None
+    finally:
+        key.chmod(0o600)
+
+
+@needs_non_root
+def test_unreadable_key_is_not_reported_as_the_pub_file_beside_it(keys: dict[str, Path], tmp_path: Path):
+    """A key file this tool cannot read must not be reported as whatever `.pub` file sits next to it.
+
+    This is what a non-root run of the audit meets on a root-owned host key:
+    the file cannot be read, so nothing about the key is known, and the `.pub`
+    file beside it could describe any other key -- here it deliberately holds
+    one. Answering from it would put a fingerprint in the report that the
+    operator has no reason to doubt and that belongs to a different key
+    entirely.
+    """
+    key = tmp_path / "ssh_host_ed25519_key"
+    key.write_bytes(keys["ed25519"].read_bytes())
+    audit.pub_sibling(key).write_text(pub(keys["rsa2048"]) + "\n")  # a valid, but unrelated, key
+    key.chmod(0o000)
+    try:
+        assert audit.fingerprint_private_key(key) == (None, None)
+
+        findings = audit.audit_host_keys({"hostkey": [str(key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+        # Mode 0000 on a file this account owns is clean as far as sshd is
+        # concerned, and whether a passphrase is set cannot be told from a file
+        # that cannot be read, so this one finding is the whole report -- no
+        # Ed25519 note either, because the key set is unknown, not known to be
+        # missing an Ed25519 key.
+        assert [(f.path, f.key_type, f.fingerprint) for f in findings] == [(str(key), "?", "")]
+        assert [(i.severity, i.message) for i in findings[0].issues] == [("LOW", "could not fingerprint host key")]
+    finally:
+        key.chmod(0o600)
+
+
+@needs_non_root
+def test_no_ed25519_note_when_a_host_key_could_not_be_fingerprinted(keys: dict[str, Path], tmp_path: Path):
+    """An unreadable host key leaves the set of key types unknown, so the Ed25519 note must stay quiet.
+
+    This is what a non-root run of the audit meets: the RSA key reads fine, the
+    Ed25519 key cannot be read at all, so its type is never recorded as present.
+    Adding the note from that would tell the operator to run `ssh-keygen -A` on
+    a host that already has an Ed25519 host key.
+    """
+    rsa = tmp_path / "ssh_host_rsa_key"
+    rsa.write_bytes(keys["rsa4096"].read_bytes())
+    rsa.chmod(0o600)
+    unreadable = tmp_path / "ssh_host_ed25519_key"
+    unreadable.write_bytes(keys["ed25519"].read_bytes())
+    unreadable.chmod(0o000)
+    try:
+        findings = audit.audit_host_keys(
+            {"hostkey": [str(rsa), str(unreadable)]}, min_rsa_bits=3072, owner_uid=os.getuid()
+        )
+    finally:
+        unreadable.chmod(0o600)
+
+    assert [f.path for f in findings] == [str(rsa), str(unreadable)]
+    assert not any("Ed25519" in i.message for f in findings for i in f.issues)
+    assert [i.message for i in findings[1].issues] == ["could not fingerprint host key"]
+
+
+# --- audit_host_keys ----------------------------------------------------------
+
+
+def test_host_keys_from_config(keys: dict[str, Path], tmp_path: Path):
+    rsa = tmp_path / "ssh_host_rsa_key"
+    ed = tmp_path / "ssh_host_ed25519_key"
+    rsa.write_bytes(keys["rsa2048"].read_bytes())
+    rsa.with_suffix(".pub").write_bytes(keys["rsa2048"].with_name("rsa2048.pub").read_bytes())
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    for p in (rsa, ed):
+        p.chmod(0o600)
+    rsa.chmod(0o644)
+
+    config = {"hostkey": [str(rsa), str(ed), str(tmp_path / "missing")]}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+    by_path = {f.path: f for f in findings}
+
+    assert by_path[str(rsa)].key_type == "RSA" and by_path[str(rsa)].bits == 2048
+    sev = _by_sev(by_path[str(rsa)].issues)
+    assert any("below policy minimum" in m for m in sev["MEDIUM"])
+    assert any("world-accessible" in m and "sshd refuses" in m for m in sev["CRITICAL"])
+
+    assert by_path[str(ed)].key_type == "ED25519"
+    assert by_path[str(ed)].issues == []
+
+    assert [i.message for i in by_path[str(tmp_path / "missing")].issues] == ["configured HostKey does not exist"]
+    assert "(none)" not in by_path  # an Ed25519 key is present, so no "missing Ed25519" entry
+    # A missing configured HostKey gets its own per-file finding, never the
+    # "no default host key" aggregate -- that one only applies when nothing
+    # was configured at all.
+    assert not any("no host key exists at any default path" in i.message for f in findings for i in f.issues)
+
+
+def test_host_key_naming_a_public_key_file_with_an_agent_is_info(keys: dict[str, Path], tmp_path: Path):
+    """With HostKeyAgent set, a public-key HostKey is how sshd is told which agent key to serve.
+
+    sshd tries sshkey_load_private() on every HostKey, falls back to
+    sshkey_load_public(), and with an agent configured logs "will rely on agent
+    for hostkey" and serves that key (sshd.c). The private half is not on disk,
+    so there are no permissions, no passphrase and no `.pub` sibling to check --
+    not even at mode 0644, which on a private key file would be a CRITICAL, and
+    not even when a `.pub` file for a different key does sit next to it.
+    """
+    hk = tmp_path / "ssh_host_ed25519_key.pub"
+    hk.write_text(pub(keys["ed25519"]) + "\n")
+    hk.chmod(0o644)
+    # A `.pub` sibling holding a different key entirely. On a private key file
+    # this is a LOW "does not match this private key"; here there is no private
+    # key to compare it against, so the check must not run at all.
+    hk.with_name(hk.name + ".pub").write_text(pub(keys["rsa4096"]) + "\n")
+
+    config = {"hostkey": [str(hk)], "hostkeyagent": ["/run/host-key-agent.sock"]}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(hk))
+    assert (finding.key_type, finding.bits) == ("ED25519", 256)
+    assert finding.fingerprint
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        ("INFO", "public key file; the private half is held by HostKeyAgent and cannot be audited here")
+    ]
+    assert not any("does not match" in i.message for i in finding.issues)
+    # sshd serves this key through the agent, so it counts as the host's Ed25519 key.
+    assert not any(f.path == "(none)" for f in findings)
+
+
+def test_host_key_held_by_an_agent_is_still_graded(keys: dict[str, Path], tmp_path: Path):
+    """An agent-held key is still a key sshd serves, so its algorithm and size are graded."""
+    hk = tmp_path / "ssh_host_rsa_key.pub"
+    hk.write_text(pub(keys["rsa1024"]) + "\n")
+
+    config = {"hostkey": [str(hk)], "hostkeyagent": ["/run/host-key-agent.sock"]}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(hk))
+    assert any("below 2048" in m for m in _by_sev(finding.issues)["CRITICAL"])
+
+
+@pytest.mark.parametrize(
+    "config_extra",
+    [
+        pytest.param({}, id="HostKeyAgent absent"),
+        pytest.param({"hostkeyagent": ["none"]}, id="HostKeyAgent none"),
+        pytest.param({"hostkeyagent": ["None"]}, id="HostKeyAgent None, any case"),
+    ],
+)
+def test_host_key_naming_a_public_key_file_without_an_agent_is_low(
+    keys: dict[str, Path], tmp_path: Path, config_extra: dict[str, list[str]]
+):
+    """Without an agent a public-key HostKey is unusable, and it is not a private key file either.
+
+    Verified against OpenSSH 10.2: `sshd -t` with such a HostKey prints
+    "Unable to load host key: <path>" and, with no other key configured,
+    "no hostkeys available -- exiting". So the permission and passphrase
+    checks -- which are about private key files -- must not run on it, and the
+    key's type must not count as a type the host can offer.
+    """
+    hk = tmp_path / "ssh_host_ed25519_key.pub"
+    hk.write_text(pub(keys["ed25519"]) + "\n")
+    hk.chmod(0o644)
+
+    config = {"hostkey": [str(hk)], **config_extra}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(hk))
+    assert (finding.key_type, finding.bits) == ("ED25519", 256)
+    assert finding.fingerprint
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        (
+            "LOW",
+            "HostKey names a public key file and no HostKeyAgent is set; sshd cannot load a private key from it",
+        )
+    ]
+    # sshd has no usable Ed25519 key from this line, so the Ed25519 note still fires.
+    assert any(f.path == "(none)" and "Ed25519" in f.issues[0].message for f in findings)
+
+
+def test_host_key_naming_a_public_key_file_without_an_agent_is_not_graded(keys: dict[str, Path], tmp_path: Path):
+    """sshd can never use the key, so grading its size would imply the host offers something it does not.
+
+    An RSA-1024 private host key is a CRITICAL. Named as a public file with no
+    agent, it is only the LOW saying sshd cannot load a private key from it:
+    there is nothing for an attacker to reach, because sshd never serves it.
+    """
+    hk = tmp_path / "ssh_host_rsa_key.pub"
+    hk.write_text(pub(keys["rsa1024"]) + "\n")
+
+    findings = audit.audit_host_keys({"hostkey": [str(hk)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(hk))
+    assert (finding.key_type, finding.bits) == ("RSA", 1024)
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        (
+            "LOW",
+            "HostKey names a public key file and no HostKeyAgent is set; sshd cannot load a private key from it",
+        )
+    ]
+
+
+def _ed25519_host_certificate(tmp_path: Path, name: str) -> Path:
+    """Sign a fresh ed25519 host key with a fresh CA and return the certificate file's path."""
+
+    def keygen(path: Path, *extra: str) -> None:
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(path), *extra],
+            check=True,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+        )
+
+    ca = tmp_path / f"{name}-ca"
+    host_key = tmp_path / name
+    keygen(ca)
+    keygen(host_key)
+    subprocess.run(
+        ["ssh-keygen", "-q", "-s", str(ca), "-I", "test", "-h", str(host_key) + ".pub"],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    return host_key.with_name(host_key.name + "-cert.pub")
+
+
+@pytest.mark.parametrize(
+    "config_extra",
+    [
+        pytest.param({}, id="no HostKeyAgent"),
+        pytest.param({"hostkeyagent": ["/run/host-key-agent.sock"]}, id="HostKeyAgent set"),
+    ],
+)
+def test_host_key_naming_a_certificate_file_is_low(tmp_path: Path, config_extra: dict[str, list[str]]):
+    """A certificate is not a host key sshd can load, with or without an agent.
+
+    The "will rely on agent for hostkey" fallback in sshd.c is only taken for a
+    plain key type, so a certificate named by HostKey is unusable either way.
+    Verified against OpenSSH 10.2 with a live agent holding both the key and
+    its certificate: `sshd -t` still logs "Unable to load host key" for the
+    certificate file and exits with "no hostkeys available", while the same
+    setup with the plain `.pub` file loads the key through the agent. So the
+    key's type must not count as one the host can offer, and grading its
+    algorithm and size would wrongly imply it does something.
+    """
+    cert = _ed25519_host_certificate(tmp_path, "ssh_host_ed25519_key")
+
+    config = {"hostkey": [str(cert)], **config_extra}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(cert))
+    assert finding.key_type == "ED25519-CERT"
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        (
+            "LOW",
+            "HostKey names a certificate file; sshd cannot load a host key from it "
+            "(a certificate belongs on a HostCertificate line)",
+        )
+    ]
+    # The Ed25519 inside the certificate is not a host key sshd can serve, so
+    # the "no Ed25519 host key present" note still fires.
+    assert any(f.path == "(none)" and "Ed25519" in f.issues[0].message for f in findings)
+
+
+def test_server_config_warns_when_a_host_key_agent_is_set():
+    """Keys an agent holds are not on disk, so the report has to say they were not audited."""
+    _, coverage = audit.audit_server_config({"hostkeyagent": ["/run/agent.sock"]}, "sshd -T", "")
+    assert (
+        "HostKeyAgent is set (/run/agent.sock); private host keys held by the agent "
+        "are not on disk and cannot be audited." in coverage
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [pytest.param({}, id="absent"), pytest.param({"hostkeyagent": ["none"]}, id="none")],
+)
+def test_server_config_says_nothing_about_an_unset_host_key_agent(config: dict[str, list[str]]):
+    _, coverage = audit.audit_server_config(config, "sshd -T", "")
+    assert not any("HostKeyAgent" in c for c in coverage)
+
+
+def test_host_key_group_accessible_and_root_owned_is_refused_by_sshd(keys: dict[str, Path], tmp_path: Path):
+    """sshkey_perm_ok() refuses a key over its mode only when the account running sshd owns it.
+
+    Here the expected owner does own the file, which is the production case of a
+    root-owned host key read by a root sshd, so sshd turns it down.
+    """
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o640)
+
+    findings = audit.audit_host_keys({"hostkey": [str(ed)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(ed))
+    assert _by_sev(finding.issues)["HIGH"] == ["group-accessible private key (mode 0640); sshd refuses to load it"]
+
+
+def test_host_key_not_owned_by_root_is_loaded_anyway(keys: dict[str, Path], tmp_path: Path):
+    """A host key somebody else owns is loaded whatever its mode, so the message must not claim otherwise.
+
+    sshkey_perm_ok() only looks at the mode when the file belongs to the uid
+    running the program; sshd runs as root, so another account's host key is
+    read regardless -- and that account, plus anyone its mode admits, can read
+    and replace the server's identity key.
+    """
+    if os.getuid() == 0:
+        pytest.skip("running as root: the file IS root-owned, so there is no mismatch to observe")
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o640)
+
+    findings = audit.audit_host_keys({"hostkey": [str(ed)]}, min_rsa_bits=3072)  # owner_uid defaults to root
+
+    finding = next(f for f in findings if f.path == str(ed))
+    assert _by_sev(finding.issues)["HIGH"] == [
+        f"owned by {audit.uid_name(os.getuid())}, expected root",
+        "group-accessible private key (mode 0640); sshd still loads it because root does not own it",
+    ]
+
+
+def test_host_keys_default_owner_is_root(keys: dict[str, Path], tmp_path: Path):
+    """Without an injected owner_uid, a host key not owned by root is a HIGH."""
+    if os.getuid() == 0:
+        pytest.skip("running as root: the file IS root-owned, so there is no mismatch to observe")
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o600)
+
+    findings = audit.audit_host_keys({"hostkey": [str(ed)]}, min_rsa_bits=3072)
+    by_path = {f.path: f for f in findings}
+    assert by_path[str(ed)].issues == [audit.Issue("HIGH", f"owned by {audit.uid_name(os.getuid())}, expected root")]
+
+
+def test_host_keys_missing_ed25519_is_noted(keys: dict[str, Path], tmp_path: Path):
+    rsa = tmp_path / "ssh_host_rsa_key"
+    rsa.write_bytes(keys["rsa4096"].read_bytes())
+    rsa.chmod(0o600)
+    findings = audit.audit_host_keys({"hostkey": [str(rsa)]}, min_rsa_bits=3072)
+    assert any(f.path == "(none)" and "Ed25519" in f.issues[0].message for f in findings)
+
+
+def test_host_keys_encrypted_key_is_low(keys: dict[str, Path], tmp_path: Path):
+    enc = tmp_path / "ssh_host_ed25519_key"
+    enc.write_bytes(keys["encrypted"].read_bytes())
+    enc.with_suffix(".pub").write_bytes(keys["encrypted"].with_name("encrypted.pub").read_bytes())
+    enc.chmod(0o600)
+    findings = audit.audit_host_keys({"hostkey": [str(enc)]}, min_rsa_bits=3072)
+    assert findings[0].fingerprint  # fingerprinted from the public half inside the private key file
+    assert any(i.severity == "LOW" and "passphrase" in i.message for i in findings[0].issues)
+    # The .pub sibling matches, so nothing is said about it.
+    assert not any("does not match" in i.message for i in findings[0].issues)
+
+
+def test_host_key_that_cannot_be_fingerprinted_still_gets_perms_and_passphrase_checked(tmp_path: Path):
+    """A host key ssh-keygen can't read at all must still get its permission and passphrase checks.
+
+    An encrypted, legacy-PEM host key with no .pub sibling cannot be
+    fingerprinted by any of the tool's methods (ssh-keygen refuses to read an
+    encrypted key without its passphrase, whatever the file's mode -- see the
+    mode-0600 case below). That must not skip the checks that do not depend
+    on fingerprinting: file permissions and whether a passphrase is set.
+    """
+    host_key = tmp_path / "ssh_host_rsa_key"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "rsa", "-b", "2048", "-m", "PEM", "-N", "somepass", "-f", str(host_key)],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    audit.pub_sibling(host_key).unlink()  # no .pub: nothing to fall back to
+    host_key.chmod(0o644)
+
+    findings = audit.audit_host_keys({"hostkey": [str(host_key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    finding = next(f for f in findings if f.path == str(host_key))
+    assert (finding.key_type, finding.bits, finding.fingerprint) == ("?", 0, "")
+    sev = _by_sev(finding.issues)
+    assert "could not fingerprint host key" in sev["LOW"]
+    assert any("passphrase" in m for m in sev["LOW"])
+    assert sev["CRITICAL"] == ["world-accessible private key (mode 0644); sshd refuses to load it"]
+
+
+def test_host_key_that_cannot_be_fingerprinted_clean_perms_only_gets_the_lows(tmp_path: Path):
+    """Same undecodable host key, but mode 0600: no CRITICAL/HIGH, just the two LOWs."""
+    host_key = tmp_path / "ssh_host_rsa_key"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "rsa", "-b", "2048", "-m", "PEM", "-N", "somepass", "-f", str(host_key)],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    audit.pub_sibling(host_key).unlink()
+    host_key.chmod(0o600)
+
+    findings = audit.audit_host_keys({"hostkey": [str(host_key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    finding = next(f for f in findings if f.path == str(host_key))
+    assert (finding.key_type, finding.bits, finding.fingerprint) == ("?", 0, "")
+    sev = _by_sev(finding.issues)
+    assert set(sev) == {"LOW"}
+    assert "could not fingerprint host key" in sev["LOW"]
+    assert any("passphrase" in m for m in sev["LOW"])
+
+
+def test_host_key_unreadable_group_other_bits_gets_the_sshd_refuses_suffix(tmp_path: Path):
+    """Mode 0601 on a host key gets the new LOW, with the same 'sshd refuses to load it' suffix as the others."""
+    host_key = tmp_path / "ssh_host_rsa_key"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "rsa", "-b", "2048", "-N", "", "-f", str(host_key)],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    host_key.chmod(0o601)
+
+    findings = audit.audit_host_keys({"hostkey": [str(host_key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    finding = next(f for f in findings if f.path == str(host_key))
+    sev = _by_sev(finding.issues)
+    assert sev["LOW"] == ["group/other bits set but not readable by them (mode 0601); sshd refuses to load it"]
+    assert "CRITICAL" not in sev
+    assert "HIGH" not in sev
+
+
+def test_host_key_stale_pub_is_flagged_and_the_private_key_wins(keys: dict[str, Path], tmp_path: Path):
+    """The .pub file next to a host key is only checked against the key, never trusted over it."""
+    host_key = tmp_path / "ssh_host_ed25519_key"
+    host_key.write_bytes(keys["encrypted"].read_bytes())
+    host_key.chmod(0o600)
+    audit.pub_sibling(host_key).write_text(pub(keys["rsa2048"]) + "\n")
+
+    findings = audit.audit_host_keys({"hostkey": [str(host_key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    finding = next(f for f in findings if f.path == str(host_key))
+    assert finding.key_type == "ED25519"
+    mismatches = [i for i in finding.issues if i.severity == "LOW" and "does not match" in i.message]
+    assert len(mismatches) == 1
+    assert mismatches[0].message.startswith("ssh_host_ed25519_key.pub does not match this private key")
+
+
+def test_host_key_whose_private_half_ssh_cannot_load_is_not_fingerprinted(keys: dict[str, Path], tmp_path: Path):
+    """A host key ssh cannot load is reported as unfingerprintable, however well its public half reads.
+
+    `sshd` builds the key it serves out of the private half, so a host key whose
+    private half ssh refuses to load is not a working host key -- and a matching
+    `.pub` file beside it must not make it look like one.
+    """
+    host_key = _corrupt_the_private_half(keys["ed25519"], tmp_path / "ssh_host_ed25519_key")
+    audit.pub_sibling(host_key).write_text(pub(keys["ed25519"]) + "\n")
+    assert audit._ssh_keygen_would_refuse(host_key) is False  # mode 0600, so the check really runs
+
+    findings = audit.audit_host_keys({"hostkey": [str(host_key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    finding = next(f for f in findings if f.path == str(host_key))
+    assert (finding.key_type, finding.bits, finding.fingerprint) == ("?", 0, "")
+    assert "could not fingerprint host key" in _by_sev(finding.issues)["LOW"]
+
+
+def test_host_keys_defaults_when_unconfigured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """No HostKey configured and none of the defaults exist: sshd has no host key at all and won't start."""
+    monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nope")])
+    findings = audit.audit_host_keys({}, min_rsa_bits=3072)
+    assert [(f.path, f.key_type, f.bits, f.fingerprint) for f in findings] == [("(none)", "?", 0, "")]
+    assert [(i.severity, i.message) for i in findings[0].issues] == [
+        ("LOW", "no host key exists at any default path; sshd has no host key and will not start")
+    ]
+    # The aggregate stands on its own; it must not be followed by the Ed25519 nag too.
+    assert not any("no Ed25519 host key present" in i.message for f in findings for i in f.issues)
+
+
+def test_host_keys_defaults_all_unstattable_reports_only_the_stat_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A default path that could not even be stat'd must not be reported as 'no host key exists'.
+
+    Not knowing whether the file is there is different from knowing it is not:
+    the aggregate "no host key exists at any default path" finding requires
+    every default path to have been confirmed absent.
+    """
+
+    def raise_permission_denied(path: Path) -> bool:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nope")])
+    monkeypatch.setattr(audit, "_is_regular_file", raise_permission_denied)
+
+    findings = audit.audit_host_keys({}, min_rsa_bits=3072)
+
+    messages = [i.message for f in findings for i in f.issues]
+    assert any("could not stat host key" in m for m in messages)
+    assert not any("no host key exists at any default path" in m for m in messages)
+
+
+def test_host_keys_defaults_mixed_missing_and_present(
+    keys: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The fallback list is used when no `HostKey` is configured: a missing entry in it is skipped silently,
+
+    while an entry that does exist is audited exactly as a configured one would be. This is what makes it
+    safe to add a new default path (such as the ML-DSA hybrid key) that most hosts do not have yet.
+    """
+    present = keys["ed25519"]
+    monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nope"), str(present)])
+
+    findings = audit.audit_host_keys({}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    assert [f.path for f in findings] == [str(present)]
+    assert findings[0].key_type == "ED25519"
+    assert not any("no host key exists at any default path" in i.message for f in findings for i in f.issues)
+
+
+def test_host_key_none_on_its_own_is_reported_as_no_host_key_at_all():
+    """`HostKey none` names no file, and on its own it leaves sshd with nothing to start with.
+
+    sshd keeps `none` as a sentinel rather than a path: derelativise_path()
+    hands back the literal "none" (servconf.c), fill_default_server_options()
+    then clears that entry to NULL (CLEAR_ON_NONE), and the host-key loader
+    skips a NULL entry (sshd.c). With no other HostKey configured, sshd exits
+    with "no hostkeys available -- exiting" -- verified against OpenSSH 10.2.
+    So there is no file here to look for, and nothing to say about the host's
+    key types either.
+    """
+    findings = audit.audit_host_keys({"hostkey": ["none"]}, min_rsa_bits=3072)
+
+    assert [(f.path, f.key_type, f.bits, f.fingerprint) for f in findings] == [("(none)", "?", 0, "")]
+    assert [(i.severity, i.message) for i in findings[0].issues] == [
+        (
+            "LOW",
+            "HostKey is set to none and no other HostKey is configured; sshd has no host key and will not start",
+        )
+    ]
+
+
+def test_host_key_null_from_sshd_t_is_not_audited_as_a_file(keys: dict[str, Path], tmp_path: Path):
+    """`sshd -T` prints a `HostKey none` entry as "hostkey (null)", which is not a path either.
+
+    Verified against OpenSSH 10.2: a config with `HostKey none` and one real key
+    prints both "hostkey (null)" and the real key's path. Only the real key is
+    audited, and nothing is reported as a missing file.
+    """
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o600)
+
+    findings = audit.audit_host_keys({"hostkey": ["(null)", str(ed)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    assert [f.path for f in findings] == [str(ed)]
+    assert findings[0].key_type == "ED25519"
+    assert not any("does not exist" in i.message for f in findings for i in f.issues)
+
+
+def test_host_key_none_alongside_a_real_key_leaves_the_real_key_audited(keys: dict[str, Path], tmp_path: Path):
+    """The sentinel is dropped, the real key is audited, and the Ed25519 note still fires for it."""
+    rsa = tmp_path / "ssh_host_rsa_key"
+    rsa.write_bytes(keys["rsa4096"].read_bytes())
+    rsa.chmod(0o600)
+
+    findings = audit.audit_host_keys({"hostkey": ["none", str(rsa)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    assert [f.path for f in findings] == [str(rsa), "(none)"]
+    assert (findings[0].key_type, findings[0].bits) == ("RSA", 4096)
+    assert findings[0].issues == []
+    assert [i.message for i in findings[1].issues] == ["no Ed25519 host key present; consider ssh-keygen -A"]
+
+
+@needs_non_root
+def test_host_keys_unstattable_path_is_low_not_a_crash(tmp_path: Path):
+    """A HostKey path this tool cannot even stat (a directory above it is unreadable) must not crash it."""
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    host_key = blocked / "ssh_host_ed25519_key"
+    blocked.chmod(0o000)
+    try:
+        findings = audit.audit_host_keys({"hostkey": [str(host_key)]}, min_rsa_bits=3072)
+    finally:
+        blocked.chmod(0o700)
+
+    finding = next(f for f in findings if f.path == str(host_key))
+    assert [i.severity for i in finding.issues] == ["LOW"]
+    assert finding.issues[0].message.startswith("could not stat host key")
+
+
+# --- audit_authorized_keys ---------------------------------------------------
+
+
+def test_authorized_keys_end_to_end(keys: dict[str, Path], tmp_path: Path):
+    root = make_user("root", 0, tmp_path / "root")
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    svc = make_user("svc", USER_UID, tmp_path / "var" / "lib" / "svc")  # home outside /home
+    for u in (root, alice, svc):
+        Path(u.pw_dir).mkdir(parents=True, mode=0o755)
+
+    _write_ak(
+        alice,
+        [
+            "# managed by ansible",  # comment on line 1 must not swallow file-level findings
+            pub(keys["rsa2048"]),
+            f'from="10.0.0.0/8",command="/usr/bin/rsync --server",no-pty {pub(keys["ed25519"])}',
+            "ssh-rsa notreallyakey garbage@x",
+        ],
+    )
+    Path(alice.pw_dir).chmod(0o770)  # group-writable home
+    _write_ak(svc, [pub(keys["rsa4096"]), pub(keys["ed25519"])])
+    root_lines = [pub(keys["ed25519"]).rsplit(" ", 1)[0]]  # no comment, unrestricted
+    if "dsa" in keys:
+        root_lines.insert(0, pub(keys["dsa"]))
+    _write_ak(root, root_lines)
+
+    config = {"authorizedkeysfile": [".ssh/authorized_keys .ssh/authorized_keys2"]}
+    patterns, files, ak, dupes, coverage = audit.audit_authorized_keys(config, 3072, users=[root, alice, svc])
+
+    assert patterns == [".ssh/authorized_keys", ".ssh/authorized_keys2"]
+    assert coverage == []
+    assert {f.user for f in files} == {"root", "alice", "svc"}
+
+    alice_file = next(f for f in files if f.user == "alice")
+    assert alice_file.key_count == 2
+    sev = _by_sev(alice_file.issues)
+    assert any("group/world-writable" in m and str(alice.pw_dir) in m for m in sev["HIGH"])
+    assert any(m.startswith("line 4: unparseable") for m in sev["LOW"])
+
+    by_key = {(k.user, k.line_number): k for k in ak}
+    assert _by_sev(by_key[("alice", 2)].issues) == {"MEDIUM": ["RSA 2048-bit is below policy minimum of 3072"]}
+    restricted = by_key[("alice", 3)]
+    assert restricted.options[0] == 'from="10.0.0.0/8"'
+    assert "MEDIUM" in _by_sev(restricted.issues)  # duplicate
+    assert "INFO" not in _by_sev(restricted.issues)  # non-root, restricted
+
+    svc_strong = by_key[("svc", 1)]
+    assert svc_strong.issues == []
+
+    ed_fp = restricted.fingerprint
+    assert set(dupes) == {ed_fp}
+    assert len(dupes[ed_fp]) == 3
+    root_ed = by_key[("root", len(root_lines))]
+    assert root_ed.comment == ""
+    sev = _by_sev(root_ed.issues)
+    assert any("also authorized at" in m and "alice" in m and "svc" in m for m in sev["MEDIUM"])
+    assert sev["INFO"] == ["uid-0 account key has no from= or command= restriction"]
+    if "dsa" in keys:
+        assert "HIGH" in _by_sev(by_key[("root", 1)].issues)
+
+
+@needs_non_root
+def test_authorized_keys_unstattable_home_is_a_file_finding_not_a_crash(keys: dict[str, Path], tmp_path: Path):
+    """A home this tool cannot even stat (another account's home when not running as root) must not crash it.
+
+    Regression test for a crash: os.stat() on a path below a 0o000 directory
+    raises PermissionError on Python 3.10-3.12, and without the fix that
+    propagated straight out of audit_authorized_keys as an unhandled
+    exception. A second account with a normal, readable file is included to
+    prove the rest of the run is unaffected.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID + 1, tmp_path / "home" / "bob")
+    Path(alice.pw_dir).mkdir(parents=True, mode=0o700)
+    Path(bob.pw_dir).mkdir(parents=True, mode=0o700)
+    _write_ak(bob, [pub(keys["ed25519"])])
+    Path(alice.pw_dir).chmod(0o000)
+
+    config = {"authorizedkeysfile": [".ssh/authorized_keys"]}  # a single pattern keeps this test to one file
+    try:
+        _, files, ak, _, _ = audit.audit_authorized_keys(config, 3072, users=[alice, bob])
+    finally:
+        Path(alice.pw_dir).chmod(0o700)
+
+    alice_files = [f for f in files if f.user == "alice"]
+    assert len(alice_files) == 1
+    assert alice_files[0].key_count == 0
+    assert [i.severity for i in alice_files[0].issues] == ["LOW"]
+    assert alice_files[0].issues[0].message.startswith(f"could not stat {alice_files[0].file_path}")
+    assert not any(k.user == "alice" for k in ak)
+
+    assert any(k.user == "bob" for k in ak)  # the other account was still audited normally
+
+
+def test_authorized_keys_certificate_is_reported_as_inert_not_graded(tmp_path: Path):
+    """A line whose own blob is a certificate never matches in sshd, so grading it would be misleading.
+
+    auth_check_authkey_line() (auth2-pubkeyfile.c) matches a plain presented
+    key only against the line itself, and a presented certificate only
+    against a cert-authority line holding the CA's plain key -- a line that
+    IS a certificate satisfies neither, so it grants no access regardless of
+    the key inside it. Grading must be skipped for it, and only for it: a
+    separate plain line with an equally weak key in the same file must still
+    be graded normally. (The cert and the key it certifies fingerprint
+    identically -- `ssh-keygen -l` reports the same SHA256 for both -- so a
+    distinct plain key is used here to keep this test clear of the separate
+    duplicate-key detection.)
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+
+    def keygen_rsa(name: str, bits: int) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["ssh-keygen", "-q", "-t", "rsa", "-b", str(bits), "-N", "", "-f", str(tmp_path / name)],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+        )
+
+    ca = tmp_path / "ca"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ca)],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+    # 1024 bits so a CRITICAL is expected on the plain line -- and, since
+    # --min-rsa-bits can never lower that floor, grading being skipped for the
+    # certificate line is unmistakable rather than a coincidence of policy.
+    bits, min_rsa_bits, expected_plain_severity = 1024, 3072, "CRITICAL"
+    user_name, plain_name = "user1024", "plain1024"
+    if keygen_rsa(user_name, bits).returncode != 0 or keygen_rsa(plain_name, bits).returncode != 0:
+        # Some ssh-keygen builds refuse to generate a 1024-bit RSA key; fall
+        # back to a size that is still weak against a raised policy minimum,
+        # using fresh filenames so a half-written 1024-bit attempt is never
+        # in the way of ssh-keygen's overwrite prompt.
+        bits, min_rsa_bits, expected_plain_severity = 2048, 4096, "MEDIUM"
+        user_name, plain_name = "user2048", "plain2048"
+        assert keygen_rsa(user_name, bits).returncode == 0
+        assert keygen_rsa(plain_name, bits).returncode == 0
+
+    user_key = tmp_path / user_name
+    subprocess.run(
+        ["ssh-keygen", "-q", "-s", str(ca), "-I", "test", "-n", "alice", str(user_key) + ".pub"],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    cert_line = (tmp_path / f"{user_name}-cert.pub").read_text().strip()
+    plain_line = pub(tmp_path / plain_name)
+
+    _write_ak(alice, [plain_line, cert_line])
+    _, _, findings, _, _ = audit.audit_authorized_keys({}, min_rsa_bits, users=[alice])
+    by_line = {f.line_number: f for f in findings}
+
+    cert_finding = by_line[2]
+    assert cert_finding.key_type == "RSA-CERT"
+    assert [i.severity for i in cert_finding.issues] == ["INFO"]
+    assert cert_finding.issues[0].message == (
+        "certificate listed in authorized_keys; sshd never matches a certificate here, so this line grants no access"
+    )
+
+    plain_finding = by_line[1]
+    assert plain_finding.key_type == "RSA"
+    assert [i.severity for i in plain_finding.issues] == [expected_plain_severity]
+
+
+def _ed25519_certificate(tmp_path: Path, name: str, principal: str) -> tuple[str, str]:
+    """Sign a fresh ed25519 key with a fresh CA.
+
+    Returns (plain public-key line, certificate line). `ssh-keygen -l` reports
+    a certificate under the fingerprint of the key inside it, so the two lines
+    fingerprint identically -- which is exactly what the reuse checks have to
+    cope with.
+    """
+
+    def keygen(path: Path) -> None:
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(path)],
+            check=True,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+        )
+
+    ca = tmp_path / f"{name}-ca"
+    user_key = tmp_path / name
+    keygen(ca)
+    keygen(user_key)
+    subprocess.run(
+        ["ssh-keygen", "-q", "-s", str(ca), "-I", "test", "-n", principal, str(user_key) + ".pub"],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    return pub(user_key), (tmp_path / f"{name}-cert.pub").read_text().strip()
+
+
+def test_certificate_line_is_not_reported_as_the_inner_key_reused(tmp_path: Path):
+    """A certificate for one account and the key it certifies for another is not key reuse.
+
+    `ssh-keygen -l` gives a certificate the fingerprint of the key inside it,
+    so counting a certificate line would make the two look like one key shared
+    between two accounts -- while the certificate line actually grants nothing.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    for u in (alice, bob):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    plain_line, cert_line = _ed25519_certificate(tmp_path, "shared", "alice")
+    _write_ak(alice, [cert_line])
+    _write_ak(bob, [plain_line])
+
+    _, _, found, dupes, _ = audit.audit_authorized_keys({}, 3072, users=[alice, bob])
+
+    assert dupes == {}
+    assert not any("same key" in i.message for f in found for i in f.issues)
+    by_user = {f.user: f for f in found}
+    assert by_user["alice"].key_type == "ED25519-CERT"
+    assert [i.severity for i in by_user["alice"].issues] == ["INFO"]
+    assert by_user["bob"].issues == []
+
+
+def test_certificate_line_is_skipped_when_the_inner_key_is_shared_by_two_other_accounts(tmp_path: Path):
+    """Real reuse between two accounts is still reported, and the certificate stays out of it.
+
+    (The plain negative half -- one key in two accounts' files getting a
+    MEDIUM -- is covered by
+    test_key_shared_between_accounts_is_medium_even_when_also_listed_twice.)
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    carol = make_user("carol", USER_UID, tmp_path / "home" / "carol")
+    for u in (alice, bob, carol):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    plain_line, cert_line = _ed25519_certificate(tmp_path, "shared", "alice")
+    _write_ak(alice, [cert_line])
+    bob_ak = _write_ak(bob, [plain_line])
+    carol_ak = _write_ak(carol, [plain_line])
+
+    _, _, found, dupes, _ = audit.audit_authorized_keys({}, 3072, users=[alice, bob, carol])
+
+    by_user = {f.user: f for f in found}
+    fingerprint = by_user["bob"].fingerprint
+    assert set(dupes) == {fingerprint}
+    assert sorted(dupes[fingerprint]) == sorted([f"bob {bob_ak}:1", f"carol {carol_ak}:1"])
+    assert _by_sev(by_user["bob"].issues)["MEDIUM"] == [f"same key also authorized at: carol {carol_ak}:1"]
+    assert _by_sev(by_user["carol"].issues)["MEDIUM"] == [f"same key also authorized at: bob {bob_ak}:1"]
+    assert [i.severity for i in by_user["alice"].issues] == ["INFO"]
+
+
+def test_authorized_keys_line_with_a_typo_in_an_option_is_reported_not_counted(keys: dict[str, Path], tmp_path: Path):
+    """sshd throws away a whole line whose options do not parse, so the key must not be counted."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [pub(keys["ed25519"]), f"no-port-fowarding {pub(keys['rsa4096'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    alice_file = files[0]
+    assert alice_file.key_count == 1
+    assert _by_sev(alice_file.issues)["LOW"] == [
+        'line 2: bad key options (unknown key option "no-port-fowarding"); sshd rejects the whole line'
+    ]
+    assert [f.line_number for f in found] == [1]
+
+
+def test_a_key_on_a_rejected_line_is_not_counted_as_reused(keys: dict[str, Path], tmp_path: Path):
+    """A dead line must not make a legitimate key elsewhere look shared between accounts."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    for u in (alice, bob):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    _write_ak(alice, [pub(keys["ed25519"])])
+    _write_ak(bob, [f"no-port-fowarding {pub(keys['ed25519'])}"])
+
+    _, files, found, dupes, _ = audit.audit_authorized_keys({}, 3072, users=[alice, bob])
+
+    assert dupes == {}
+    assert [(f.user, f.line_number) for f in found] == [("alice", 1)]
+    assert not any("same key" in i.message for i in found[0].issues)
+    bob_file = next(f for f in files if f.user == "bob")
+    assert bob_file.key_count == 0
+    assert _by_sev(bob_file.issues)["LOW"] == [
+        'line 1: bad key options (unknown key option "no-port-fowarding"); sshd rejects the whole line'
+    ]
+
+
+def test_authorized_keys_leading_comma_is_reported_not_counted(keys: dict[str, Path], tmp_path: Path):
+    """A leading comma leaves an empty option that matches no name, so sshd rejects the whole line."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f",no-pty {pub(keys['ed25519'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert found == []
+    assert files[0].key_count == 0
+    assert _by_sev(files[0].issues)["LOW"] == [
+        'line 1: bad key options (unknown key option ""); sshd rejects the whole line'
+    ]
+
+
+def test_authorized_keys_trailing_comma_before_the_key_is_accepted(keys: dict[str, Path], tmp_path: Path):
+    """A comma right before the key is sshd's option loop stopping, not an empty option -- the line is fine."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f"no-pty, {pub(keys['ed25519'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 1
+    assert not any("bad key options" in i.message for i in files[0].issues)
+    assert len(found) == 1
+    assert found[0].options == ["no-pty"]
+
+
+def test_authorized_keys_principals_without_cert_authority_is_reported_not_counted(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """sshd denies a line that lists principals on a key it is not told is a CA.
+
+    auth_authorise_keyopts() (auth2-pubkeyfile.c) turns such a line down with
+    "principals on non-CA key", so the key on it authorises nobody. The same
+    options with cert-authority beside them are fine, and that line is counted.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(
+        alice,
+        [
+            f'principals="admin" {pub(keys["ed25519"])}',
+            f'cert-authority,principals="admin" {pub(keys["rsa4096"])}',
+        ],
+    )
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 1
+    assert _by_sev(files[0].issues)["LOW"] == [
+        "line 1: bad key options (principals on non-CA key); sshd rejects the whole line"
+    ]
+    assert [f.line_number for f in found] == [2]
+
+
+def test_authorized_keys_rich_valid_options_are_counted_and_graded(keys: dict[str, Path], tmp_path: Path):
+    """The clean case: every option shape sshd accepts leaves the line counted and graded as usual."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f"{RICH_VALID_OPTIONS} {pub(keys['ed25519'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 1
+    assert not any("bad key options" in i.message for i in files[0].issues)
+    assert len(found) == 1
+    assert found[0].issues == []
+    assert found[0].options[0] == "restrict"
+    assert found[0].options[1] == 'command="echo \\"hi\\",there"'
+
+
+def test_authorized_keys_unclosed_quote_is_reported_as_bad_options(keys: dict[str, Path], tmp_path: Path):
+    """An unclosed quote eats the key material, and sshd turns the line down over its options.
+
+    split_options keeps reading to the end of the line while a quote is open,
+    so nothing is left that could be read as a key. Calling the result an
+    unparseable entry would point at the wrong half of the line: sshd's own
+    complaint is "bad key options: missing end quote".
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f'command="echo hi {pub(keys["ed25519"])}'])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert found == []
+    assert files[0].key_count == 0
+    assert _by_sev(files[0].issues)["LOW"] == [
+        "line 1: bad key options (missing end quote); sshd rejects the whole line"
+    ]
+
+
+def test_unparseable_key_material_with_bad_options_reports_only_the_unparseable_entry(tmp_path: Path):
+    """sshd never looks at the options of a line whose key it cannot read, so neither does the tool."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, ["no-port-fowarding ssh-rsa notreallyakey garbage@x"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert found == []
+    assert files[0].key_count == 0
+    assert _by_sev(files[0].issues)["LOW"] == ["line 1: unparseable entry (ignored by sshd)"]
+
+
+def _rewrite_ak_key_line(ak: Path, blob_byte: bytes = b"", comment: bytes = b"") -> None:
+    """Rewrite the single key line in an authorized_keys file, splicing raw bytes into it.
+
+    blob_byte goes into the middle of the key's base64; comment replaces the
+    comment field. Written as bytes, because the point is bytes that are not
+    valid UTF-8 and so cannot come from write_text.
+    """
+    type_name, blob, old_comment = ak.read_bytes().split(b" ", 2)
+    cut = len(blob) // 2
+    spliced = blob[:cut] + blob_byte + blob[cut:]
+    ak.write_bytes(type_name + b" " + spliced + b" " + (comment or old_comment.strip() + b"\n"))
+
+
+def test_authorized_keys_non_ascii_byte_in_a_key_blob_is_unparseable(keys: dict[str, Path], tmp_path: Path):
+    """A byte that is not ASCII inside a key's base64 leaves a line sshd cannot read, and nor can this tool.
+
+    The file is read with undecodable bytes replaced rather than dropped:
+    dropping this one would join the base64 on either side of it back into a
+    working key, reporting a line sshd throws away as a key that grants access.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _rewrite_ak_key_line(_write_ak(alice, [pub(keys["ed25519"])]), blob_byte=b"\xff")
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert found == []
+    assert files[0].key_count == 0
+    assert _by_sev(files[0].issues)["LOW"] == ["line 1: unparseable entry (ignored by sshd)"]
+
+
+def test_authorized_keys_non_ascii_byte_in_a_comment_is_still_a_key(keys: dict[str, Path], tmp_path: Path):
+    """A byte that is not ASCII in the comment field is shown as a replacement character, not dropped.
+
+    sshd does not care what a comment holds, so the line is a working key and
+    has to be counted as one -- only its comment looks different in the report.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _rewrite_ak_key_line(_write_ak(alice, [pub(keys["ed25519"])]), comment=b"wh\xffo@host\n")
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 1
+    assert len(found) == 1
+    assert found[0].key_type == "ED25519"
+    assert found[0].comment == "wh\ufffdo@host"
+    assert files[0].issues == []
+
+
+def test_authorized_keys_custom_absolute_pattern_and_dedup(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    keydir = tmp_path / "etc" / "ssh" / "authorized_keys"
+    mkdir_clean(keydir, tmp_path)
+    (keydir / "alice").write_text(pub(keys["ed25519"]) + "\n")
+    # Same path listed twice must only be scanned once.
+    config = {"authorizedkeysfile": [f"{keydir}/%u {keydir}/%u"]}
+    _, files, ak, dupes, _ = audit.audit_authorized_keys(config, 3072, users=[alice])
+    assert [f.file_path for f in files] == [str(keydir / "alice")]
+    assert len(ak) == 1
+    assert dupes == {}
+
+
+def test_authorized_keys_shared_absolute_file_is_attributed_to_every_account(
+    keys: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """One literal AuthorizedKeysFile shared by every account: sshd reads it for all of them.
+
+    Every key in it logs into every account, so it must be reported once per
+    account and its keys must show up as reused across accounts.
+    """
+    root = make_user("root", 0, tmp_path / "root")
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    for u in (root, alice):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    shared_dir = mkdir_clean(tmp_path / "etc" / "ssh", tmp_path)
+    shared = shared_dir / "authorized_keys"
+    shared.write_text(pub(keys["ed25519"]) + "\n" + pub(keys["rsa4096"]) + "\n")
+    shared.chmod(0o644)
+
+    calls: list[str] = []
+    real_fingerprint_line = audit.fingerprint_line
+
+    def counting(key_line: str):
+        calls.append(key_line)
+        return real_fingerprint_line(key_line)
+
+    monkeypatch.setattr(audit, "fingerprint_line", counting)
+
+    config = {"authorizedkeysfile": [str(shared)]}
+    _, files, ak, dupes, _ = audit.audit_authorized_keys(config, 3072, users=[root, alice])
+
+    assert [(f.user, f.file_path) for f in files] == [("root", str(shared)), ("alice", str(shared))]
+    assert len(ak) == 4
+    # Each distinct key line is fingerprinted once, not once per account.
+    assert len(calls) == 2
+
+    by_user_line = {(k.user, k.line_number): k for k in ak}
+    assert set(by_user_line) == {("root", 1), ("root", 2), ("alice", 1), ("alice", 2)}
+    assert len(dupes) == 2
+    for line_no in (1, 2):
+        fingerprint = by_user_line[("root", line_no)].fingerprint
+        assert by_user_line[("alice", line_no)].fingerprint == fingerprint
+        assert sorted(dupes[fingerprint]) == sorted([f"root {shared}:{line_no}", f"alice {shared}:{line_no}"])
+        assert any(
+            "also authorized at" in i.message and "alice" in i.message for i in by_user_line[("root", line_no)].issues
+        )
+        assert any(
+            "also authorized at" in i.message and "root" in i.message for i in by_user_line[("alice", line_no)].issues
+        )
+
+    root_messages = [i.message for i in by_user_line[("root", 1)].issues]
+    alice_messages = [i.message for i in by_user_line[("alice", 1)].issues]
+    assert any("uid-0 account key has no from= or command= restriction" in m for m in root_messages)
+    assert not any("uid-0" in m for m in alice_messages)
+
+
+def test_same_key_listed_twice_for_one_account_is_low_not_medium(keys: dict[str, Path], tmp_path: Path):
+    """Two entries for one account grant no extra access, so they are noted at LOW, not MEDIUM."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"]), pub(keys["ed25519"])])
+
+    _, _, found, dupes, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert [k.line_number for k in found] == [1, 2]
+    fingerprint = found[0].fingerprint
+    assert set(dupes) == {fingerprint}
+    assert sorted(dupes[fingerprint]) == sorted([f"alice {ak}:1", f"alice {ak}:2"])
+    for finding, other_line in ((found[0], 2), (found[1], 1)):
+        sev = _by_sev(finding.issues)
+        assert "MEDIUM" not in sev
+        assert sev["LOW"] == [
+            f"same key also listed for this account at: alice {ak}:{other_line}; removing one entry does not revoke it"
+        ]
+
+
+def test_same_key_in_both_of_one_account_s_files_is_low_not_medium(keys: dict[str, Path], tmp_path: Path):
+    """authorized_keys and authorized_keys2 are two files but still one account, so still LOW."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+    ak2 = ak.with_name("authorized_keys2")
+    ak2.write_text(pub(keys["ed25519"]) + "\n")
+    ak2.chmod(0o600)
+
+    _, _, found, dupes, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    by_file = {k.file_path: k for k in found}
+    assert set(by_file) == {str(ak), str(ak2)}
+    fingerprint = found[0].fingerprint
+    assert set(dupes) == {fingerprint}
+    assert sorted(dupes[fingerprint]) == sorted([f"alice {ak}:1", f"alice {ak2}:1"])
+    for path, other in ((ak, ak2), (ak2, ak)):
+        sev = _by_sev(by_file[str(path)].issues)
+        assert "MEDIUM" not in sev
+        assert sev["LOW"] == [
+            f"same key also listed for this account at: alice {other}:1; removing one entry does not revoke it"
+        ]
+
+
+def test_key_shared_between_accounts_is_medium_even_when_also_listed_twice(keys: dict[str, Path], tmp_path: Path):
+    """A key authorised for two accounts is MEDIUM everywhere, with no second LOW alongside it."""
+    root = make_user("root", 0, tmp_path / "root")
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    for u in (root, alice):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    root_ak = _write_ak(root, [pub(keys["ed25519"]), pub(keys["ed25519"])])
+    alice_ak = _write_ak(alice, [pub(keys["ed25519"])])
+
+    _, _, found, dupes, _ = audit.audit_authorized_keys({}, 3072, users=[root, alice])
+
+    assert len(found) == 3
+    fingerprint = found[0].fingerprint
+    assert sorted(dupes[fingerprint]) == sorted([f"root {root_ak}:1", f"root {root_ak}:2", f"alice {alice_ak}:1"])
+    for finding in found:
+        sev = _by_sev(finding.issues)
+        assert len(sev["MEDIUM"]) == 1
+        assert sev["MEDIUM"][0].startswith("same key also authorized at: ")
+        assert not any("listed for this account" in m for m in sev.get("LOW", []))
+
+
+def test_authorized_keys_per_account_match_override(keys: dict[str, Path], tmp_path: Path):
+    """A Match block that moves one account's AuthorizedKeysFile is honoured, and others keep the default."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    for u in (alice, bob):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    alice_ak = _write_ak(alice, [pub(keys["ed25519"])])
+    custom = mkdir_clean(tmp_path / "etc" / "keys", tmp_path)
+    bob_ak = custom / "bob"
+    bob_ak.write_text(pub(keys["rsa4096"]) + "\n")
+    bob_ak.chmod(0o600)
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        # {} means a successful sshd -T -C run for alice that sets nothing special,
+        # so cfg_value falls back to the same default patterns as the global config.
+        return {"authorizedkeysfile": [f"{custom}/%u"]} if user.pw_name == "bob" else {}
+
+    patterns, files, ak, _, coverage = audit.audit_authorized_keys(
+        {}, 3072, users=[alice, bob], user_config=user_config
+    )
+
+    assert patterns == audit.DEFAULT_AUTHORIZED_KEYS_PATTERNS  # the returned list stays the global one
+    assert {(f.user, f.file_path) for f in files} == {("alice", str(alice_ak)), ("bob", str(bob_ak))}
+    assert {(k.user, k.key_type) for k in ak} == {("alice", "ED25519"), ("bob", "RSA")}
+    assert coverage == []
+
+
+def test_authorized_keys_match_none_skips_that_account_only(keys: dict[str, Path], tmp_path: Path):
+    """AuthorizedKeysFile none inside a Match block: that account's files are not read."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    for u in (alice, bob):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    alice_ak = _write_ak(alice, [pub(keys["ed25519"])])
+    _write_ak(bob, [pub(keys["rsa4096"])])
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        # {} for alice is a successful sshd -T -C run that sets nothing special for her.
+        return {"authorizedkeysfile": ["none"]} if user.pw_name == "bob" else {}
+
+    _, files, ak, _, coverage = audit.audit_authorized_keys({}, 3072, users=[alice, bob], user_config=user_config)
+
+    assert [(f.user, f.file_path) for f in files] == [("alice", str(alice_ak))]
+    assert [k.user for k in ak] == ["alice"]
+    assert len(coverage) == 1
+    assert coverage[0].startswith("AuthorizedKeysFile is 'none' for bob (Match block)")
+
+
+def test_authorized_keys_per_account_config_failure_is_reported_as_coverage(keys: dict[str, Path], tmp_path: Path):
+    """When `sshd -T -C user=<account>` fails for one account, the report must say so, not go quiet about it.
+
+    Falling back to the global AuthorizedKeysFile for that account is still
+    correct behaviour -- but silently doing so while the report claims to be
+    based on sshd -T would hide the fact that any Match block for that
+    account was never applied.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    for u in (alice, bob):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    _write_ak(alice, [pub(keys["ed25519"])])
+    bob_ak = _write_ak(bob, [pub(keys["rsa4096"])])
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        # None simulates `sshd -T -C user=bob` failing; alice's own run succeeds.
+        return None if user.pw_name == "bob" else {"authorizedkeysfile": [".ssh/authorized_keys"]}
+
+    _, files, ak, _, coverage = audit.audit_authorized_keys({}, 3072, users=[alice, bob], user_config=user_config)
+
+    assert len(coverage) == 1
+    assert coverage[0].startswith("could not read the effective sshd config for 1 account ")
+    assert "sshd -T -C user=<name> failed for: bob" in coverage[0]
+    assert not any("alice" in c for c in coverage)
+    # The global AuthorizedKeysFile is still used for bob, so his file is scanned.
+    bob_file = next((f for f in files if f.user == "bob"), None)
+    assert bob_file is not None
+    assert bob_file.file_path == str(bob_ak)
+    assert {k.user for k in ak} == {"alice", "bob"}
+
+
+def test_authorized_keys_several_per_account_config_failures_share_one_coverage_line(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """Every account whose own sshd -T -C run failed is named in one warning, not one warning each.
+
+    A host where those runs fail for everybody would otherwise push the rest
+    of the report out of sight behind hundreds of near-identical lines.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    carol = make_user("carol", USER_UID, tmp_path / "home" / "carol")
+    for u in (alice, bob, carol):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+        _write_ak(u, [pub(keys["ed25519"])])
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        # None simulates `sshd -T -C user=<name>` failing for both bob and carol.
+        return {} if user.pw_name == "alice" else None
+
+    _, _, _, _, coverage = audit.audit_authorized_keys({}, 3072, users=[alice, bob, carol], user_config=user_config)
+
+    assert len(coverage) == 1
+    assert coverage[0].startswith("could not read the effective sshd config for 2 accounts ")
+    assert "sshd -T -C user=<name> failed for: bob, carol" in coverage[0]
+    assert "alice" not in coverage[0]
+
+
+def test_authorized_keys_no_user_config_callback_reports_no_per_account_failure(keys: dict[str, Path], tmp_path: Path):
+    """With no user_config callback at all (the sshd -T fallback-parser case), nothing claims a per-account failure."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [pub(keys["ed25519"])])
+
+    _, _, _, _, coverage = audit.audit_authorized_keys({}, 3072, users=[alice], user_config=None)
+
+    assert not any("could not read the effective sshd config" in c for c in coverage)
+
+
+def test_authorized_keys_global_none_reports_coverage_once_not_per_account(keys: dict[str, Path], tmp_path: Path):
+    """Global AuthorizedKeysFile none: sshd -T -C user=X echoes 'none' for every account too.
+
+    That must not produce one false per-account coverage line per user on top
+    of the one true global line.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    carol = make_user("carol", USER_UID, tmp_path / "home" / "carol")
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        return {"authorizedkeysfile": ["none"]}
+
+    patterns, files, ak, _, coverage = audit.audit_authorized_keys(
+        {"authorizedkeysfile": ["none"]}, 3072, users=[alice, bob, carol], user_config=user_config
+    )
+
+    assert patterns == []
+    assert files == []
+    assert ak == []
+    assert coverage == ["AuthorizedKeysFile is 'none'; sshd reads no authorized_keys files."]
+
+
+def test_authorized_keys_none_pattern(tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path)
+    patterns, files, ak, _, coverage = audit.audit_authorized_keys(
+        {"authorizedkeysfile": ["none"]}, 3072, users=[alice]
+    )
+    assert patterns == [] and files == [] and ak == []
+    assert coverage and "none" in coverage[0]
+
+
+def test_authorized_keys_none_pattern_is_case_insensitive(tmp_path: Path):
+    """sshd compares AuthorizedKeysFile to 'none' with strcasecmp, so NONE must match too."""
+    alice = make_user("alice", os.getuid(), tmp_path)
+    patterns, files, ak, _, coverage = audit.audit_authorized_keys(
+        {"authorizedkeysfile": ["NONE"]}, 3072, users=[alice]
+    )
+    assert patterns == [] and files == [] and ak == []
+    assert coverage == ["AuthorizedKeysFile is 'none'; sshd reads no authorized_keys files."]
+
+
+def test_authorized_keys_match_none_case_insensitive_skips_that_account_only(keys: dict[str, Path], tmp_path: Path):
+    """A per-account AuthorizedKeysFile NONE (any case) from a Match block is honoured too."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    for u in (alice, bob):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    alice_ak = _write_ak(alice, [pub(keys["ed25519"])])
+    _write_ak(bob, [pub(keys["rsa4096"])])
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        # {} for alice is a successful sshd -T -C run that sets nothing special for her.
+        return {"authorizedkeysfile": ["NONE"]} if user.pw_name == "bob" else {}
+
+    _, files, ak, _, coverage = audit.audit_authorized_keys({}, 3072, users=[alice, bob], user_config=user_config)
+
+    assert [(f.user, f.file_path) for f in files] == [("alice", str(alice_ak))]
+    assert [k.user for k in ak] == ["alice"]
+    assert len(coverage) == 1
+    assert coverage[0].startswith("AuthorizedKeysFile is 'none' for bob (Match block)")
+
+
+def test_authorized_keys_none_entry_is_skipped_per_entry_not_whole_list(keys: dict[str, Path], tmp_path: Path):
+    """sshd skips a 'none' AuthorizedKeysFile entry by itself, not only when the whole value is 'none'.
+
+    "none .ssh/authorized_keys2" must scan authorized_keys2 and skip a file
+    that happens to be named "none" -- and must not produce the "AuthorizedKeysFile
+    is 'none'" coverage line, since some files are still being read. It gets the
+    "mixes 'none' with other entries" warning instead, because OpenSSH's
+    current development code refuses to start on that configuration, so a
+    future upgrade may stop sshd from starting.
+    """
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir) / ".ssh", tmp_path)
+    ak2 = Path(alice.pw_dir) / ".ssh" / "authorized_keys2"
+    ak2.write_text(pub(keys["ed25519"]) + "\n")
+    ak2.chmod(0o600)
+    literal_none = Path(alice.pw_dir) / "none"
+    literal_none.write_text(pub(keys["rsa4096"]) + "\n")
+    literal_none.chmod(0o600)
+
+    patterns, files, ak, _, coverage = audit.audit_authorized_keys(
+        {"authorizedkeysfile": ["none .ssh/authorized_keys2"]}, 3072, users=[alice]
+    )
+
+    assert patterns == [".ssh/authorized_keys2"]
+    assert [f.file_path for f in files] == [str(ak2)]
+    assert [k.key_type for k in ak] == ["ED25519"]
+    assert len(coverage) == 1
+    assert coverage[0].startswith("AuthorizedKeysFile mixes 'none' with other entries (none .ssh/authorized_keys2)")
+    assert not any("AuthorizedKeysFile is 'none'" in c for c in coverage)
+
+
+def test_authorized_keys_mixed_none_warns_once_not_per_account(keys: dict[str, Path], tmp_path: Path):
+    """A global value mixing 'none' with real paths is one warning, however many accounts there are.
+
+    `sshd -T -C user=<name>` echoes the global AuthorizedKeysFile for every
+    account, so a per-account check on its own would repeat the same warning
+    once per account.
+    """
+    users = [make_user(name, USER_UID, tmp_path / "home" / name) for name in ("alice", "bob", "carol")]
+    for user in users:
+        mkdir_clean(Path(user.pw_dir), tmp_path)
+        _write_ak(user, [pub(keys["ed25519"])])
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        return {"authorizedkeysfile": ["none .ssh/authorized_keys"]}
+
+    _, files, ak, _, coverage = audit.audit_authorized_keys(
+        {"authorizedkeysfile": ["none .ssh/authorized_keys"]}, 3072, users=users, user_config=user_config
+    )
+
+    assert len(coverage) == 1
+    assert coverage[0] == (
+        "AuthorizedKeysFile mixes 'none' with other entries (none .ssh/authorized_keys); "
+        "released sshd versions skip just the 'none' entry and this audit does the same, "
+        "but OpenSSH's current development code rejects the whole configuration, "
+        "so a future upgrade may stop sshd from starting."
+    )
+    # The entries that are not 'none' are still scanned for every account.
+    assert {f.user for f in files} == {"alice", "bob", "carol"}
+    assert {k.user for k in ak} == {"alice", "bob", "carol"}
+
+
+def test_authorized_keys_match_block_mixed_none_names_the_account(keys: dict[str, Path], tmp_path: Path):
+    """A Match block that mixes 'none' in for one account is warned about for that account."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    for user in (alice, bob):
+        mkdir_clean(Path(user.pw_dir), tmp_path)
+        _write_ak(user, [pub(keys["ed25519"])])
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        # {} for alice is a successful sshd -T -C run that sets nothing special for her.
+        return {"authorizedkeysfile": ["none .ssh/authorized_keys"]} if user.pw_name == "bob" else {}
+
+    _, files, ak, _, coverage = audit.audit_authorized_keys({}, 3072, users=[alice, bob], user_config=user_config)
+
+    assert len(coverage) == 1
+    assert coverage[0].startswith(
+        "AuthorizedKeysFile mixes 'none' with other entries for bob (Match block) (none .ssh/authorized_keys)"
+    )
+    # bob's real entry is still scanned, and alice is not mentioned at all.
+    assert {f.user for f in files} == {"alice", "bob"}
+    assert {k.user for k in ak} == {"alice", "bob"}
+    assert "alice" not in coverage[0]
+
+
+def test_authorized_keys_unmixed_values_get_no_mixed_none_warning(keys: dict[str, Path], tmp_path: Path):
+    """Neither a plain 'none' nor an ordinary value is a mixed value, so neither earns that warning."""
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [pub(keys["ed25519"])])
+
+    for value in ("none", ".ssh/authorized_keys", ".ssh/authorized_keys .ssh/authorized_keys2"):
+        _, _, _, _, coverage = audit.audit_authorized_keys({"authorizedkeysfile": [value]}, 3072, users=[alice])
+        assert not any("mixes 'none'" in c for c in coverage), value
+
+
+def test_authorized_keys_empty_pw_dir_does_not_read_cwd(
+    keys: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An empty pw_dir must mean the filesystem root, never the auditing process's own cwd."""
+    assert not Path("/.ssh/authorized_keys").exists()  # keep the test honest
+    nohome = pwd.struct_passwd(("nohome", "x", USER_UID, USER_UID, "nohome", "", "/bin/sh"))
+    ssh_dir = mkdir_clean(tmp_path / ".ssh", tmp_path)
+    ak = ssh_dir / "authorized_keys"
+    ak.write_text(pub(keys["ed25519"]) + "\n")
+    ak.chmod(0o600)
+    monkeypatch.chdir(tmp_path)
+
+    _, files, ak_findings, _, _ = audit.audit_authorized_keys({}, 3072, users=[nohome])
+
+    assert [f for f in files if f.user == "nohome"] == []
+    assert [k for k in ak_findings if k.user == "nohome"] == []
+
+
+def test_authorized_keys_empty_file_still_reports_file_issues(tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, ["# only a comment"], mode=0o666)
+    _, files, findings, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+    assert findings == []
+    assert files[0].key_count == 0
+    assert any(i.severity == "HIGH" and str(ak) in i.message for i in files[0].issues)
+
+
+# --- audit_private_keys --------------------------------------------------------
+
+
+def test_private_keys_end_to_end(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", USER_UID, tmp_path / "alice")
+    root = make_user("root", 0, tmp_path / "root")
+    for u in (alice, root):
+        mkdir_clean(Path(u.pw_dir) / ".ssh", tmp_path)
+
+    a_ssh = Path(alice.pw_dir) / ".ssh"
+    (a_ssh / "id_ed25519").write_bytes(keys["encrypted"].read_bytes())
+    (a_ssh / "id_ed25519.pub").write_bytes(keys["encrypted"].with_name("encrypted.pub").read_bytes())
+    (a_ssh / "id_rsa_old").write_bytes(keys["rsa1024"].read_bytes())  # no .pub sibling
+    (a_ssh / "config").write_text("Host x\n")
+    (a_ssh / "known_hosts").write_text("x ssh-ed25519 AAAA\n")
+    (a_ssh / "authorized_keys").write_text(pub(keys["ed25519"]) + "\n")
+    for f in a_ssh.iterdir():
+        f.chmod(0o600)
+    (a_ssh / "id_rsa_old").chmod(0o644)
+
+    r_ssh = Path(root.pw_dir) / ".ssh"
+    (r_ssh / "id_ed25519").write_bytes(keys["ed25519"].read_bytes())
+    (r_ssh / "id_ed25519").chmod(0o600)
+    host_key = r_ssh / "ssh_host_ed25519_key"  # should be excluded as a host key
+    host_key.write_bytes(keys["ed25519"].read_bytes())
+
+    findings = audit.audit_private_keys(3072, host_key_paths={str(host_key)}, users=[alice, root])
+    by_path = {f.path: f for f in findings}
+
+    assert set(by_path) == {str(a_ssh / "id_ed25519"), str(a_ssh / "id_rsa_old"), str(r_ssh / "id_ed25519")}
+
+    enc = by_path[str(a_ssh / "id_ed25519")]
+    assert enc.encrypted is True
+    # Read from the public half inside the private key file; the matching .pub sibling is silent.
+    assert enc.fingerprint and enc.key_type == "ED25519"
+    assert enc.issues == []
+
+    old = by_path[str(a_ssh / "id_rsa_old")]
+    assert old.encrypted is False
+    # Fingerprinted from the public half inside the private key file; there is no .pub sibling.
+    assert (old.key_type, old.bits) == ("RSA", 1024)
+    sev = _by_sev(old.issues)
+    assert len(sev["CRITICAL"]) == 2  # 1024-bit + world-accessible
+    assert sev["MEDIUM"] == ["private key has no passphrase"]
+
+    root_key = by_path[str(r_ssh / "id_ed25519")]
+    # An intact, unencrypted, current-format key at mode 0600: ssh can load it,
+    # so the private-half check leaves it fingerprinted as usual.
+    assert (root_key.key_type, root_key.bits) == ("ED25519", 256)
+    assert root_key.fingerprint
+    sev = _by_sev(root_key.issues)
+    assert "private key has no passphrase" in sev["HIGH"]
+    assert not any("could not fingerprint" in i.message for i in root_key.issues)
+
+
+@needs_non_root
+def test_private_keys_unstattable_home_is_skipped_not_a_crash(keys: dict[str, Path], tmp_path: Path):
+    """An account whose home this tool cannot even stat must be skipped quietly, not crash the run.
+
+    Regression test: os.stat() on a path below a 0o000 directory raises
+    PermissionError on Python 3.10-3.12, and without the fix that propagated
+    straight out of audit_private_keys. A second account with a normal,
+    readable key is included to prove the rest of the run is unaffected.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID + 1, tmp_path / "home" / "bob")
+    Path(alice.pw_dir).mkdir(parents=True, mode=0o700)
+    b_ssh = mkdir_clean(Path(bob.pw_dir) / ".ssh", tmp_path)
+    (b_ssh / "id_ed25519").write_bytes(keys["ed25519"].read_bytes())
+    (b_ssh / "id_ed25519").chmod(0o600)
+    Path(alice.pw_dir).chmod(0o000)
+
+    try:
+        findings = audit.audit_private_keys(3072, host_key_paths=set(), users=[alice, bob])
+    finally:
+        Path(alice.pw_dir).chmod(0o700)
+
+    assert not any(f.user == "alice" for f in findings)
+    assert any(f.user == "bob" for f in findings)
+
+
+def test_private_keys_empty_pw_dir_does_not_read_cwd(
+    keys: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An empty pw_dir must mean the filesystem root, never the auditing process's own cwd.
+
+    make_user stringifies its home argument, so an empty Path("") can't be
+    built through it; build the passwd entry by hand, the way a real account
+    with no home directory looks (see test_strictmodes_empty_pw_dir_does_not_stop_the_walk_early).
+    """
+    assert not Path("/.ssh").is_dir()  # keep the test honest: nothing here should be found for real
+    nohome = pwd.struct_passwd(("nohome", "x", USER_UID, USER_UID, "nohome", "", "/bin/sh"))
+    ssh_dir = mkdir_clean(tmp_path / ".ssh", tmp_path)
+    key = ssh_dir / "id_ed25519"
+    key.write_bytes(keys["ed25519"].read_bytes())
+    key.chmod(0o600)
+    monkeypatch.chdir(tmp_path)
+
+    assert audit.audit_private_keys(3072, host_key_paths=set(), users=[nohome]) == []
+
+
+def test_private_keys_pub_suffix_is_not_a_shortcut(keys: dict[str, Path], tmp_path: Path):
+    """looks_like_private_key decides by content: a *.pub-named private key is audited, a genuine .pub file is not."""
+    alice = make_user("alice", USER_UID, tmp_path / "alice")
+    a_ssh = mkdir_clean(Path(alice.pw_dir) / ".ssh", tmp_path)
+    backup = a_ssh / "backup.pub"
+    backup.write_bytes(keys["ed25519"].read_bytes())
+    backup.chmod(0o600)
+    real_pub = a_ssh / "id_ed25519.pub"
+    real_pub.write_text(pub(keys["ed25519"]) + "\n")
+
+    findings = audit.audit_private_keys(3072, host_key_paths=set(), users=[alice])
+    paths = {f.path for f in findings}
+
+    assert str(backup) in paths
+    assert str(real_pub) not in paths
+
+
+def _one_private_key(tmp_path: Path, write: Callable[[Path], None]) -> audit.PrivateKeyFinding:
+    """Lay out a single-account ~/.ssh, let `write` fill it in, and audit it."""
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    a_ssh = mkdir_clean(Path(alice.pw_dir) / ".ssh", tmp_path)
+    write(a_ssh)
+    findings = audit.audit_private_keys(3072, host_key_paths=set(), users=[alice])
+    assert len(findings) == 1
+    return findings[0]
+
+
+def test_private_key_stale_pub_is_flagged_and_the_private_key_wins(keys: dict[str, Path], tmp_path: Path):
+    """A .pub file that belongs to a different key must not decide the reported type."""
+
+    def write(a_ssh: Path) -> None:
+        key = a_ssh / "id_ed25519"
+        key.write_bytes(keys["encrypted"].read_bytes())
+        key.chmod(0o600)
+        (a_ssh / "id_ed25519.pub").write_text(pub(keys["rsa2048"]) + "\n")
+
+    finding = _one_private_key(tmp_path, write)
+    assert finding.key_type == "ED25519"
+    lows = [i.message for i in finding.issues if i.severity == "LOW"]
+    assert len([m for m in lows if m.startswith("id_ed25519.pub does not match")]) == 1
+
+
+def test_private_key_pem_stale_pub_is_flagged_and_the_private_key_wins(keys: dict[str, Path], tmp_path: Path):
+    """End to end: a legacy PEM private key with a stale .pub is graded from the private key, not the .pub.
+
+    Mirrors test_private_key_stale_pub_is_flagged_and_the_private_key_wins
+    above, but for the PEM/PKCS#8 formats that have no embedded public half
+    and so are fingerprinted through the symlink trick in
+    _fingerprint_private_file_alone instead.
+    """
+
+    def write(a_ssh: Path) -> None:
+        key = _pem_key(a_ssh / "id_rsa")
+        audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+        key.chmod(0o600)
+
+    finding = _one_private_key(tmp_path, write)
+    assert finding.key_type == "RSA"
+    lows = [i.message for i in finding.issues if i.severity == "LOW"]
+    assert len([m for m in lows if m.startswith("id_rsa.pub does not match")]) == 1
+
+
+def test_private_key_corrupt_openssh_body_with_unrelated_pub_is_unfingerprinted(keys: dict[str, Path], tmp_path: Path):
+    """End to end: a corrupt current-format key is reported as unfingerprintable, not as its .pub neighbour.
+
+    Same scenario as test_fingerprint_private_key_corrupt_openssh_body_is_not_reported_as_an_unrelated_pub,
+    but through audit_private_keys, to prove the fix also holds for the finding
+    that actually gets reported.
+    """
+    captured: dict[str, Path] = {}
+
+    def write(a_ssh: Path) -> None:
+        # Same truncated body as the "truncated" case in test_public_key_from_private_is_none_for_corrupt_bodies.
+        payload = (
+            _ssh_string(b"none")
+            + _ssh_string(b"none")
+            + _ssh_string(b"")
+            + (1).to_bytes(4, "big")
+            + (99).to_bytes(4, "big")
+        )
+        key = _openssh_key_file(a_ssh / "id_ed25519", payload)
+        (a_ssh / "id_ed25519.pub").write_text(pub(keys["rsa2048"]) + "\n")  # a valid, but unrelated, key
+        key.chmod(0o600)
+        captured["path"] = key
+
+    finding = _one_private_key(tmp_path, write)
+    assert (finding.key_type, finding.fingerprint) == ("?", "")
+    lows = [i.message for i in finding.issues if i.severity == "LOW"]
+    assert "could not fingerprint private key; algorithm and size were not checked" in lows
+    assert not any("does not match" in m for m in lows)
+    assert audit.fingerprint_private_key(captured["path"]) == (None, None)
+
+
+def test_private_key_ssh_cannot_load_is_reported_as_unfingerprintable(keys: dict[str, Path], tmp_path: Path):
+    """End to end: a key whose private half ssh cannot load gets the LOW `could not fingerprint` finding.
+
+    Same corruption as test_fingerprint_private_key_is_none_when_ssh_cannot_load_the_private_half,
+    but through audit_private_keys, to prove it also reaches the finding that
+    actually gets reported.
+    """
+
+    def write(a_ssh: Path) -> None:
+        key = _corrupt_the_private_half(keys["ed25519"], a_ssh / "id_ed25519")
+        audit.pub_sibling(key).write_text(pub(keys["ed25519"]) + "\n")
+
+    finding = _one_private_key(tmp_path, write)
+    assert (finding.key_type, finding.bits, finding.fingerprint) == ("?", 0, "")
+    lows = [i.message for i in finding.issues if i.severity == "LOW"]
+    assert "could not fingerprint private key; algorithm and size were not checked" in lows
+    assert not any("does not match" in m for m in lows)
+
+
+def test_private_key_encrypted_without_a_pub_is_still_fingerprinted(keys: dict[str, Path], tmp_path: Path):
+    def write(a_ssh: Path) -> None:
+        key = a_ssh / "id_ed25519"
+        key.write_bytes(keys["encrypted"].read_bytes())
+        key.chmod(0o600)
+
+    finding = _one_private_key(tmp_path, write)
+    assert finding.encrypted is True
+    assert finding.key_type == "ED25519" and finding.fingerprint
+    assert not any("could not fingerprint" in i.message for i in finding.issues)
+
+
+def test_private_key_encrypted_pem_without_a_pub_cannot_be_fingerprinted(tmp_path: Path):
+    """A passphrase-protected PEM key with no .pub file: say so rather than grade it silently."""
+
+    def write(a_ssh: Path) -> None:
+        key = _pem_key(a_ssh / "id_rsa", passphrase="hunter2")
+        audit.pub_sibling(key).unlink()
+        key.chmod(0o600)
+
+    finding = _one_private_key(tmp_path, write)
+    assert finding.encrypted is True
+    assert (finding.key_type, finding.bits, finding.fingerprint) == ("?", 0, "")
+    assert [i.severity for i in finding.issues] == ["LOW"]
+    assert finding.issues[0].message == "could not fingerprint private key; algorithm and size were not checked"
+
+
+def test_private_key_plain_pem_without_a_pub_is_fingerprinted(tmp_path: Path):
+    def write(a_ssh: Path) -> None:
+        key = _pem_key(a_ssh / "id_rsa")
+        audit.pub_sibling(key).unlink()
+        key.chmod(0o600)
+
+    finding = _one_private_key(tmp_path, write)
+    assert (finding.key_type, finding.bits) == ("RSA", 2048)
+    assert not any("could not fingerprint" in i.message for i in finding.issues)
+
+
+def test_private_keys_skips_symlinks_and_missing_dirs(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    bob = make_user("bob", os.getuid(), tmp_path / "bob")  # no .ssh at all
+    a_ssh = Path(alice.pw_dir) / ".ssh"
+    mkdir_clean(a_ssh, tmp_path)
+    (a_ssh / "link").symlink_to(keys["ed25519"])
+    assert audit.audit_private_keys(3072, host_key_paths=set(), users=[alice, bob]) == []
+
+
+def test_private_keys_unrecognised_body_reports_encrypted_as_none(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    """A key with a plausible header but a body private_key_is_encrypted can't parse.
+
+    must surface as encrypted=None ("unknown"), not be coerced to False, and
+    the text report must say so rather than claiming "NO passphrase".
+    """
+    alice = make_user("alice", os.getuid(), tmp_path / "alice")
+    a_ssh = Path(alice.pw_dir) / ".ssh"
+    mkdir_clean(a_ssh, tmp_path)
+    key = a_ssh / "id_ed25519"
+    key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nnot valid base64!!\n-----END OPENSSH PRIVATE KEY-----\n")
+    key.chmod(0o600)
+
+    findings = audit.audit_private_keys(3072, host_key_paths=set(), users=[alice])
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.encrypted is None
+    # The body is unreadable and there is no .pub sibling, so there is nothing to fingerprint from.
+    assert finding.fingerprint == ""
+    assert any(
+        i.severity == "LOW" and i.message.startswith("could not fingerprint private key") for i in finding.issues
+    )
+
+    payload = json.dumps(asdict(finding))
+    assert '"encrypted": null' in payload
+
+    report = audit.Report(
+        config_source="sshd -T",
+        effective_authorized_keys_file=[],
+        coverage_warnings=[],
+        server_config_issues=[],
+        host_keys=[],
+        authorized_key_files=[],
+        authorized_keys=[],
+        duplicate_authorized_keys={},
+        private_keys=[finding],
+    )
+    audit.print_report(report)
+    out = capsys.readouterr().out
+    assert "passphrase: unknown" in out
+    assert "NO passphrase" not in out
+
+
+# --- run_audit / print_report / CLI -----------------------------------------
+
+
+def test_run_audit_and_report_smoke(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """Whole pipeline with an empty system: no crash, sane report, valid JSON."""
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("AuthorizedKeysFile none\nPasswordAuthentication no\n")
+    monkeypatch.setattr(audit, "SSHD_CONFIG", cfg)
+    monkeypatch.setattr(audit, "_find_sshd", lambda: None)
+    monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nokey")])
+    monkeypatch.setattr(audit.pwd, "getpwall", lambda: [])
+
+    report = audit.run_audit(3072, do_host=True, do_authorized=True, do_private=True)
+    # No HostKey is configured and the (monkeypatched) default doesn't exist,
+    # so sshd has no host key at all -- that is itself a finding, not silence.
+    assert [(f.path, f.key_type) for f in report.host_keys] == [("(none)", "?")]
+    assert report.authorized_keys == [] and report.private_keys == []
+    assert any("AuthorizedKeysFile is 'none'" in w for w in report.coverage_warnings)
+
+    audit.print_report(report)
+    out = capsys.readouterr().out
+    assert "Coverage warnings" in out
+    assert out.strip().endswith("Totals: LOW: 1")
+
+    audit.main(["--json", "--skip-host"])
+    import json
+
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["host_keys"] == []
+    assert "coverage_warnings" in parsed
+
+
+def test_main_without_ssh_keygen_raises(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(audit.shutil, "which", lambda _name: None)
+    with pytest.raises(audit.AuditError):
+        audit.main([])
+
+
+def test_audit_py_runs_standalone_without_the_package(tmp_path: Path):
+    """audit.py must still run when copied off by itself (docs/usage.md, "Fleet use").
+
+    -S skips site-packages, so an installed copy of the package (which would
+    make the `from audit_ssh_keys import __version__` import succeed even
+    with PYTHONPATH stripped) cannot mask the standalone fallback either.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, "-S", audit.__file__, "--version"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "audit-ssh-keys unknown"
+
+
+# --- verbose report ------------------------------------------------------------
+
+
+def _report_with_one_clean_and_one_flagged_key(keys: dict[str, Path], tmp_path: Path) -> audit.Report:
+    alice = make_user("alice", USER_UID, tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [pub(keys["rsa4096"]), pub(keys["rsa2048"])])
+    patterns, files, ak, dupes, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    host_keys = [
+        audit.HostKeyFinding("/etc/ssh/ssh_host_ed25519_key_clean", "ED25519", 256, "SHA256:cleanhostkey"),
+        audit.HostKeyFinding(
+            "/etc/ssh/ssh_host_rsa_key_flagged",
+            "RSA",
+            2048,
+            "SHA256:flaggedhostkey",
+            issues=[audit.Issue("LOW", "example host key finding")],
+        ),
+    ]
+    private_keys = [
+        audit.PrivateKeyFinding(
+            "alice", "/home/alice/.ssh/id_ed25519_clean", "ED25519", 256, "SHA256:cleanprivkey", False
+        ),
+        audit.PrivateKeyFinding(
+            "alice",
+            "/home/alice/.ssh/id_rsa_flagged",
+            "RSA",
+            2048,
+            "SHA256:flaggedprivkey",
+            False,
+            issues=[audit.Issue("LOW", "example private key finding")],
+        ),
+    ]
+
+    # A file-level finding, so the default layout prints the per-file header for
+    # it, and a server-configuration finding, so that section is printed too.
+    files[0].issues.append(audit.Issue("HIGH", "example file finding"))
+
+    return audit.Report(
+        config_source="sshd -T",
+        effective_authorized_keys_file=patterns,
+        coverage_warnings=[],
+        server_config_issues=[audit.Issue("MEDIUM", "example server configuration finding")],
+        host_keys=host_keys,
+        authorized_key_files=files,
+        authorized_keys=ak,
+        duplicate_authorized_keys=dupes,
+        private_keys=private_keys,
+    )
+
+
+def test_default_report_lists_only_keys_with_findings(keys, tmp_path, capsys):
+    report = _report_with_one_clean_and_one_flagged_key(keys, tmp_path)
+    audit.print_report(report)
+    out = capsys.readouterr().out
+    assert "rsa2048@test" in out
+    assert "rsa4096@test" not in out
+    assert "  ok" not in out
+    assert "ssh_host_ed25519_key_clean" not in out
+    assert "ssh_host_rsa_key_flagged" in out
+    assert "id_ed25519_clean" not in out
+    assert "id_rsa_flagged" in out
+    # A section of its own for the server configuration, and the per-file header
+    # above a file-level finding, which is the only place a file's own findings
+    # are shown in this layout.
+    assert "=== Server configuration ===" in out
+    assert "[MEDIUM] example server configuration finding" in out
+    lines = out.splitlines()
+    i_file = next(i for i, ln in enumerate(lines) if ln.startswith("alice: ") and ln.endswith("key(s))"))
+    assert lines[i_file + 1] == "  [HIGH] example file finding"
+
+
+def test_verbose_report_lists_every_key_grouped_by_file(keys, tmp_path, capsys):
+    report = _report_with_one_clean_and_one_flagged_key(keys, tmp_path)
+    audit.print_report(report, verbose=True)
+    out = capsys.readouterr().out
+    assert "rsa4096@test" in out and "rsa2048@test" in out
+    assert "ssh_host_ed25519_key_clean" in out and "ssh_host_rsa_key_flagged" in out
+    assert "id_ed25519_clean" in out and "id_rsa_flagged" in out
+    # Grouped under the file header, in line order, clean key marked ok.
+    lines = out.splitlines()
+    i_file = next(i for i, ln in enumerate(lines) if ln.startswith("alice: ") and "authorized_keys" in ln)
+    i_1 = next(i for i, ln in enumerate(lines) if ln.startswith("  line 1: RSA 4096-bit"))
+    i_2 = next(i for i, ln in enumerate(lines) if ln.startswith("  line 2: RSA 2048-bit"))
+    assert i_file < i_1 < i_2
+    assert lines[i_1 + 1] == "    ok"
+    assert lines[i_2 + 1].startswith("    [MEDIUM]")
+
+    # Clean host key: path line, then "type bits fingerprint" line, then "  ok".
+    i_host_clean = next(i for i, ln in enumerate(lines) if ln == "/etc/ssh/ssh_host_ed25519_key_clean")
+    assert lines[i_host_clean + 2] == "  ok"
+
+    # Clean private key: "user: path" line, then "type bits fingerprint passphrase" line, then "  ok".
+    i_priv_clean = next(i for i, ln in enumerate(lines) if ln == "alice: /home/alice/.ssh/id_ed25519_clean")
+    assert lines[i_priv_clean + 2] == "  ok"
+
+
+def test_default_report_says_no_findings_in_every_section_that_has_none(capsys):
+    """A section whose keys are all clean has to say so rather than print a bare header.
+
+    The default layout lists only the keys with findings, so on a host where
+    everything is clean all three sections would otherwise be a header with
+    nothing under it -- indistinguishable from a section the tool failed to
+    fill in.
+    """
+    file_path = "/home/alice/.ssh/authorized_keys"
+    report = audit.Report(
+        config_source="sshd -T",
+        effective_authorized_keys_file=[".ssh/authorized_keys"],
+        coverage_warnings=[],
+        server_config_issues=[],
+        host_keys=[audit.HostKeyFinding("/etc/ssh/ssh_host_ed25519_key", "ED25519", 256, "SHA256:cleanhostkey")],
+        authorized_key_files=[audit.FileFinding(user="alice", file_path=file_path, key_count=1)],
+        authorized_keys=[
+            audit.AuthorizedKeyFinding(
+                user="alice",
+                file_path=file_path,
+                line_number=1,
+                key_type="ED25519",
+                bits=256,
+                fingerprint="SHA256:cleanauthkey",
+                comment="alice@test",
+                options=[],
+            )
+        ],
+        duplicate_authorized_keys={},
+        private_keys=[
+            audit.PrivateKeyFinding("alice", "/home/alice/.ssh/id_ed25519", "ED25519", 256, "SHA256:cleanpriv", True)
+        ],
+    )
+
+    audit.print_report(report)
+    out = capsys.readouterr().out
+
+    assert out.count("  no findings") == 3  # host keys, authorized_keys, private keys
+    assert "=== Server configuration ===" not in out  # no findings there means no section at all
+    assert "alice@test" not in out  # a clean key is not listed in this layout
+    assert out.strip().endswith("Totals: no issues")
+
+
+def test_verbose_report_groups_shared_file_by_account_not_just_by_path(capsys):
+    """A shared absolute AuthorizedKeysFile gets a FileFinding per account; keys must not bleed across them.
+
+    Grouping keys by file_path alone would put both accounts' keys under both
+    accounts' headers, since a shared file has the same file_path for every
+    account that reads it.
+    """
+    shared_path = "/etc/ssh/authorized_keys"
+    files = [
+        audit.FileFinding(user="root", file_path=shared_path, key_count=1),
+        audit.FileFinding(user="alice", file_path=shared_path, key_count=1),
+    ]
+    keys = [
+        audit.AuthorizedKeyFinding(
+            user="root",
+            file_path=shared_path,
+            line_number=1,
+            key_type="ED25519",
+            bits=256,
+            fingerprint="SHA256:root",
+            comment="root-only@test",
+            options=[],
+        ),
+        audit.AuthorizedKeyFinding(
+            user="alice",
+            file_path=shared_path,
+            line_number=1,
+            key_type="ED25519",
+            bits=256,
+            fingerprint="SHA256:alice",
+            comment="alice-only@test",
+            options=[],
+        ),
+    ]
+    report = audit.Report(
+        config_source="sshd -T",
+        effective_authorized_keys_file=[shared_path],
+        coverage_warnings=[],
+        server_config_issues=[],
+        host_keys=[],
+        authorized_key_files=files,
+        authorized_keys=keys,
+        duplicate_authorized_keys={},
+        private_keys=[],
+    )
+
+    audit.print_report(report, verbose=True)
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+
+    assert out.count("root-only@test") == 1
+    assert out.count("alice-only@test") == 1
+
+    i_root_header = next(i for i, ln in enumerate(lines) if ln.startswith("root: "))
+    i_alice_header = next(i for i, ln in enumerate(lines) if ln.startswith("alice: "))
+    i_root_comment = next(i for i, ln in enumerate(lines) if "root-only@test" in ln)
+    i_alice_comment = next(i for i, ln in enumerate(lines) if "alice-only@test" in ln)
+
+    if i_root_header < i_alice_header:
+        assert i_root_header < i_root_comment < i_alice_header < i_alice_comment
+    else:
+        assert i_alice_header < i_alice_comment < i_root_header < i_root_comment
+
+
+def test_cli_verbose_flag(keys, tmp_path, monkeypatch, capsys):
+    report = _report_with_one_clean_and_one_flagged_key(keys, tmp_path)
+    monkeypatch.setattr(audit, "run_audit", lambda *_a, **_k: report)
+    audit.main(["--verbose"])
+    assert "rsa4096@test" in capsys.readouterr().out
+    audit.main([])
+    assert "rsa4096@test" not in capsys.readouterr().out
+
+
+# --- escaping control characters in the text report ----------------------------
+
+_ANSI_COMMENT = "\x1b[31mred\x1b[0m"
+_OSC_OPTION = 'command="\x1b]0;evil\x07"'
+
+
+def test_printable_escapes_only_what_a_terminal_would_act_on():
+    assert audit._printable("plain text") == "plain text"
+    assert audit._printable("Müller") == "Müller"  # ordinary non-ASCII text is text, not a control sequence
+    assert audit._printable("a\nb") == "a\nb"  # the report's own line breaks have to survive
+    assert audit._printable(_ANSI_COMMENT) == "\\x1b[31mred\\x1b[0m"
+    assert audit._printable("bell\x07") == "bell\\x07"
+    assert audit._printable("tab\there") == "tab\\x09here"  # a tab would move the cursor across the layout
+    assert audit._printable("\x7f\x85") == "\\x7f\\x85"  # DEL, and a control character above ASCII
+    assert audit._printable("zero​width") == "zero\\u200bwidth"  # invisible as printed, so shown as an escape
+    # Line and paragraph separators are not control characters by category, but
+    # some terminals and pagers break a line on them, so they are escaped too.
+    assert audit._printable("a\u2028b\u2029c") == "a\\u2028b\\u2029c"
+    # A tag character: a format character above U+FFFF, so it takes the \U form.
+    assert audit._printable("tag\U000e0020here") == "tag\\U000e0020here"
+    # A lone surrogate cannot even be encoded for the terminal, so it is escaped.
+    assert audit._printable("half\ud800pair") == "half\\ud800pair"
+
+
+def test_printable_leaves_private_use_and_unassigned_code_points_alone():
+    """Neither is something a terminal acts on, and escaping the unassigned ones is not stable.
+
+    Which code points are unassigned comes from the Unicode tables built into
+    the interpreter, so a new emoji is unassigned on one Python version and
+    assigned on the next. Escaping by that would make the same key comment print
+    differently on two hosts, for a character no terminal treats specially
+    either way.
+    """
+    assert audit._printable("\U0001fae9") == "\U0001fae9"  # unassigned in Python 3.11, an emoji from 3.13 on
+    assert audit._printable("puahere") == "puahere"  # private use, inside U+FFFF
+    assert audit._printable("pua\U000f0000here") == "pua\U000f0000here"  # private use, above U+FFFF
+
+
+def _report_with_terminal_escapes_in_account_controlled_text() -> audit.Report:
+    """A report whose key comment, key options and coverage warning all hold escape sequences.
+
+    Every one of them is text an ordinary account writes into its own
+    authorized_keys file, or a message of this tool's own that quotes it. The
+    second key's comment is ordinary non-ASCII text, which must come through
+    unchanged.
+    """
+    file_path = "/home/alice/.ssh/authorized_keys"
+    ak = [
+        audit.AuthorizedKeyFinding(
+            user="alice",
+            file_path=file_path,
+            line_number=1,
+            key_type="ED25519",
+            bits=256,
+            fingerprint="SHA256:withescapes",
+            comment=_ANSI_COMMENT,
+            options=[_OSC_OPTION],
+            issues=[audit.Issue("LOW", f"line 1: example finding quoting the comment {_ANSI_COMMENT}")],
+        ),
+        audit.AuthorizedKeyFinding(
+            user="alice",
+            file_path=file_path,
+            line_number=2,
+            key_type="ED25519",
+            bits=256,
+            fingerprint="SHA256:plaintext",
+            comment="Müller",
+            options=[],
+            issues=[audit.Issue("LOW", "line 2: example finding")],
+        ),
+    ]
+    return audit.Report(
+        config_source="sshd -T",
+        effective_authorized_keys_file=[".ssh/authorized_keys"],
+        coverage_warnings=["AuthorizedKeysCommand is set: \x1b[2Jkeys served by a command are not audited"],
+        server_config_issues=[],
+        host_keys=[],
+        authorized_key_files=[audit.FileFinding(user="alice", file_path=file_path, key_count=2)],
+        authorized_keys=ak,
+        duplicate_authorized_keys={},
+        private_keys=[],
+    )
+
+
+@pytest.mark.parametrize("verbose", [False, True], ids=["default report", "verbose report"])
+def test_text_report_escapes_control_characters_from_an_authorized_keys_file(verbose: bool, capsys):
+    """An escape sequence in a key comment or option must not reach the operator's terminal.
+
+    A comment is whatever the account that owns the file put there, so it can
+    hold an ANSI sequence that recolours the report, erases a line the operator
+    has already read, or (as an OSC sequence) rewrites the window title. The
+    report shows the escapes instead of acting on them, in both the default and
+    the verbose layout, and in this tool's own messages that quote the comment.
+    """
+    audit.print_report(_report_with_terminal_escapes_in_account_controlled_text(), verbose=verbose)
+    out = capsys.readouterr().out
+
+    assert "\x1b" not in out and "\x07" not in out
+    assert out.count("\\x1b[31mred\\x1b[0m") == 2  # the comment itself, and the finding quoting it
+    assert 'command="\\x1b]0;evil\\x07"' in out
+    assert "\\x1b[2J" in out  # the coverage warning
+    assert "Müller" in out  # ordinary non-ASCII text is printed as it stands
+
+
+def test_text_report_survives_an_ascii_stdout(monkeypatch: pytest.MonkeyPatch):
+    """A non-ASCII key comment must not abort the report when stdout cannot encode it.
+
+    Under an ASCII locale -- LC_ALL=C with Python's UTF-8 coercion turned off --
+    stdout is an ASCII stream, and a key comment holds whatever the account that
+    owns the file put there. print() would raise UnicodeEncodeError on the first
+    non-ASCII character and abandon the report part way through, which is worse
+    than an unreadable character: the operator loses the findings below it. The
+    report asks stdout to write what it cannot encode as a backslash escape
+    instead, so the whole report comes out and the byte is still shown.
+    """
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="ascii", newline="\n"))
+
+    audit.print_report(_report_with_terminal_escapes_in_account_controlled_text())
+    sys.stdout.flush()
+
+    written = raw.getvalue()
+    assert b"M\\xfcller" in written  # the u-umlaut as its backslash escape
+    assert written.strip().endswith(b"Totals: LOW: 2")  # the report ran to the end

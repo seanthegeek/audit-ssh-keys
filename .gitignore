@@ -1,0 +1,24 @@
+# Generated test keys — tests create these with ssh-keygen; never commit them
+id_*
+ssh_host_*
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+# Tool-manager lockfile: the tool has no runtime dependencies, and the dev
+# workflow is `pip install -e ".[dev]"`, so nothing reads this file. Revisit
+# if CI adopts uv.
+uv.lock
