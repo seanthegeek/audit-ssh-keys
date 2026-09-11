@@ -43,6 +43,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -185,6 +186,33 @@ class Report:
 
 
 # --------------------------------------------------------------------------- #
+# Filesystem helpers
+# --------------------------------------------------------------------------- #
+
+
+def _stat_if_present(path: Path) -> os.stat_result | None:
+    """stat() a path, returning None when nothing is there.
+
+    Raises OSError for every other failure (permission denied on a directory
+    above it, a symlink loop, a dead mount) so the caller can report that the
+    path could not be checked instead of treating it as absent. Path.is_file()
+    cannot be used for this: on Python 3.13 and later it answers False to a
+    permission error, and on earlier versions it raises, so the tool would
+    behave differently depending on the interpreter it happens to run under.
+    """
+    try:
+        return path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _is_regular_file(path: Path) -> bool:
+    """True when path exists and is a regular file. Raises OSError when that could not be checked."""
+    st = _stat_if_present(path)
+    return st is not None and stat.S_ISREG(st.st_mode)
+
+
+# --------------------------------------------------------------------------- #
 # sshd configuration
 # --------------------------------------------------------------------------- #
 
@@ -241,7 +269,14 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
     skipped. depth counts how many Includes deep this file is; nesting stops at
     MAX_INCLUDE_DEPTH, which is also what stops a file that includes itself.
     """
-    if not path.is_file():
+    try:
+        if not _is_regular_file(path):
+            return
+    except OSError:
+        # Could not even tell whether the file is there (for example, a
+        # directory above it that this account cannot read). It already
+        # returns silently for a file that exists but cannot be read, so do
+        # the same here rather than raising out of a best-effort fallback.
         return
     try:
         text = path.read_text(errors="ignore")
@@ -323,7 +358,8 @@ def read_user_sshd_config(user_name: str, sshd_bin: str) -> dict[str, list[str]]
     here, so sshd treats them as not matching.
 
     Returns None when sshd cannot be run, exits non-zero, or prints nothing;
-    the caller then falls back to the global configuration.
+    the caller then falls back to the global configuration for that account
+    and records a coverage warning saying so.
     """
     try:
         proc = subprocess.run(
@@ -451,6 +487,50 @@ def fingerprint_file(path: Path) -> tuple[str, int, str, str] | None:
     return parse_fingerprint_output(proc.stdout)
 
 
+def _fingerprint_private_file_alone(path: Path) -> tuple[str, int, str, str] | None:
+    """Fingerprint a private key file with any `.pub` sibling hidden from ssh-keygen.
+
+    `ssh-keygen -lf <path>` does not read `<path>` when a `<path>.pub` file
+    exists next to it -- it silently reads that `.pub` file instead, even one
+    with a different key inside it (verified against OpenSSH 10.2: the loader
+    tries the `.pub` file before ever opening the private key). Pointing
+    ssh-keygen at the private key in place would therefore just echo whatever
+    `.pub` happens to be sitting there, which defeats the whole point of
+    checking the private key for real.
+
+    To get ssh-keygen to look at the private key itself, this creates a
+    throwaway, private (mode 0700) temporary directory, puts a symlink to the
+    private key's absolute path inside it, and runs ssh-keygen on the symlink.
+    Nothing beside the symlink lives in that directory, so there is no `.pub`
+    file for ssh-keygen to find, and it has no choice but to open the private
+    key. No key material is ever copied -- only a symlink is created, and the
+    directory (symlink included) is removed immediately afterward.
+
+    Returns None when ssh-keygen cannot read the key at all (it is
+    passphrase-protected, or the file is owned by the account running this tool
+    and readable by group or others, which makes ssh-keygen refuse to open it),
+    or when the temporary directory or symlink cannot be created; the caller
+    then falls back to the `.pub` file, exactly as for a passphrase-protected
+    key.
+    """
+    try:
+        tmpdir = tempfile.TemporaryDirectory()
+    except OSError as exc:
+        logger.debug("could not create a temporary directory to fingerprint %s: %s", path, exc)
+        return None
+    with tmpdir:
+        link = Path(tmpdir.name) / "key"
+        try:
+            link.symlink_to(path.absolute())
+        except OSError as exc:
+            logger.debug("could not fingerprint %s through a temporary symlink: %s", path, exc)
+            return None
+        # Deliberately outside the try: a failure in here means ssh-keygen is
+        # missing or unusable, which must not be quietly read as "this key
+        # needs a passphrase" and turned into a fall back to the `.pub` file.
+        return fingerprint_file(link)
+
+
 def _read_uint32(buf: bytes, offset: int) -> tuple[int, int]:
     """Read a big-endian 32-bit number at offset; return (value, offset after it).
 
@@ -527,7 +607,10 @@ def _openssh_key_blob(path: Path) -> bytes | None:
     lines = _openssh_private_key_lines(path)
     if lines is None:
         return None
-    body = "".join(ln for ln in lines[1:] if not ln.startswith("-----"))
+    # Only the header and footer lines are markers; anything else that looks like
+    # one is part of the base64 body. Dropping it instead of decoding it would
+    # silently repair a corrupt file that OpenSSH itself refuses to load.
+    body = "".join(lines[1:-1])
     try:
         raw = base64.b64decode(body, validate=True)
     except (binascii.Error, ValueError):
@@ -598,20 +681,37 @@ def fingerprint_private_key(path: Path) -> tuple[tuple[str, int, str, str] | Non
     of it authorises the wrong key.
 
     The fallbacks below apply only to keys in the older PEM/PKCS#8 formats,
-    which do not carry a readable public half: for those, the `.pub` file is
-    used, and failing that ssh-keygen is asked to read the private key
-    directly (which works only when it has no passphrase). A key in the
-    current OpenSSH format whose embedded public half cannot be read is
-    corrupt, and is reported as unfingerprintable no matter what `.pub` file
-    sits next to it -- that file says nothing about which key this one is.
+    which do not carry a readable public half. For those, the private key
+    file itself is fingerprinted first (through the symlink trick in
+    `_fingerprint_private_file_alone`, which keeps ssh-keygen from being
+    steered by a stale `.pub`). Only when the private file cannot be read at
+    all -- it is passphrase-protected, or it is owned by the account running
+    this tool and readable by group or others, which makes ssh-keygen refuse to
+    open it -- is the `.pub` file used instead, and in that case a stale
+    `.pub` cannot be detected: there is nothing to compare it against. A key
+    in the current OpenSSH format whose embedded public half cannot be read
+    is corrupt, and is reported as unfingerprintable no matter what `.pub`
+    file sits next to it -- that file says nothing about which key this one
+    is.
     """
     line = public_key_from_private(path)
     if line is None and _is_openssh_format(path):
         return None, None
     result = fingerprint_line(line) if line else None
 
+    if result is None:
+        # No readable embedded public half: a legacy PEM/PKCS#8 key. Try the
+        # private key file itself first -- it is the authoritative answer
+        # whenever ssh-keygen can read it at all.
+        result = _fingerprint_private_file_alone(path)
+
     pub = pub_sibling(path)
-    pub_result = fingerprint_file(pub) if pub.is_file() else None
+    try:
+        # A .pub file this tool cannot even stat is treated the same as no
+        # .pub file at all: there is nothing to compare the private key against.
+        pub_result = fingerprint_file(pub) if _is_regular_file(pub) else None
+    except OSError:
+        pub_result = None
 
     mismatch: Issue | None = None
     if result is not None and pub_result is not None and result[2] != pub_result[2]:
@@ -621,12 +721,12 @@ def fingerprint_private_key(path: Path) -> tuple[tuple[str, int, str, str] | Non
         )
 
     if result is None:
+        # The private key itself could not be read (passphrase-protected, or
+        # owned by the account running this tool and readable by group or
+        # others, which makes ssh-keygen refuse to open it): fall back to the
+        # .pub file, the only thing left that is readable. A stale .pub cannot
+        # be detected here -- there is nothing to compare it against.
         result = pub_result
-        if result is None:
-            # Reached only for keys with no readable public half (legacy PEM)
-            # whose .pub is absent or unreadable; ssh-keygen can still read an
-            # unencrypted private key directly.
-            result = fingerprint_file(path)
     return result, mismatch
 
 
@@ -760,6 +860,131 @@ def split_options(line: str) -> tuple[list[str], str]:
     return [o for o in options if o], ""
 
 
+# Options that take no value. sshd accepts each of these on its own, and each
+# of the second group with a "no-" in front of it as well; "no-restrict" and
+# "no-cert-authority" are not accepted.
+_FLAG_OPTIONS = ("restrict", "cert-authority")
+_NEGATABLE_FLAG_OPTIONS = (
+    "port-forwarding",
+    "agent-forwarding",
+    "x11-forwarding",
+    "touch-required",
+    "verify-required",
+    "pty",
+    "user-rc",
+)
+# Options that must be followed by = and a double-quoted string.
+_VALUE_OPTIONS = (
+    "command",
+    "principals",
+    "from",
+    "expiry-time",
+    "environment",
+    "permitopen",
+    "permitlisten",
+    "tunnel",
+)
+# Of those, the ones sshd allows only once per line.
+_SINGLE_USE_VALUE_OPTIONS = ("command", "principals", "from")
+_ENV_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
+# sshd hands a tunnel= value to strtonum(), which calls strtoll(): leading
+# whitespace is skipped and a leading sign is allowed, so " 5", "\t5", "-0",
+# and "+7" all reach the range test below. Only the number that comes out has
+# to be a device number sshd can use.
+_TUN_NUMBER_RE = re.compile(r"[ \t\n\v\f\r]*[+-]?[0-9]+")
+# sshd's SSH_TUNID_MAX: the two values above it are reserved for "any" and "error".
+_TUN_DEVICE_MAX = 0x7FFFFFFF - 2
+
+
+def _dequote_value(text: str) -> tuple[str, str] | str:
+    """Read one double-quoted option value, the way sshd's opt_dequote() does.
+
+    Returns (value, rest-of-the-text) on success, or the rejection reason as a
+    string. Only \\" is an escape inside the quotes; a backslash in front of
+    anything else is kept as a backslash, exactly as sshd keeps it.
+    """
+    if not text.startswith('"'):
+        return "missing start quote"
+    value: list[str] = []
+    i = 1
+    while i < len(text):
+        if text[i] == '"':
+            return "".join(value), text[i + 1 :]
+        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] == '"':
+            value.append('"')
+            i += 2
+            continue
+        value.append(text[i])
+        i += 1
+    return "missing end quote"
+
+
+def check_options(options: list[str]) -> str | None:
+    """Would sshd accept these authorized_keys options? None if yes, the reason if no.
+
+    sshd's sshauthopt_parse() (auth-options.c) rejects the *whole* line when
+    any option fails to parse -- it logs "bad key options: <reason>" and the
+    key grants no access -- so a typo such as "no-port-fowarding" silently
+    turns a working entry into a dead one. The reasons returned here are
+    sshd's own wording, with the offending text added for an unknown option.
+
+    Takes the option list produced by split_options(), where each element is
+    one option ('no-pty' or 'command="a,b"').
+
+    What is checked: the option names, the quoting of every value, the three
+    clauses sshd allows only once (command, principals, from), and the values
+    of environment= and tunnel=. What is deliberately not checked: the
+    contents of expiry-time=, permitopen=, and permitlisten= values, because
+    whether those parse depends on the sshd version, on the machine's timezone
+    and date handling, and on /etc/services lookups -- wrongly calling a
+    working line dead would be worse than missing a broken one.
+    """
+    seen_single_use: set[str] = set()
+    for option in options:
+        unknown = f'unknown key option "{option}"'
+        lowered = option.lower()
+
+        name = next((f for f in _FLAG_OPTIONS if lowered.startswith(f)), None)
+        if name is None:
+            name = next(
+                (f for f in _NEGATABLE_FLAG_OPTIONS if lowered.startswith(f) or lowered.startswith("no-" + f)),
+                None,
+            )
+            if name is not None and lowered.startswith("no-"):
+                name = "no-" + name
+        if name is not None:
+            # sshd matches the flag name as a prefix, then insists the next
+            # character ends the option, so "pty=x" and "restricted" are both
+            # rejected as unknown.
+            if len(option) != len(name):
+                return unknown
+            continue
+
+        name = next((v for v in _VALUE_OPTIONS if lowered.startswith(v + "=")), None)
+        if name is None:
+            return unknown
+        if name in _SINGLE_USE_VALUE_OPTIONS:
+            if name in seen_single_use:
+                return f'multiple "{name}" clauses'
+            seen_single_use.add(name)
+        dequoted = _dequote_value(option[len(name) + 1 :])
+        if isinstance(dequoted, str):
+            return dequoted
+        value, rest = dequoted
+        if rest:
+            # Text after the closing quote: sshd wants a comma, whitespace, or
+            # the end of the line there.
+            return unknown
+        if name == "environment":
+            env_name, sep, _ = value.partition("=")
+            if not sep or not _ENV_NAME_RE.fullmatch(env_name):
+                return "invalid environment string"
+        elif name == "tunnel" and value.lower() != "any":
+            if not _TUN_NUMBER_RE.fullmatch(value) or not 0 <= int(value) <= _TUN_DEVICE_MAX:
+                return "invalid tun device"
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Grading
 # --------------------------------------------------------------------------- #
@@ -831,7 +1056,19 @@ def check_strictmodes_path(path: Path, owner: pwd.struct_passwd) -> list[Issue]:
     # sshd's realpath("") on an empty pw_dir fails, so it walks all the way to
     # /; Path("") would otherwise resolve to the current working directory and
     # could make the walk stop there instead.
-    home_real = Path(owner.pw_dir).resolve() if owner.pw_dir and Path(owner.pw_dir).exists() else None
+    home_real: Path | None = None
+    if owner.pw_dir:
+        home_path = Path(owner.pw_dir)
+        try:
+            home_present = _stat_if_present(home_path) is not None
+        except OSError:
+            # Could not tell whether the home directory is there -- for
+            # example, another account's home when this tool is not running
+            # as root. Treat it as absent: the walk below then continues all
+            # the way to /, which is the conservative (stricter) behaviour.
+            home_present = False
+        if home_present:
+            home_real = home_path.resolve()
 
     issues = _check_one_strictmodes_path(real, owner)
     for parent in real.parents:
@@ -957,7 +1194,12 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
         if str(path) in seen:
             continue
         seen.add(str(path))
-        if not path.is_file():
+        try:
+            present = _is_regular_file(path)
+        except OSError as exc:
+            findings.append(HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", f"could not stat host key: {exc}")]))
+            continue
+        if not present:
             if config.get("hostkey"):
                 # Explicitly configured but missing: sshd will log an error for it.
                 findings.append(
@@ -1003,6 +1245,16 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
 # --------------------------------------------------------------------------- #
 
 
+def _is_certificate(key_type: str) -> bool:
+    """True when a key type names a certificate: `ssh-keygen -l` labels one `<TYPE>-CERT`."""
+    return key_type.upper().endswith("-CERT")
+
+
+def _bad_options_issue(line_number: int, reason: str) -> Issue:
+    """The finding for a line whose options sshd will not parse, so it ignores the whole line."""
+    return Issue("LOW", f"line {line_number}: bad key options ({reason}); sshd rejects the whole line")
+
+
 def audit_authorized_keys(
     config: dict[str, list[str]],
     min_rsa_bits: int,
@@ -1014,7 +1266,9 @@ def audit_authorized_keys(
     user_config, when given, is asked for each account's own effective config
     (see read_user_sshd_config), so a Match block that changes
     AuthorizedKeysFile for some accounts is honoured. It may return None for an
-    account, in which case the global configuration is used for it.
+    account, in which case the global configuration is used for it and a
+    coverage warning is recorded, since that account's own sshd -T -C
+    user=<account> run could not be trusted.
 
     The returned pattern list is the global one, not any per-account override.
     """
@@ -1038,6 +1292,9 @@ def audit_authorized_keys(
     seen_paths: set[tuple[str, str]] = set()
     # One ssh-keygen call per distinct key line, not per account that has it.
     fingerprints: dict[str, tuple[str, int, str, str] | None] = {}
+    # Accounts whose own `sshd -T -C user=<name>` run failed. One coverage line
+    # after the loop names all of them.
+    config_failures: list[str] = []
 
     for user in sorted(users if users is not None else pwd.getpwall(), key=lambda u: u.pw_uid):
         user_patterns = patterns
@@ -1047,6 +1304,16 @@ def audit_authorized_keys(
                 user_patterns = cfg_value(
                     account_config, "authorizedkeysfile", " ".join(DEFAULT_AUTHORIZED_KEYS_PATTERNS)
                 ).split()
+            else:
+                # In production this means `sshd -T -C user=<name>` itself
+                # failed, so the account's own Match blocks were never
+                # consulted. Falling back to the global setting without
+                # saying so would leave the report silently claiming
+                # coverage it does not have. The names are gathered here and
+                # reported as one line below: on a host where the per-account
+                # run fails for everybody, a line per account would bury the
+                # rest of the report.
+                config_failures.append(user.pw_name)
         user_remaining = _without_none(user_patterns)
         if not user_remaining and user_patterns:
             # An account's effective AuthorizedKeysFile can be 'none' for two
@@ -1067,7 +1334,27 @@ def audit_authorized_keys(
 
         for pattern in user_patterns:
             path = Path(expand_authorized_keys_pattern(pattern, user))
-            if (user.pw_name, str(path)) in seen_paths or not path.is_file():
+            if (user.pw_name, str(path)) in seen_paths:
+                continue
+            try:
+                present = _is_regular_file(path)
+            except OSError as exc:
+                # Could not even tell whether the file is there -- for example,
+                # another account's home when this tool is not running as
+                # root. That is different from the file being absent, so it
+                # gets its own file-level finding instead of being skipped
+                # silently.
+                seen_paths.add((user.pw_name, str(path)))
+                files.append(
+                    FileFinding(
+                        user=user.pw_name,
+                        file_path=str(path),
+                        key_count=0,
+                        issues=[Issue("LOW", f"could not stat {path}: {exc}")],
+                    )
+                )
+                continue
+            if not present:
                 continue
             seen_paths.add((user.pw_name, str(path)))
 
@@ -1086,6 +1373,17 @@ def audit_authorized_keys(
                 if not line or line.startswith("#"):
                     continue
                 options, key_material = split_options(line)
+                if not key_material and options:
+                    # split_options reads to the end of the line while a quote
+                    # is still open, so a line such as `command="x ssh-ed25519
+                    # AAAA...` leaves nothing behind that could be a key. sshd
+                    # turns that line down over its options, not its key
+                    # material, so report what sshd would actually complain
+                    # about rather than calling the line unparseable.
+                    option_problem = check_options(options)
+                    if option_problem is not None:
+                        file_finding.issues.append(_bad_options_issue(idx, option_problem))
+                        continue
                 if not key_material:
                     result = None
                 elif key_material in fingerprints:
@@ -1097,6 +1395,14 @@ def audit_authorized_keys(
                     file_finding.issues.append(Issue("LOW", f"line {idx}: unparseable entry (ignored by sshd)"))
                     continue
                 key_type, bits, fingerprint, comment = result
+                # sshd throws the whole line away when the options do not
+                # parse, so a line with a typo'd option name authorises
+                # nobody. Counting it, or letting its key take part in the
+                # reuse checks, would claim access that does not exist.
+                option_problem = check_options(options)
+                if option_problem is not None:
+                    file_finding.issues.append(_bad_options_issue(idx, option_problem))
+                    continue
                 file_finding.key_count += 1
 
                 finding = AuthorizedKeyFinding(
@@ -1109,7 +1415,7 @@ def audit_authorized_keys(
                     comment=comment,
                     options=options,
                 )
-                if key_type.upper().endswith("-CERT"):
+                if _is_certificate(key_type):
                     # auth_check_authkey_line() (auth2-pubkeyfile.c) matches a plain
                     # presented key only against the line itself, and a presented
                     # certificate only against a cert-authority line holding the
@@ -1127,14 +1433,33 @@ def audit_authorized_keys(
                 else:
                     finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
                     finding.issues.extend(grade_options(options, user))
+                    # Only plain keys go into the reuse maps. ssh-keygen -l
+                    # reports a certificate under the fingerprint of the key
+                    # inside it, so a certificate line here would look like
+                    # that key authorised for this account as well -- and it
+                    # authorises nothing at all.
+                    fp_locations[fingerprint].append(f"{user.pw_name} {path}:{idx}")
+                    fp_users[fingerprint].add(user.pw_name)
                 keys.append(finding)
-                fp_locations[fingerprint].append(f"{user.pw_name} {path}:{idx}")
-                fp_users[fingerprint].add(user.pw_name)
 
             files.append(file_finding)
 
+    if config_failures:
+        count = len(config_failures)
+        coverage.append(
+            f"could not read the effective sshd config for {count} account{'' if count == 1 else 's'} "
+            f"(sshd -T -C user=<name> failed for: {', '.join(config_failures)}); Match blocks were not applied "
+            f"to {'that account' if count == 1 else 'those accounts'} and the global AuthorizedKeysFile was "
+            "used instead"
+        )
+
     duplicates = {fp: locs for fp, locs in fp_locations.items() if len(locs) > 1}
     for finding in keys:
+        if _is_certificate(finding.key_type):
+            # A certificate carries the fingerprint of the key inside it, so it
+            # would pick up a reuse note whenever that key is listed elsewhere,
+            # even though this line grants nothing.
+            continue
         locations = duplicates.get(finding.fingerprint)
         if locations is None:
             continue
@@ -1173,7 +1498,18 @@ def audit_private_keys(
 
     for user in sorted(users if users is not None else pwd.getpwall(), key=lambda u: u.pw_uid):
         ssh_dir = home_dir(user) / ".ssh"
-        if not ssh_dir.is_dir() or str(ssh_dir) in seen:
+        try:
+            st = _stat_if_present(ssh_dir)
+        except OSError as exc:
+            # Could not even tell whether ~/.ssh is there -- for example,
+            # another account's home when this tool is not running as root.
+            # Skip it the same way an unreadable ~/.ssh already is (see the
+            # except OSError around iterdir() below); the start-of-run
+            # warning already tells the operator that non-root runs miss
+            # other accounts' files.
+            logger.debug("could not stat %s: %s", ssh_dir, exc)
+            continue
+        if st is None or not stat.S_ISDIR(st.st_mode) or str(ssh_dir) in seen:
             continue
         seen.add(str(ssh_dir))
         try:

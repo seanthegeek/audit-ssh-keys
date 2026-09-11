@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from audit_ssh_keys import audit
-from tests.conftest import make_user
+from tests.conftest import RICH_VALID_OPTIONS, make_user
 
 # --- split_options -----------------------------------------------------------
 
@@ -90,6 +90,76 @@ def test_split_options_only_options_is_malformed():
     opts, rest = audit.split_options("no-pty,restrict")
     assert opts == ["no-pty", "restrict"]
     assert rest == ""
+
+
+# --- check_options -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param([], id="no options"),
+        pytest.param(["restrict"], id="restrict"),
+        pytest.param(["no-user-rc", "no-touch-required", "verify-required"], id="negated flags"),
+        pytest.param(["NO-PTY", "Cert-Authority"], id="mixed case"),
+        pytest.param(['command="a,b"', 'permitopen="h:1"', 'permitopen="h:2"'], id="permitopen may repeat"),
+        pytest.param(['environment="1=2"'], id="a digits-only environment name is valid"),
+        pytest.param(['environment="A_b9=x=y"'], id="only the name before the first = is checked"),
+        pytest.param(['tunnel="5"'], id="numbered tun device"),
+        pytest.param(['tunnel=" 5"'], id="leading whitespace before the number"),
+        pytest.param(['tunnel="-0"'], id="a signed zero is still device 0"),
+        pytest.param(['tunnel="+7"'], id="a plus sign in front of the number"),
+        pytest.param(['tunnel="2147483645"'], id="the largest tun device number sshd allows"),
+        pytest.param([r'command="a\b"'], id="a backslash before anything but a quote is literal"),
+        pytest.param(['tunnel="ANY"'], id="any tun device, case-insensitive"),
+        pytest.param(['expiry-time="whatever"'], id="expiry-time contents are not checked"),
+        pytest.param(['permitlisten="not a port"'], id="permitlisten contents are not checked"),
+    ],
+)
+def test_check_options_accepts_what_sshd_accepts(options: list[str]):
+    assert audit.check_options(options) is None
+
+
+def test_check_options_accepts_a_rich_line_split_by_split_options():
+    """The two functions have to compose: split_options' output is check_options' input."""
+    options, key_material = audit.split_options(f"{RICH_VALID_OPTIONS} ssh-ed25519 {_blob('ssh-ed25519')} c")
+    assert key_material == f"ssh-ed25519 {_blob('ssh-ed25519')} c"
+    assert audit.check_options(options) is None
+
+
+@pytest.mark.parametrize(
+    ("options", "reason"),
+    [
+        pytest.param(["no-port-fowarding"], 'unknown key option "no-port-fowarding"', id="typo"),
+        pytest.param(["no-restrict"], 'unknown key option "no-restrict"', id="restrict cannot be negated"),
+        pytest.param(
+            ["no-cert-authority"], 'unknown key option "no-cert-authority"', id="cert-authority cannot be negated"
+        ),
+        pytest.param(["pty=x"], 'unknown key option "pty=x"', id="a flag option takes no value"),
+        pytest.param(["restricted"], 'unknown key option "restricted"', id="a flag name is not a prefix"),
+        pytest.param(["command"], 'unknown key option "command"', id="a value option needs an ="),
+        pytest.param(["command=x"], "missing start quote", id="unquoted value"),
+        pytest.param(['command="x'], "missing end quote", id="unterminated value"),
+        pytest.param(['command="x"y'], 'unknown key option "command="x"y"', id="text after the closing quote"),
+        pytest.param(['command="a"', 'command="b"'], 'multiple "command" clauses', id="two commands"),
+        pytest.param(['from="a"', 'from="b"'], 'multiple "from" clauses', id="two froms"),
+        pytest.param(['principals="a"', 'principals="b"'], 'multiple "principals" clauses', id="two principals"),
+        pytest.param(['environment="FOO"'], "invalid environment string", id="environment with no ="),
+        pytest.param(['environment="a-b=c"'], "invalid environment string", id="punctuation in an environment name"),
+        pytest.param(['environment="=x"'], "invalid environment string", id="empty environment name"),
+        pytest.param(['tunnel="x"'], "invalid tun device", id="non-numeric tun device"),
+        pytest.param(['tunnel="-1"'], "invalid tun device", id="negative tun device"),
+        pytest.param(['tunnel="2147483646"'], "invalid tun device", id="one above the largest tun device number"),
+        pytest.param(["no-pty", "bogus"], 'unknown key option "bogus"', id="a later option is checked too"),
+    ],
+)
+def test_check_options_rejects_what_sshd_rejects(options: list[str], reason: str):
+    assert audit.check_options(options) == reason
+
+
+def test_check_options_rejects_a_typo_split_by_split_options():
+    line = f"no-port-fowarding ssh-ed25519 {_blob('ssh-ed25519')} c"
+    assert audit.check_options(audit.split_options(line)[0]) == 'unknown key option "no-port-fowarding"'
 
 
 # --- pub_sibling ---------------------------------------------------------------

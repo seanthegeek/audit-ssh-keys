@@ -23,6 +23,18 @@ USER_UID = os.getuid() or 1000
 
 needs_ssh_keygen = pytest.mark.skipif(not HAVE_SSH_KEYGEN, reason="ssh-keygen not installed")
 needs_root = pytest.mark.skipif(not IS_ROOT, reason="requires root to chown")
+# A permission error can only be observed when the test itself is not root:
+# root ignores a directory's permission bits entirely, so chmod(0o000) would
+# not reproduce anything for it to see.
+needs_non_root = pytest.mark.skipif(IS_ROOT, reason="root ignores permission bits, so this needs a non-root run")
+
+# A line using every option shape sshd accepts: flag options plain and
+# negated, mixed case, an escaped quote and a comma inside a quoted value.
+RICH_VALID_OPTIONS = (
+    'restrict,command="echo \\"hi\\",there",from="10.0.0.0/8,!10.0.0.1",environment="FOO=bar",'
+    'permitopen="host:22",permitlisten="8080",tunnel="any",expiry-time="20300101",'
+    "no-pty,No-Port-Forwarding,cert-authority"
+)
 
 
 def make_user(name: str, uid: int, home: Path) -> pwd.struct_passwd:

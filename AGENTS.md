@@ -8,7 +8,7 @@ Read `docs/how-it-works.md` before changing any check, and `docs/findings.md` be
 
 ## Project-specific rules
 
-- **The tool never modifies anything.** No `chmod`, no `chown`, no rewriting key files, no `--fix` flag. It reads files and runs `ssh-keygen -l` and `sshd -T`. If a feature needs to change the system, it belongs in a different tool.
+- **The tool never modifies the system it audits.** No `chmod`, no `chown`, no rewriting key files, no `--fix` flag. It reads files and runs `ssh-keygen -l` and `sshd -T`. If a feature needs to change the system, it belongs in a different tool. The one exception: fingerprinting a private key that has no readable embedded public half (the legacy PEM and PKCS#8 formats) creates a throwaway temporary directory holding a single symlink, so that `ssh-keygen -l` reads the private key itself instead of being silently steered by a stale `.pub` file sitting beside it; no key material is ever copied, and the directory is removed immediately afterward.
 - **Match `sshd`'s behaviour, not folk wisdom.** Permission checks encode what `sshd` enforces (`secure_filename()`: owner is the user or root; no group/other *write* bits on the file, `~/.ssh`, and `$HOME`). Mode 644/755 is accepted by `sshd` and must not be flagged. Host keys are the exception: `sshd` refuses any group/other bits on them. When in doubt, test against a real `sshd` — `sshd -T` and `ssh-keygen` are cheap to run in a container.
 - **Every ssh-keygen call gets `stdin=subprocess.DEVNULL`.** Nothing in this tool may ever block on a passphrase prompt.
 - **Do not use `ssh-keygen -y` to detect passphrases.** It refuses world-readable keys — exactly the ones most worth reporting. `private_key_is_encrypted()` inspects the file format instead. Keep it that way.
@@ -114,7 +114,7 @@ These standards apply to ALL project Python code **including tests**.
 - Releases are made by version tag not branch
 - Version tags should be prefixed with `v`, unless prior tags are not
 - Release titles must always exclude the `v` prefix
-- For Python projects, wheels and srcbuilds should always be attached
+- For Python projects, wheels and source distributions (sdists) should always be attached
   - Use existing build files **if** they match the release version
 
 ## Documentation
