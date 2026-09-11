@@ -43,10 +43,12 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Literal
 
 try:
     from audit_ssh_keys import __version__
@@ -113,6 +115,12 @@ PRIVATE_KEY_HEADERS = (
 # that was never there.
 OPENSSH_PRIVATE_KEY_HEADER_BYTES = OPENSSH_PRIVATE_KEY_HEADER.encode("ascii")
 PRIVATE_KEY_HEADERS_BYTES = tuple(header.encode("ascii") for header in PRIVATE_KEY_HEADERS)
+# Just the older PEM and PKCS#8 headers: every header above except OpenSSH's
+# own. These are the formats that carry no public half inside the file, so they
+# are the only ones a `.pub` file beside the key may answer for.
+LEGACY_PRIVATE_KEY_HEADERS_BYTES = tuple(
+    header for header in PRIVATE_KEY_HEADERS_BYTES if header != OPENSSH_PRIVATE_KEY_HEADER_BYTES
+)
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
@@ -449,6 +457,18 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
         # ended the keyword has to be remembered to tell those apart.
         keyword_split = re.match(r"([^\s=]*)(\s+|=)(.*)", line)
         if keyword_split is None:
+            # Nothing separates a keyword from a value on this line, so the
+            # whole line is the keyword and it has no value. sshd refuses a
+            # config like that outright (for a bare "Match": 'no argument after
+            # keyword "Match"', verified against OpenSSH 10.2) -- which is one
+            # of the reasons this fallback parser would be running at all. The
+            # one thing that still matters is the Match case: skipping the line
+            # here would leave the block's body to be read as global
+            # configuration, which is far worse than skipping the block.
+            if line.lower() == "match":
+                in_match = True
+            else:
+                logger.debug("ignoring line with no argument in %s: %s", path, line)
             continue
         key = keyword_split.group(1).lower()
         rest = keyword_split.group(3).lstrip()
@@ -869,37 +889,53 @@ def _openssh_private_key_lines(path: Path) -> list[str] | None:
     return lines
 
 
-def _is_openssh_format(path: Path) -> bool:
-    """True when the file's first non-blank line starts with the OpenSSH private-key header.
+def _private_key_format(path: Path) -> Literal["openssh", "legacy"] | None:
+    """Which private-key format a file's first non-blank line claims: OpenSSH's own, an older one, or neither.
 
-    Used to tell a corrupt OpenSSH-format key (which must be reported as
-    unfingerprintable, not confused with whatever `.pub` file happens to sit
-    next to it) apart from the older PEM/PKCS#8 formats, where falling back
-    to a `.pub` file is the intended behaviour. Only the start of the first
-    line is checked, so a file that is in this format but damaged -- cut short
-    before its footer line, or with junk stuck on the end of the header line
-    itself -- still counts as an attempt at this format, which is what keeps
-    it from falling back to a `.pub` file that says nothing about it.
+    Returns "openssh" for OpenSSH's own private key format, which carries the
+    key's public half inside the file; "legacy" for the older PEM and PKCS#8
+    formats, which do not, and which are therefore the only formats a `.pub`
+    file sitting beside the key may be read as an answer for; and None for
+    anything else -- an empty file, a file holding something that is not a
+    private key at all, or a file this tool cannot read.
+
+    None is a real third answer and not a quiet "legacy". A `.pub` file beside a
+    key is only worth reading when the key itself is in a format that cannot
+    answer for itself, so the fallback is taken only for a file that positively
+    holds one of the older headers. Without that, a zero-byte
+    `ssh_host_ed25519_key` with a real `.pub` file next to it was reported as a
+    healthy Ed25519 host key, and so was any other unreadable or unrecognised
+    file with a `.pub` beside it.
+
+    Only the start of the first non-blank line is checked, so a file that is in
+    one of these formats but damaged -- cut short before its footer line, or
+    with junk stuck on the end of the header line itself -- still counts as an
+    attempt at that format. For an OpenSSH-format file that is what keeps it
+    from falling back to a `.pub` file that says nothing about it:
     `public_key_from_private` holds the damaged file to the full format (an
-    exact header line, ASCII throughout) and answers None for it, so such a
-    file is reported as unfingerprintable rather than as the `.pub` file's key.
+    exact header line, ASCII throughout) and answers None for it, so such a file
+    is reported as unfingerprintable rather than as the `.pub` file's key.
 
     The comparison is on raw bytes rather than on decoded text. Decoding the
     file first -- with undecodable bytes replaced -- would make a single stray
-    byte in the header line itself answer False, which is exactly the fallback
-    to an unrelated `.pub` file this check exists to prevent. Returns False
-    when the file cannot be read at all.
+    byte in the header line itself answer "not this format", which is exactly
+    the fallback to an unrelated `.pub` file this check exists to prevent.
     """
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        logger.debug("could not read %s to tell whether it is in the OpenSSH key format: %s", path, exc)
-        return False
+        logger.debug("could not read %s to tell which private key format it is in: %s", path, exc)
+        return None
     for line in raw.splitlines():
         stripped = line.strip()
-        if stripped:
-            return stripped.startswith(OPENSSH_PRIVATE_KEY_HEADER_BYTES)
-    return False
+        if not stripped:
+            continue
+        if stripped.startswith(OPENSSH_PRIVATE_KEY_HEADER_BYTES):
+            return "openssh"
+        if stripped.startswith(LEGACY_PRIVATE_KEY_HEADERS_BYTES):
+            return "legacy"
+        return None
+    return None
 
 
 def _openssh_key_blob(path: Path) -> bytes | None:
@@ -1012,23 +1048,34 @@ def fingerprint_private_key(path: Path) -> tuple[tuple[str, int, str, str] | Non
     which do not carry a readable public half. For those, the private key
     file itself is fingerprinted first (through the symlink trick in
     `_fingerprint_private_file_alone`, which keeps ssh-keygen from being
-    steered by a stale `.pub`). Only when the private file cannot be read at
-    all -- it is passphrase-protected, or it is owned by the account running
+    steered by a stale `.pub`). Only when ssh-keygen cannot read the private
+    file -- it is passphrase-protected, or it is owned by the account running
     this tool with any group or other permission bits set, which makes
     ssh-keygen refuse to open it -- is the `.pub` file used instead, and in that case a stale
     `.pub` cannot be detected: there is nothing to compare it against. A key
     in the current OpenSSH format whose embedded public half cannot be read,
     or can be read but not fingerprinted, is corrupt, and is reported as
     unfingerprintable no matter what `.pub` file sits next to it -- that file
-    says nothing about which key this one is.
+    says nothing about which key this one is. A file whose format cannot be
+    established at all -- one this tool cannot read (another account's key on a
+    non-root run, say), an empty one, or one holding something that is not a
+    private key header -- gets no `.pub` answer either: the fallback is for the
+    formats that cannot answer for themselves, so there is no reason to think
+    the `.pub` file beside an unrecognised file describes it.
     """
     line = public_key_from_private(path)
     result = fingerprint_line(line) if line else None
-    if result is None and _is_openssh_format(path):
-        # A key in this format carries its public half in the clear, so either
-        # that half is missing or it is there and unreadable -- a corrupt file
-        # either way, not merely an old format. Whatever `.pub` file sits
-        # beside it could describe any other key, so it gets no say here.
+    if result is None and _private_key_format(path) != "legacy":
+        # Nothing was read out of the file itself, and it is not positively in
+        # one of the older formats, so the `.pub` file beside it gets no say.
+        #
+        # Two cases land here. A file in the current OpenSSH format carries its
+        # public half in the clear, so either that half is missing or it is
+        # there and unreadable -- a corrupt file either way, not merely an old
+        # format. And a file whose format could not be established at all (it
+        # could not be read, it is empty, or its first line is not a
+        # private-key header) says nothing about which key it holds. In both
+        # cases the `.pub` file next to it could describe any other key.
         return None, None
 
     # True only for a key in the current OpenSSH format -- the one format with
@@ -1134,7 +1181,7 @@ def looks_like_private_key(path: Path) -> bool:
     """Cheap header check so we only run ssh-keygen on plausible private keys.
 
     Compares the first 64 bytes against the header markers as bytes, for the
-    same reason `_is_openssh_format` does: a private key file is ASCII from end
+    same reason `_private_key_format` does: a private key file is ASCII from end
     to end, so the bytes in the file are the question being asked. Decoding the
     head first with undecodable bytes dropped would join the text on either
     side of such a byte back together, and answer from a header line that was
@@ -1564,11 +1611,51 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
     injectable (as the other audit functions take `users=`, `config_paths=`,
     `sshd_bin=`) so tests can run as an ordinary user and still exercise the
     ownership check without needing real root-owned files.
+
+    A `HostKey none` entry is not a file and is dropped before anything is
+    looked up on disk (see below). When it is the only entry, the one finding
+    returned says sshd has no host key at all.
     """
-    paths = config.get("hostkey") or DEFAULT_HOST_KEYS
+    configured = config.get("hostkey") or []
+    # sshd keeps "none" as a sentinel rather than as the name of a file:
+    # derelativise_path() hands the literal "none" straight back instead of
+    # making it absolute (servconf.c line 585), servconf_add_hostkey() stores
+    # that string (line 246), and fill_default_server_options() then clears the
+    # entry to NULL (CLEAR_ON_NONE, lines 413 and 443). sshd's host-key loader
+    # skips a NULL entry (sshd.c line 1591), and `sshd -T` prints it as
+    # "hostkey (null)" -- verified against OpenSSH 10.2, with `HostKey none`
+    # listed alongside a real key. So both spellings can reach this tool,
+    # "none" from the fallback parser and "(null)" from `sshd -T`, and neither
+    # names a file to audit.
+    paths = [p for p in (configured or DEFAULT_HOST_KEYS) if p.lower() != "none" and p != "(null)"]
+    if configured and not paths:
+        # Nothing but the sentinel was configured, so sshd has no host key and
+        # exits with "no hostkeys available -- exiting" (verified against
+        # OpenSSH 10.2). There is no key set to say anything else about, so the
+        # Ed25519 note below is not added either.
+        return [
+            HostKeyFinding(
+                "(none)",
+                "?",
+                0,
+                "",
+                [
+                    Issue(
+                        "LOW",
+                        "HostKey is set to none and no other HostKey is configured; "
+                        "sshd has no host key and will not start",
+                    )
+                ],
+            )
+        ]
     findings: list[HostKeyFinding] = []
     seen: set[str] = set()
     types_present: set[str] = set()
+    # Whether every key file that is there was actually read well enough to say
+    # what type of key it holds. A file that could not be stat'd or could not be
+    # fingerprinted leaves its type unknown, which is not the same as the host
+    # not having a key of that type -- see where the Ed25519 note is added.
+    every_key_identified = True
 
     for p in paths:
         path = Path(p)
@@ -1579,9 +1666,10 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
             present = _is_regular_file(path)
         except OSError as exc:
             findings.append(HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", f"could not stat host key: {exc}")]))
+            every_key_identified = False
             continue
         if not present:
-            if config.get("hostkey"):
+            if configured:
                 # Explicitly configured but missing: sshd will log an error for it.
                 findings.append(
                     HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", "configured HostKey does not exist")])
@@ -1669,6 +1757,7 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
         result, mismatch = fingerprint_private_key(path)
         if result is None:
             finding = HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", "could not fingerprint host key")])
+            every_key_identified = False
         else:
             key_type, bits, fingerprint, _ = result
             types_present.add(key_type.upper())
@@ -1700,7 +1789,12 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
             finding.issues.append(Issue("LOW", "host key is passphrase-protected; sshd cannot load it unattended"))
         findings.append(finding)
 
-    if findings and "ED25519" not in types_present:
+    # Only say an Ed25519 host key is missing when every key file that is there
+    # was identified. A key this tool could not stat or could not fingerprint --
+    # which is what a non-root run meets on every root-owned host key -- has an
+    # unknown type, so the host may well have the Ed25519 key this note would
+    # tell the operator to generate.
+    if findings and every_key_identified and "ED25519" not in types_present:
         findings.append(
             HostKeyFinding(
                 "(none)", "ED25519", 0, "", [Issue("LOW", "no Ed25519 host key present; consider ssh-keygen -A")]
@@ -2090,9 +2184,76 @@ def run_audit(min_rsa_bits: int, do_host: bool, do_authorized: bool, do_private:
     )
 
 
+# The Unicode categories _printable() escapes: control characters, format
+# characters (the invisible ones, and the bidirectional overrides that reorder
+# a printed line), and surrogates. The private-use (Co) and unassigned (Cn)
+# categories are deliberately left out -- see _printable().
+ESCAPED_CATEGORIES = ("Cc", "Cf", "Cs")
+# The line and paragraph separators, which are not control characters by
+# category but which some terminals and pagers break a line on.
+ESCAPED_SEPARATORS = ("\u2028", "\u2029")
+
+
+def _printable(text: str) -> str:
+    """Text with every character a terminal would act on replaced by a visible escape.
+
+    Key comments and key options come out of an `authorized_keys` file, which
+    belongs to the account being audited, and several of this tool's own
+    messages quote them. A terminal acts on some of what can be written there:
+    an ANSI escape sequence can recolour the report, move the cursor, or erase
+    a line the operator has already read, and an OSC sequence can rewrite the
+    window title. Printing those as text instead keeps the report saying what
+    the file actually holds.
+
+    What gets replaced: the control characters (Unicode category Cc), the
+    format characters (Cf -- the invisible ones such as a zero-width space,
+    and the bidirectional overrides that can reorder a printed line), the
+    surrogates (Cs), and the line and paragraph separators U+2028 and U+2029,
+    which some terminals and pagers break a line on. Newline is the one
+    exception among the control characters: the report's own layout is made of
+    newlines.
+
+    Private-use characters (Co) and unassigned code points (Cn) are left alone.
+    No terminal acts on either, and which code points count as unassigned comes
+    from the Unicode tables built into the interpreter, so escaping them would
+    make the same key comment print one way under one Python version and
+    another way under the next.
+
+    A character below U+0100 is shown in the `\\x1b` form, one that fits in four
+    hex digits as `\\u200b`, and anything above that as `\\U000e0020` -- the way
+    Python itself spells them. A backslash the file already holds is printed as
+    it stands, so a comment holding the four characters `\\x1b` as ordinary text
+    looks exactly like an escaped escape character in the report: the point is
+    to stop the terminal acting on what it is handed, not to let the report be
+    turned back into the file's bytes. Ordinary non-ASCII text -- a name such as
+    "Müller" in a key comment -- is not touched.
+    """
+    out: list[str] = []
+    for ch in text:
+        if ch == "\n" or (unicodedata.category(ch) not in ESCAPED_CATEGORIES and ch not in ESCAPED_SEPARATORS):
+            out.append(ch)
+        elif ord(ch) < 0x100:
+            out.append(f"\\x{ord(ch):02x}")
+        elif ord(ch) <= 0xFFFF:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(f"\\U{ord(ch):08x}")
+    return "".join(out)
+
+
+def _out(text: str) -> None:
+    """Print one piece of the text report, with anything a terminal would act on escaped.
+
+    Every line of the text report goes through here. The JSON output does not
+    need it: json.dumps escapes control characters itself, and nothing reading
+    JSON acts on them.
+    """
+    print(_printable(text))
+
+
 def _print_issues(issues: list[Issue], indent: str = "  ") -> None:
     for issue in sorted(issues, key=lambda i: SEVERITY_ORDER[i.severity]):
-        print(f"{indent}[{issue.severity}] {issue.message}")
+        _out(f"{indent}[{issue.severity}] {issue.message}")
 
 
 def _worst(issues: list[Issue]) -> int:
@@ -2100,10 +2261,10 @@ def _worst(issues: list[Issue]) -> int:
 
 
 def _print_key_entry(k: AuthorizedKeyFinding) -> None:
-    print(f"  line {k.line_number}: {k.key_type} {k.bits}-bit  {k.fingerprint}  {k.comment or '(no comment)'}")
+    _out(f"  line {k.line_number}: {k.key_type} {k.bits}-bit  {k.fingerprint}  {k.comment or '(no comment)'}")
     if k.options:
-        print(f"    options: {','.join(k.options)}")
-    _print_issues(k.issues, indent="    ") if k.issues else print("    ok")
+        _out(f"    options: {','.join(k.options)}")
+    _print_issues(k.issues, indent="    ") if k.issues else _out("    ok")
 
 
 def print_report(report: Report, verbose: bool = False) -> None:
@@ -2112,61 +2273,77 @@ def print_report(report: Report, verbose: bool = False) -> None:
     By default only files and keys with findings are listed. With ``verbose``
     every host key, every authorized_keys file and entry, and every private
     key is listed, grouped by file in file order, with ``ok`` for clean ones.
+
+    Every line goes out through `_out`, which escapes the characters a terminal
+    would act on rather than display (see `_printable`): part of what is
+    printed here -- key comments and key options, and this tool's own messages
+    quoting them -- comes from files the audited accounts own.
     """
-    print(f"sshd config source: {report.config_source}")
+    # A key comment can hold any text the account's own file holds, including
+    # ordinary non-ASCII text such as a name. Under an ASCII locale (LC_ALL=C
+    # with Python's UTF-8 coercion turned off) print() would raise
+    # UnicodeEncodeError on the first such character and abandon the report part
+    # way through. Writing the characters stdout cannot encode as backslash
+    # escapes keeps the whole report coming out, and still shows the operator
+    # what was in the file.
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(errors="backslashreplace")
+
+    _out(f"sshd config source: {report.config_source}")
     if report.coverage_warnings:
-        print("\n=== Coverage warnings ===")
+        _out("\n=== Coverage warnings ===")
         for w in report.coverage_warnings:
-            print(f"  ! {w}")
+            _out(f"  ! {w}")
 
     if report.server_config_issues:
-        print("\n=== Server configuration ===")
+        _out("\n=== Server configuration ===")
         _print_issues(report.server_config_issues)
 
     if report.host_keys:
-        print(f"\n=== Host keys ({len(report.host_keys)}) ===")
+        _out(f"\n=== Host keys ({len(report.host_keys)}) ===")
         shown_host_keys = report.host_keys if verbose else [hk for hk in report.host_keys if hk.issues]
         for hk in shown_host_keys:
             line = f"\n{hk.path}"
             if hk.fingerprint:
                 line += f"\n  {hk.key_type} {hk.bits}-bit  {hk.fingerprint}"
-            print(line)
-            _print_issues(hk.issues) if hk.issues else print("  ok")
+            _out(line)
+            _print_issues(hk.issues) if hk.issues else _out("  ok")
         if not shown_host_keys:
-            print("  no findings")
+            _out("  no findings")
 
     if report.effective_authorized_keys_file or report.authorized_key_files:
         n_files, n_keys = len(report.authorized_key_files), len(report.authorized_keys)
-        print(f"\n=== authorized_keys ({n_files} file(s), {n_keys} key(s)) ===")
-        print(f"AuthorizedKeysFile: {' '.join(report.effective_authorized_keys_file) or 'none'}")
+        _out(f"\n=== authorized_keys ({n_files} file(s), {n_keys} key(s)) ===")
+        _out(f"AuthorizedKeysFile: {' '.join(report.effective_authorized_keys_file) or 'none'}")
         if verbose:
             keys_by_account_file: dict[tuple[str, str], list[AuthorizedKeyFinding]] = defaultdict(list)
             for k in report.authorized_keys:
                 keys_by_account_file[k.user, k.file_path].append(k)
             for f in report.authorized_key_files:
-                print(f"\n{f.user}: {f.file_path} ({f.key_count} key(s))")
+                _out(f"\n{f.user}: {f.file_path} ({f.key_count} key(s))")
                 _print_issues(f.issues)
                 for k in sorted(keys_by_account_file[f.user, f.file_path], key=lambda k: k.line_number):
                     _print_key_entry(k)
         else:
             for f in (f for f in report.authorized_key_files if f.issues):
-                print(f"\n{f.user}: {f.file_path} ({f.key_count} key(s))")
+                _out(f"\n{f.user}: {f.file_path} ({f.key_count} key(s))")
                 _print_issues(f.issues)
             key_issues = sorted((k for k in report.authorized_keys if k.issues), key=lambda k: _worst(k.issues))
             for k in key_issues:
-                print(f"\n{k.user}: {k.file_path}:{k.line_number}")
-                print(f"  {k.key_type} {k.bits}-bit  {k.fingerprint}  {k.comment or '(no comment)'}")
+                _out(f"\n{k.user}: {k.file_path}:{k.line_number}")
+                _out(f"  {k.key_type} {k.bits}-bit  {k.fingerprint}  {k.comment or '(no comment)'}")
                 if k.options:
-                    print(f"  options: {','.join(k.options)}")
+                    _out(f"  options: {','.join(k.options)}")
                 _print_issues(k.issues)
             if not key_issues and not any(f.issues for f in report.authorized_key_files):
-                print("  no findings")
+                _out("  no findings")
 
     if report.private_keys:
-        print(f"\n=== Private keys in ~/.ssh ({len(report.private_keys)}) ===")
+        _out(f"\n=== Private keys in ~/.ssh ({len(report.private_keys)}) ===")
         shown_private_keys = report.private_keys if verbose else [pk for pk in report.private_keys if pk.issues]
         for pk in sorted(shown_private_keys, key=lambda p: _worst(p.issues)):
-            print(f"\n{pk.user}: {pk.path}")
+            _out(f"\n{pk.user}: {pk.path}")
             desc = f"{pk.key_type} {pk.bits}-bit  {pk.fingerprint}" if pk.fingerprint else "(unfingerprinted)"
             if pk.encrypted is True:
                 passphrase_desc = "passphrase-protected"
@@ -2174,10 +2351,10 @@ def print_report(report: Report, verbose: bool = False) -> None:
                 passphrase_desc = "NO passphrase"
             else:
                 passphrase_desc = "passphrase: unknown"
-            print(f"  {desc}  {passphrase_desc}")
-            _print_issues(pk.issues) if pk.issues else print("  ok")
+            _out(f"  {desc}  {passphrase_desc}")
+            _print_issues(pk.issues) if pk.issues else _out("  ok")
         if not shown_private_keys:
-            print("  no findings")
+            _out("  no findings")
 
     counts: dict[str, int] = defaultdict(int)
     all_issues = (
@@ -2190,7 +2367,7 @@ def print_report(report: Report, verbose: bool = False) -> None:
     for i in all_issues:
         counts[i.severity] += 1
     summary = "  ".join(f"{sev}: {counts[sev]}" for sev in SEVERITY_ORDER if counts[sev])
-    print(f"\nTotals: {summary or 'no issues'}")
+    _out(f"\nTotals: {summary or 'no issues'}")
 
 
 def main(argv: list[str] | None = None) -> None:

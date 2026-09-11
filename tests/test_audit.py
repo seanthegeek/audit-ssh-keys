@@ -7,6 +7,7 @@ under tmp_path, then feed fake passwd entries to the audit functions.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import pwd
@@ -692,12 +693,43 @@ def test_private_key_with_a_mangled_header_line_is_not_reported_as_an_unrelated_
     audit.pub_sibling(key).write_text(pub(keys["rsa2048"]) + "\n")  # a valid, but unrelated, key
 
     assert audit.looks_like_private_key(key) is True  # so the file is audited at all
-    assert audit._is_openssh_format(key) is True
+    assert audit._private_key_format(key) == "openssh"
     # The full format is not met: the header line is not the header, and a
     # private key file holding a byte that is not ASCII is corrupt either way.
     assert audit.public_key_from_private(key) is None
     assert audit.fingerprint_private_key(key) == (None, None)
     assert audit.private_key_is_encrypted(key) is None
+
+
+def test_empty_or_unrecognised_key_file_is_not_reported_as_the_pub_beside_it(keys: dict[str, Path], tmp_path: Path):
+    """A readable file that holds no private-key header must not borrow the answer from a `.pub` file.
+
+    The `.pub` fallback exists for the old PEM and PKCS#8 formats, which carry
+    no public half inside them, so the `.pub` file beside one of those is the
+    only thing left to read. A zero-byte file is not one of those formats, and
+    neither is a file holding arbitrary text. Answering from the `.pub` file put
+    a healthy-looking Ed25519 host key in the report for a zero-byte
+    `ssh_host_ed25519_key` that `sshd` can load nothing at all from.
+    """
+    empty = tmp_path / "ssh_host_ed25519_key"
+    empty.write_bytes(b"")
+    empty.chmod(0o600)
+    audit.pub_sibling(empty).write_text(pub(keys["ed25519"]) + "\n")
+    assert audit.fingerprint_private_key(empty) == (None, None)
+    assert audit._private_key_format(empty) is None
+
+    # The same file as the audit meets it: reported as unfingerprintable, not as
+    # the key in the `.pub` file.
+    findings = audit.audit_host_keys({"hostkey": [str(empty)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+    assert [(f.path, f.key_type, f.fingerprint) for f in findings if f.path == str(empty)] == [(str(empty), "?", "")]
+    assert "could not fingerprint host key" in [i.message for f in findings for i in f.issues]
+
+    garbage = tmp_path / "id_garbage"
+    garbage.write_text("this is not a key at all\nnor is this line\n")
+    garbage.chmod(0o600)
+    audit.pub_sibling(garbage).write_text(pub(keys["ed25519"]) + "\n")
+    assert audit.fingerprint_private_key(garbage) == (None, None)
+    assert audit._private_key_format(garbage) is None
 
 
 def test_fingerprint_private_key_prefers_the_private_key_over_a_stale_pub(keys: dict[str, Path], tmp_path: Path):
@@ -1116,16 +1148,78 @@ def test_looks_like_private_key(keys: dict[str, Path], tmp_path: Path):
 
 
 @needs_non_root
-def test_is_openssh_format_is_false_for_a_file_that_cannot_be_read(tmp_path: Path):
-    """An unreadable file cannot be claimed to be in this format, and the check must not raise."""
+def test_private_key_format_is_none_for_a_file_that_cannot_be_read(tmp_path: Path):
+    """An unreadable file answers "cannot tell", never "one of the older formats", and must not raise.
+
+    The difference matters to the caller: only a "legacy" answer sends a file
+    down the fallback meant for the older PEM formats, which reports whatever
+    `.pub` file sits beside it.
+    """
     key = tmp_path / "id_ed25519"
     key.write_text(audit.OPENSSH_PRIVATE_KEY_HEADER + "\n")
-    assert audit._is_openssh_format(key) is True  # readable as written
+    assert audit._private_key_format(key) == "openssh"  # readable as written
     key.chmod(0o000)
     try:
-        assert audit._is_openssh_format(key) is False
+        assert audit._private_key_format(key) is None
     finally:
         key.chmod(0o600)
+
+
+@needs_non_root
+def test_unreadable_key_is_not_reported_as_the_pub_file_beside_it(keys: dict[str, Path], tmp_path: Path):
+    """A key file this tool cannot read must not be reported as whatever `.pub` file sits next to it.
+
+    This is what a non-root run of the audit meets on a root-owned host key:
+    the file cannot be read, so nothing about the key is known, and the `.pub`
+    file beside it could describe any other key -- here it deliberately holds
+    one. Answering from it would put a fingerprint in the report that the
+    operator has no reason to doubt and that belongs to a different key
+    entirely.
+    """
+    key = tmp_path / "ssh_host_ed25519_key"
+    key.write_bytes(keys["ed25519"].read_bytes())
+    audit.pub_sibling(key).write_text(pub(keys["rsa2048"]) + "\n")  # a valid, but unrelated, key
+    key.chmod(0o000)
+    try:
+        assert audit.fingerprint_private_key(key) == (None, None)
+
+        findings = audit.audit_host_keys({"hostkey": [str(key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+        # Mode 0000 on a file this account owns is clean as far as sshd is
+        # concerned, and whether a passphrase is set cannot be told from a file
+        # that cannot be read, so this one finding is the whole report -- no
+        # Ed25519 note either, because the key set is unknown, not known to be
+        # missing an Ed25519 key.
+        assert [(f.path, f.key_type, f.fingerprint) for f in findings] == [(str(key), "?", "")]
+        assert [(i.severity, i.message) for i in findings[0].issues] == [("LOW", "could not fingerprint host key")]
+    finally:
+        key.chmod(0o600)
+
+
+@needs_non_root
+def test_no_ed25519_note_when_a_host_key_could_not_be_fingerprinted(keys: dict[str, Path], tmp_path: Path):
+    """An unreadable host key leaves the set of key types unknown, so the Ed25519 note must stay quiet.
+
+    This is what a non-root run of the audit meets: the RSA key reads fine, the
+    Ed25519 key cannot be read at all, so its type is never recorded as present.
+    Adding the note from that would tell the operator to run `ssh-keygen -A` on
+    a host that already has an Ed25519 host key.
+    """
+    rsa = tmp_path / "ssh_host_rsa_key"
+    rsa.write_bytes(keys["rsa4096"].read_bytes())
+    rsa.chmod(0o600)
+    unreadable = tmp_path / "ssh_host_ed25519_key"
+    unreadable.write_bytes(keys["ed25519"].read_bytes())
+    unreadable.chmod(0o000)
+    try:
+        findings = audit.audit_host_keys(
+            {"hostkey": [str(rsa), str(unreadable)]}, min_rsa_bits=3072, owner_uid=os.getuid()
+        )
+    finally:
+        unreadable.chmod(0o600)
+
+    assert [f.path for f in findings] == [str(rsa), str(unreadable)]
+    assert not any("Ed25519" in i.message for f in findings for i in f.issues)
+    assert [i.message for i in findings[1].issues] == ["could not fingerprint host key"]
 
 
 # --- audit_host_keys ----------------------------------------------------------
@@ -1516,6 +1610,60 @@ def test_host_keys_defaults_mixed_missing_and_present(
 
     assert [f.path for f in findings] == [str(present)]
     assert findings[0].key_type == "ED25519"
+
+
+def test_host_key_none_on_its_own_is_reported_as_no_host_key_at_all():
+    """`HostKey none` names no file, and on its own it leaves sshd with nothing to start with.
+
+    sshd keeps `none` as a sentinel rather than a path: derelativise_path()
+    hands back the literal "none" (servconf.c), fill_default_server_options()
+    then clears that entry to NULL (CLEAR_ON_NONE), and the host-key loader
+    skips a NULL entry (sshd.c). With no other HostKey configured, sshd exits
+    with "no hostkeys available -- exiting" -- verified against OpenSSH 10.2.
+    So there is no file here to look for, and nothing to say about the host's
+    key types either.
+    """
+    findings = audit.audit_host_keys({"hostkey": ["none"]}, min_rsa_bits=3072)
+
+    assert [(f.path, f.key_type, f.bits, f.fingerprint) for f in findings] == [("(none)", "?", 0, "")]
+    assert [(i.severity, i.message) for i in findings[0].issues] == [
+        (
+            "LOW",
+            "HostKey is set to none and no other HostKey is configured; sshd has no host key and will not start",
+        )
+    ]
+
+
+def test_host_key_null_from_sshd_t_is_not_audited_as_a_file(keys: dict[str, Path], tmp_path: Path):
+    """`sshd -T` prints a `HostKey none` entry as "hostkey (null)", which is not a path either.
+
+    Verified against OpenSSH 10.2: a config with `HostKey none` and one real key
+    prints both "hostkey (null)" and the real key's path. Only the real key is
+    audited, and nothing is reported as a missing file.
+    """
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o600)
+
+    findings = audit.audit_host_keys({"hostkey": ["(null)", str(ed)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    assert [f.path for f in findings] == [str(ed)]
+    assert findings[0].key_type == "ED25519"
+    assert not any("does not exist" in i.message for f in findings for i in f.issues)
+
+
+def test_host_key_none_alongside_a_real_key_leaves_the_real_key_audited(keys: dict[str, Path], tmp_path: Path):
+    """The sentinel is dropped, the real key is audited, and the Ed25519 note still fires for it."""
+    rsa = tmp_path / "ssh_host_rsa_key"
+    rsa.write_bytes(keys["rsa4096"].read_bytes())
+    rsa.chmod(0o600)
+
+    findings = audit.audit_host_keys({"hostkey": ["none", str(rsa)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    assert [f.path for f in findings] == [str(rsa), "(none)"]
+    assert (findings[0].key_type, findings[0].bits) == ("RSA", 4096)
+    assert findings[0].issues == []
+    assert [i.message for i in findings[1].issues] == ["no Ed25519 host key present; consider ssh-keygen -A"]
 
 
 @needs_non_root
@@ -2784,11 +2932,15 @@ def _report_with_one_clean_and_one_flagged_key(keys: dict[str, Path], tmp_path: 
         ),
     ]
 
+    # A file-level finding, so the default layout prints the per-file header for
+    # it, and a server-configuration finding, so that section is printed too.
+    files[0].issues.append(audit.Issue("HIGH", "example file finding"))
+
     return audit.Report(
         config_source="sshd -T",
         effective_authorized_keys_file=patterns,
         coverage_warnings=[],
-        server_config_issues=[],
+        server_config_issues=[audit.Issue("MEDIUM", "example server configuration finding")],
         host_keys=host_keys,
         authorized_key_files=files,
         authorized_keys=ak,
@@ -2808,6 +2960,14 @@ def test_default_report_lists_only_keys_with_findings(keys, tmp_path, capsys):
     assert "ssh_host_rsa_key_flagged" in out
     assert "id_ed25519_clean" not in out
     assert "id_rsa_flagged" in out
+    # A section of its own for the server configuration, and the per-file header
+    # above a file-level finding, which is the only place a file's own findings
+    # are shown in this layout.
+    assert "=== Server configuration ===" in out
+    assert "[MEDIUM] example server configuration finding" in out
+    lines = out.splitlines()
+    i_file = next(i for i, ln in enumerate(lines) if ln.startswith("alice: ") and ln.endswith("key(s))"))
+    assert lines[i_file + 1] == "  [HIGH] example file finding"
 
 
 def test_verbose_report_lists_every_key_grouped_by_file(keys, tmp_path, capsys):
@@ -2833,6 +2993,49 @@ def test_verbose_report_lists_every_key_grouped_by_file(keys, tmp_path, capsys):
     # Clean private key: "user: path" line, then "type bits fingerprint passphrase" line, then "  ok".
     i_priv_clean = next(i for i, ln in enumerate(lines) if ln == "alice: /home/alice/.ssh/id_ed25519_clean")
     assert lines[i_priv_clean + 2] == "  ok"
+
+
+def test_default_report_says_no_findings_in_every_section_that_has_none(capsys):
+    """A section whose keys are all clean has to say so rather than print a bare header.
+
+    The default layout lists only the keys with findings, so on a host where
+    everything is clean all three sections would otherwise be a header with
+    nothing under it -- indistinguishable from a section the tool failed to
+    fill in.
+    """
+    file_path = "/home/alice/.ssh/authorized_keys"
+    report = audit.Report(
+        config_source="sshd -T",
+        effective_authorized_keys_file=[".ssh/authorized_keys"],
+        coverage_warnings=[],
+        server_config_issues=[],
+        host_keys=[audit.HostKeyFinding("/etc/ssh/ssh_host_ed25519_key", "ED25519", 256, "SHA256:cleanhostkey")],
+        authorized_key_files=[audit.FileFinding(user="alice", file_path=file_path, key_count=1)],
+        authorized_keys=[
+            audit.AuthorizedKeyFinding(
+                user="alice",
+                file_path=file_path,
+                line_number=1,
+                key_type="ED25519",
+                bits=256,
+                fingerprint="SHA256:cleanauthkey",
+                comment="alice@test",
+                options=[],
+            )
+        ],
+        duplicate_authorized_keys={},
+        private_keys=[
+            audit.PrivateKeyFinding("alice", "/home/alice/.ssh/id_ed25519", "ED25519", 256, "SHA256:cleanpriv", True)
+        ],
+    )
+
+    audit.print_report(report)
+    out = capsys.readouterr().out
+
+    assert out.count("  no findings") == 3  # host keys, authorized_keys, private keys
+    assert "=== Server configuration ===" not in out  # no findings there means no section at all
+    assert "alice@test" not in out  # a clean key is not listed in this layout
+    assert out.strip().endswith("Totals: no issues")
 
 
 def test_verbose_report_groups_shared_file_by_account_not_just_by_path(capsys):
@@ -2906,3 +3109,129 @@ def test_cli_verbose_flag(keys, tmp_path, monkeypatch, capsys):
     assert "rsa4096@test" in capsys.readouterr().out
     audit.main([])
     assert "rsa4096@test" not in capsys.readouterr().out
+
+
+# --- escaping control characters in the text report ----------------------------
+
+_ANSI_COMMENT = "\x1b[31mred\x1b[0m"
+_OSC_OPTION = 'command="\x1b]0;evil\x07"'
+
+
+def test_printable_escapes_only_what_a_terminal_would_act_on():
+    assert audit._printable("plain text") == "plain text"
+    assert audit._printable("Müller") == "Müller"  # ordinary non-ASCII text is text, not a control sequence
+    assert audit._printable("a\nb") == "a\nb"  # the report's own line breaks have to survive
+    assert audit._printable(_ANSI_COMMENT) == "\\x1b[31mred\\x1b[0m"
+    assert audit._printable("bell\x07") == "bell\\x07"
+    assert audit._printable("tab\there") == "tab\\x09here"  # a tab would move the cursor across the layout
+    assert audit._printable("\x7f\x85") == "\\x7f\\x85"  # DEL, and a control character above ASCII
+    assert audit._printable("zero​width") == "zero\\u200bwidth"  # invisible as printed, so shown as an escape
+    # Line and paragraph separators are not control characters by category, but
+    # some terminals and pagers break a line on them, so they are escaped too.
+    assert audit._printable("a\u2028b\u2029c") == "a\\u2028b\\u2029c"
+    # A tag character: a format character above U+FFFF, so it takes the \U form.
+    assert audit._printable("tag\U000e0020here") == "tag\\U000e0020here"
+    # A lone surrogate cannot even be encoded for the terminal, so it is escaped.
+    assert audit._printable("half\ud800pair") == "half\\ud800pair"
+
+
+def test_printable_leaves_private_use_and_unassigned_code_points_alone():
+    """Neither is something a terminal acts on, and escaping the unassigned ones is not stable.
+
+    Which code points are unassigned comes from the Unicode tables built into
+    the interpreter, so a new emoji is unassigned on one Python version and
+    assigned on the next. Escaping by that would make the same key comment print
+    differently on two hosts, for a character no terminal treats specially
+    either way.
+    """
+    assert audit._printable("\U0001fae9") == "\U0001fae9"  # unassigned in Python 3.11, an emoji from 3.13 on
+    assert audit._printable("puahere") == "puahere"  # private use, inside U+FFFF
+    assert audit._printable("pua\U000f0000here") == "pua\U000f0000here"  # private use, above U+FFFF
+
+
+def _report_with_terminal_escapes_in_account_controlled_text() -> audit.Report:
+    """A report whose key comment, key options and coverage warning all hold escape sequences.
+
+    Every one of them is text an ordinary account writes into its own
+    authorized_keys file, or a message of this tool's own that quotes it. The
+    second key's comment is ordinary non-ASCII text, which must come through
+    unchanged.
+    """
+    file_path = "/home/alice/.ssh/authorized_keys"
+    ak = [
+        audit.AuthorizedKeyFinding(
+            user="alice",
+            file_path=file_path,
+            line_number=1,
+            key_type="ED25519",
+            bits=256,
+            fingerprint="SHA256:withescapes",
+            comment=_ANSI_COMMENT,
+            options=[_OSC_OPTION],
+            issues=[audit.Issue("LOW", f"line 1: example finding quoting the comment {_ANSI_COMMENT}")],
+        ),
+        audit.AuthorizedKeyFinding(
+            user="alice",
+            file_path=file_path,
+            line_number=2,
+            key_type="ED25519",
+            bits=256,
+            fingerprint="SHA256:plaintext",
+            comment="Müller",
+            options=[],
+            issues=[audit.Issue("LOW", "line 2: example finding")],
+        ),
+    ]
+    return audit.Report(
+        config_source="sshd -T",
+        effective_authorized_keys_file=[".ssh/authorized_keys"],
+        coverage_warnings=["AuthorizedKeysCommand is set: \x1b[2Jkeys served by a command are not audited"],
+        server_config_issues=[],
+        host_keys=[],
+        authorized_key_files=[audit.FileFinding(user="alice", file_path=file_path, key_count=2)],
+        authorized_keys=ak,
+        duplicate_authorized_keys={},
+        private_keys=[],
+    )
+
+
+@pytest.mark.parametrize("verbose", [False, True], ids=["default report", "verbose report"])
+def test_text_report_escapes_control_characters_from_an_authorized_keys_file(verbose: bool, capsys):
+    """An escape sequence in a key comment or option must not reach the operator's terminal.
+
+    A comment is whatever the account that owns the file put there, so it can
+    hold an ANSI sequence that recolours the report, erases a line the operator
+    has already read, or (as an OSC sequence) rewrites the window title. The
+    report shows the escapes instead of acting on them, in both the default and
+    the verbose layout, and in this tool's own messages that quote the comment.
+    """
+    audit.print_report(_report_with_terminal_escapes_in_account_controlled_text(), verbose=verbose)
+    out = capsys.readouterr().out
+
+    assert "\x1b" not in out and "\x07" not in out
+    assert out.count("\\x1b[31mred\\x1b[0m") == 2  # the comment itself, and the finding quoting it
+    assert 'command="\\x1b]0;evil\\x07"' in out
+    assert "\\x1b[2J" in out  # the coverage warning
+    assert "Müller" in out  # ordinary non-ASCII text is printed as it stands
+
+
+def test_text_report_survives_an_ascii_stdout(monkeypatch: pytest.MonkeyPatch):
+    """A non-ASCII key comment must not abort the report when stdout cannot encode it.
+
+    Under an ASCII locale -- LC_ALL=C with Python's UTF-8 coercion turned off --
+    stdout is an ASCII stream, and a key comment holds whatever the account that
+    owns the file put there. print() would raise UnicodeEncodeError on the first
+    non-ASCII character and abandon the report part way through, which is worse
+    than an unreadable character: the operator loses the findings below it. The
+    report asks stdout to write what it cannot encode as a backslash escape
+    instead, so the whole report comes out and the byte is still shown.
+    """
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="ascii", newline="\n"))
+
+    audit.print_report(_report_with_terminal_escapes_in_account_controlled_text())
+    sys.stdout.flush()
+
+    written = raw.getvalue()
+    assert b"M\\xfcller" in written  # the u-umlaut as its backslash escape
+    assert written.strip().endswith(b"Totals: LOW: 2")  # the report ran to the end

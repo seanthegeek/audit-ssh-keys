@@ -444,6 +444,39 @@ def test_fallback_parser_strips_the_equals_from_a_path_value(tmp_path: Path):
     assert config["hostkey"] == [str(host_key)]
 
 
+def test_fallback_parser_treats_a_bare_match_line_as_opening_a_block(tmp_path: Path):
+    """A line that is just "Match" has no separator in it, and must still open a block.
+
+    sshd refuses a configuration like this one outright ("line 1: no argument
+    after keyword \"Match\"", verified against OpenSSH 10.2) -- which is one of
+    the reasons this fallback parser would be running at all. Reading the
+    block's body as global configuration would be the worst answer: the
+    PermitRootLogin below would be reported as the host's global setting when
+    sshd applies it to nobody.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("Match\nPermitRootLogin yes\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert "permitrootlogin" not in config
+
+
+def test_fallback_parser_ignores_a_keyword_with_no_value_and_keeps_reading(tmp_path: Path):
+    """A line holding nothing but a keyword has no value to store, and must not stop the rest of the file.
+
+    sshd refuses a configuration like this one outright ("line 1: no argument
+    after keyword \"PermitRootLogin\"", verified against OpenSSH 10.2), which is
+    one of the reasons this fallback parser would be running. Only a bare
+    "Match" means anything on a line with no separator in it; this is the other
+    branch, where the line is dropped, no value is invented for it, and the
+    keywords below it still parse.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("PermitRootLogin\nStrictModes no\n")
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+    assert "permitrootlogin" not in config
+    assert config["strictmodes"] == ["no"]
+
+
 def test_fallback_parser_skips_a_match_block_opened_by_a_malformed_match_line(tmp_path: Path):
     """A Match line sshd would reject still opens a block, so its body must not be read as global config.
 
