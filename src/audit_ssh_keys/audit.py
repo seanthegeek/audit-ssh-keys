@@ -157,7 +157,7 @@ class PrivateKeyFinding:
     """A private key found in a user's ~/.ssh.
 
     encrypted is True (passphrase-protected), False (no passphrase), or None
-    when the file format could not be recognised and neither could be determined.
+    when the file format was not recognised, so it could not be determined.
     """
 
     user: str
@@ -456,7 +456,7 @@ def public_key_from_private(path: Path) -> str | None:
         public_blob, _ = _read_string(blob, offset)
         key_type, _ = _read_string(public_blob, 0)
         name = key_type.decode("ascii")
-    except (ValueError, UnicodeDecodeError):
+    except ValueError:  # UnicodeDecodeError is a ValueError subclass
         return None
     if not name:
         return None
@@ -495,9 +495,10 @@ def fingerprint_private_key(path: Path) -> tuple[tuple[str, int, str, str] | Non
 
     if result is None:
         result = pub_result
-        if result is None and not pub.is_file():
-            # ssh-keygen prefers a .pub sibling when one exists, so this is only
-            # worth trying when there is none.
+        if result is None:
+            # Reached only for keys with no readable public half (legacy PEM)
+            # whose .pub is absent or unreadable; ssh-keygen can still read an
+            # unencrypted private key directly.
             result = fingerprint_file(path)
     return result, mismatch
 
@@ -674,8 +675,10 @@ def check_strictmodes_path(path: Path, owner: pwd.struct_passwd) -> list[Issue]:
     except OSError as exc:
         return [Issue("LOW", f"could not resolve {path}: {exc}")]
 
-    home = Path(owner.pw_dir)
-    home_real = home.resolve() if home.exists() else None
+    # sshd's realpath("") on an empty pw_dir fails, so it walks all the way to
+    # /; Path("") would otherwise resolve to the current working directory and
+    # could make the walk stop there instead.
+    home_real = Path(owner.pw_dir).resolve() if owner.pw_dir and Path(owner.pw_dir).exists() else None
 
     issues = _check_one_strictmodes_path(real, owner)
     for parent in real.parents:
@@ -787,9 +790,9 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
     """Fingerprint and grade each configured (or default) host key.
 
     Host keys must be owned by root, so owner_uid defaults to 0. It is
-    injectable (like the repo's other audit functions take users=,
-    config_paths=, sshd_bin=) so tests can run as an ordinary user and still
-    exercise the ownership check without needing real root-owned files.
+    injectable (as the other audit functions take `users=`, `config_paths=`,
+    `sshd_bin=`) so tests can run as an ordinary user and still exercise the
+    ownership check without needing real root-owned files.
     """
     paths = config.get("hostkey") or DEFAULT_HOST_KEYS
     findings: list[HostKeyFinding] = []
@@ -884,10 +887,19 @@ def audit_authorized_keys(
                     account_config, "authorizedkeysfile", " ".join(DEFAULT_AUTHORIZED_KEYS_PATTERNS)
                 ).split()
         if user_patterns == ["none"]:
-            coverage.append(
-                f"AuthorizedKeysFile is 'none' for {user.pw_name} (Match block); "
-                "sshd reads no authorized_keys files for that account."
-            )
+            # An account's effective AuthorizedKeysFile can be 'none' for two
+            # different reasons: a Match block actually sets it for this one
+            # account, or the global AuthorizedKeysFile is already 'none', in
+            # which case `sshd -T -C user=X` just echoes that same 'none' for
+            # every account. The global case already has its own coverage
+            # line above; only add a per-account line for the Match-block
+            # case, which is exactly when `patterns` (the global list) was
+            # not itself emptied out by 'none'.
+            if patterns:
+                coverage.append(
+                    f"AuthorizedKeysFile is 'none' for {user.pw_name} (Match block); "
+                    "sshd reads no authorized_keys files for that account."
+                )
             continue
 
         for pattern in user_patterns:

@@ -2,7 +2,7 @@
 
 ## What it reads
 
-1. **Effective sshd config.** Runs `sshd -T`, which resolves `Include` directives and prints every effective keyword with its final value. Plain `sshd -T` prints the configuration with **no `Match` block applied**, and gives no hint that any exist, so the tool also runs `sshd -T -C user=<account>` once per account (see item 3) to pick up `Match User` and `Match Group` blocks. Criteria that depend on an actual connection (`Match Address`, `LocalPort`, and the rest) cannot be evaluated without one, so `sshd` treats them as not matching and this tool sees the same thing.
+1. **Effective sshd config.** Runs `sshd -T`, which resolves `Include` directives and prints every effective keyword with its final value. Plain `sshd -T` prints the configuration with **no `Match` block applied**, and gives no hint that any exist, so the tool also runs `sshd -T -C user=<account>` once per account (see item 3) to pick up that account's effective `AuthorizedKeysFile` from any `Match User` or `Match Group` block that changes it. That is the only setting taken from the per-account run. Criteria that depend on an actual connection (`Match Address`, `LocalPort`, and the rest) cannot be evaluated without one, so `sshd` treats them as not matching and this tool sees the same thing.
 
    If `sshd -T` fails (no `sshd` binary, not root, or the config is broken) the tool falls back to parsing `/etc/ssh/sshd_config` and `/etc/ssh/sshd_config.d/*.conf` directly, skipping `Match` blocks entirely and taking the first occurrence of each keyword. The fallback cannot see fully-expanded algorithm lists either, so those checks are skipped and a coverage warning says both things.
 
@@ -30,6 +30,7 @@ Other things out of scope by design:
 - Keys under `~/.ssh` subdirectories, or in locations that are not `~/.ssh` (only host keys and `AuthorizedKeysFile` paths are read from config).
 - Weak-entropy detection (the 2008 Debian OpenSSL blocklist). Rare enough now that it is left to `ssh-vulnkey`-style tooling.
 - Client-side config (`~/.ssh/config`, `known_hosts`).
+- `Match` blocks that change anything other than `AuthorizedKeysFile` — for example a per-account `AuthorizedKeysCommand`, `TrustedUserCAKeys`, or `PubkeyAuthentication no`. Only the global values of those are checked.
 
 ## Safety
 

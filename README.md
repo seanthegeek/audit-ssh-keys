@@ -54,9 +54,9 @@ sudo audit-ssh-keys --json     # machine-readable, for pipelines and fleet rollu
 | Section | Checks |
 | ------- | ------ |
 | Server configuration | Weak signature algorithms still accepted (`ssh-dss`, SHA-1 `ssh-rsa`); `StrictModes no`; `PermitRootLogin yes`; password auth enabled |
-| Host keys | Algorithm and size; ownership and mode (`sshd` refuses group/other-accessible host keys); configured-but-missing keys; passphrase-protected keys; missing Ed25519 key |
+| Host keys | Algorithm and size; ownership and mode (`sshd` refuses group/other-accessible host keys); a `.pub` file next to the key checked against the key itself; configured-but-missing keys; passphrase-protected keys; missing Ed25519 key |
 | `authorized_keys` | Every account, every configured path; algorithm and size; what `StrictModes` would reject (ownership, group/world-writable file, `~/.ssh`, or `$HOME`); the same key reused across accounts; unrestricted keys on uid-0 accounts; malformed lines |
-| Private keys in `~/.ssh` | Algorithm and size; ownership and mode; whether a passphrase is set |
+| Private keys in `~/.ssh` | Algorithm and size; ownership and mode; whether a passphrase is set; a `.pub` file next to the key checked against the key itself |
 
 Every finding has a severity (CRITICAL, HIGH, MEDIUM, LOW, INFO). See
 [docs/findings.md](docs/findings.md) for what each one means and why it has the

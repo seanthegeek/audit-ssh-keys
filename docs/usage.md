@@ -41,7 +41,7 @@ The exit code does not reflect findings, so the tool is safe to run from cron or
 | Key | Contents |
 | --- | -------- |
 | `config_source` | `"sshd -T"` or `"parsed sshd_config (sshd -T unavailable)"` |
-| `effective_authorized_keys_file` | The `AuthorizedKeysFile` patterns that were expanded per account |
+| `effective_authorized_keys_file` | The global `AuthorizedKeysFile` patterns. An account whose `Match` block moves the file is still scanned at the moved location (see `authorized_key_files`), but that override is not reflected here |
 | `coverage_warnings` | Things the audit could not see (see [How it works](how-it-works.md)) |
 | `server_config_issues` | Findings about `sshd` settings |
 | `host_keys` | One entry per host key: `path`, `key_type`, `bits`, `fingerprint`, `issues` |

@@ -36,6 +36,7 @@ Algorithm checks only run when `sshd -T` succeeds, because only it prints the fu
 | `host key is passphrase-protected` | LOW | `sshd` cannot load it at boot | Regenerate without a passphrase |
 | `<name>.pub does not match this private key` | LOW | The public file next to the key is stale or belongs to a different key, so anything copied out of it — into an `authorized_keys` file, a config-management repo, a `known_hosts` entry — authorises the wrong key | Regenerate it: `ssh-keygen -y -f <key> > <key>.pub` |
 | `no Ed25519 host key present` | LOW | Ed25519 is the current best-practice host key | `ssh-keygen -A` |
+| `could not fingerprint host key` | LOW | The public half could not be read from any source: a passphrase-protected key in the old PEM format with no `.pub` file, or a corrupt key body. Its algorithm and size were not graded | Write the public file (`ssh-keygen -y -f <key> > <key>.pub`) or convert the key to the current format with `ssh-keygen -p -o -f <key>` |
 
 ## authorized_keys — file level
 
@@ -71,4 +72,4 @@ The tool follows any symbolic links, then checks the file and every directory ab
 | `RSA N-bit ...`, `DSA key` | as above | | Rotate |
 | `could not determine whether the key is passphrase-protected` | LOW | Unrecognised file format | Inspect manually |
 | `<name>.pub does not match this private key` | LOW | The public file next to the key is stale or belongs to a different key, so anything copied out of it — for example into an `authorized_keys` file — authorises the wrong key | Regenerate it: `ssh-keygen -y -f <key> > <key>.pub` |
-| `could not fingerprint private key` | LOW | A passphrase-protected key in the old PEM format with no `.pub` file beside it cannot be read without the passphrase, so its algorithm and size were not graded | Write the public file (`ssh-keygen -y -f <key> > <key>.pub`), or convert the key to the current format with `ssh-keygen -p -o -f <key>` |
+| `could not fingerprint private key` | LOW | The public half could not be read from any source: a passphrase-protected key in the old PEM format with no `.pub` file, a world-readable PEM key with no `.pub` (`ssh-keygen` refuses to open it), or a corrupt key body. Its algorithm and size were not graded | Fix the permissions if that is the cause; otherwise write the public file (`ssh-keygen -y -f <key> > <key>.pub`) or convert the key to the current format with `ssh-keygen -p -o -f <key>` |

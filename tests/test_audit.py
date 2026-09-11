@@ -10,8 +10,10 @@ import base64
 import json
 import os
 import pwd
+import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
@@ -187,6 +189,12 @@ def test_strictmodes_absolute_path_outside_the_home_is_checked_to_the_root(tmp_p
     )
     _assert_only_victim_and_tmp_ancestors(issues, victim, tmp_path)
 
+    # tmp_path lives under /tmp, which is mode 1777 on any normal system: prove
+    # the walk actually reaches / by asserting that finding is present, not
+    # merely tolerating it.
+    if stat.S_IMODE(Path("/tmp").stat().st_mode) & 0o022:
+        assert any(_reported_path(i) == Path("/tmp") for i in issues)
+
 
 def test_strictmodes_follows_symlinks_before_checking(tmp_path: Path):
     alice = make_user("alice", os.getuid(), tmp_path / "home" / "alice")
@@ -217,6 +225,29 @@ def test_strictmodes_stops_at_the_home_directory(tmp_path: Path):
     (tmp_path / "home").chmod(0o775)
 
     assert audit.check_strictmodes_path(ak, alice) == []
+
+
+def test_strictmodes_empty_pw_dir_does_not_stop_the_walk_early(tmp_path: Path):
+    """Path("") resolves to the cwd, so an empty pw_dir must not silently stop the walk there.
+
+    make_user stringifies its home argument, so an empty Path("") can't be
+    built through it (it would come out as "."). Build the passwd entry by
+    hand instead, the way a real account with no home directory looks.
+    """
+    nohome = pwd.struct_passwd(("nohome", "x", os.getuid(), os.getuid(), "nohome", "", "/bin/sh"))
+    victim = mkdir_clean(tmp_path / "x", tmp_path)
+    ssh_dir = mkdir_clean(victim / ".ssh", tmp_path)
+    ak = ssh_dir / "authorized_keys"
+    ak.write_text("# empty\n")
+    ak.chmod(0o600)
+    victim.chmod(victim.stat().st_mode | 0o020)  # group-writable
+
+    issues = audit.check_strictmodes_path(ak, nohome)
+    victim_real = victim.resolve()
+    assert any(
+        i.severity == "HIGH" and str(victim_real) in i.message and "group/world-writable" in i.message for i in issues
+    )
+    _assert_only_victim_and_tmp_ancestors(issues, victim_real, tmp_path)
 
 
 # --- check_private_key_perms ------------------------------------------------
@@ -430,6 +461,21 @@ def test_fingerprint_private_key_falls_back_for_pem_keys(tmp_path: Path):
     audit.pub_sibling(encrypted).unlink()
     result, mismatch = audit.fingerprint_private_key(encrypted)
     assert result is None and mismatch is None
+
+
+def test_fingerprint_private_key_falls_back_when_the_pub_sibling_is_unparsable(tmp_path: Path):
+    """A PEM key with a garbage (not merely stale) .pub beside it must still fall back to the private key.
+
+    An unparsable .pub file means ssh-keygen cannot read it, but the private
+    key itself is unencrypted and readable, so ssh-keygen can fingerprint that
+    directly -- the fallback must not be skipped just because a .pub file
+    happens to exist.
+    """
+    plain = _pem_key(tmp_path / "plain")
+    audit.pub_sibling(plain).write_text("not a key\n")
+    result, mismatch = audit.fingerprint_private_key(plain)
+    assert result is not None and result[:2] == ("RSA", 2048)
+    assert mismatch is None
 
 
 def test_private_key_is_encrypted(keys: dict[str, Path]):
@@ -757,6 +803,29 @@ def test_authorized_keys_match_none_skips_that_account_only(keys: dict[str, Path
     assert coverage[0].startswith("AuthorizedKeysFile is 'none' for bob (Match block)")
 
 
+def test_authorized_keys_global_none_reports_coverage_once_not_per_account(keys: dict[str, Path], tmp_path: Path):
+    """Global AuthorizedKeysFile none: sshd -T -C user=X echoes 'none' for every account too.
+
+    That must not produce one false per-account coverage line per user on top
+    of the one true global line.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    carol = make_user("carol", USER_UID, tmp_path / "home" / "carol")
+
+    def user_config(user: pwd.struct_passwd) -> dict[str, list[str]] | None:
+        return {"authorizedkeysfile": ["none"]}
+
+    patterns, files, ak, _, coverage = audit.audit_authorized_keys(
+        {"authorizedkeysfile": ["none"]}, 3072, users=[alice, bob, carol], user_config=user_config
+    )
+
+    assert patterns == []
+    assert files == []
+    assert ak == []
+    assert coverage == ["AuthorizedKeysFile is 'none'; sshd reads no authorized_keys files."]
+
+
 def test_authorized_keys_none_pattern(tmp_path: Path):
     alice = make_user("alice", os.getuid(), tmp_path)
     patterns, files, ak, _, coverage = audit.audit_authorized_keys(
@@ -826,11 +895,11 @@ def test_private_keys_end_to_end(keys: dict[str, Path], tmp_path: Path):
     assert "private key has no passphrase" in sev["HIGH"]
 
 
-def _one_private_key(tmp_path: Path, write: object) -> audit.PrivateKeyFinding:
+def _one_private_key(tmp_path: Path, write: Callable[[Path], None]) -> audit.PrivateKeyFinding:
     """Lay out a single-account ~/.ssh, let `write` fill it in, and audit it."""
     alice = make_user("alice", os.getuid(), tmp_path / "alice")
     a_ssh = mkdir_clean(Path(alice.pw_dir) / ".ssh", tmp_path)
-    write(a_ssh)  # type: ignore[operator]
+    write(a_ssh)
     findings = audit.audit_private_keys(3072, host_key_paths=set(), users=[alice])
     assert len(findings) == 1
     return findings[0]
@@ -980,10 +1049,15 @@ def test_main_without_ssh_keygen_raises(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_audit_py_runs_standalone_without_the_package(tmp_path: Path):
-    """audit.py must still run when copied off by itself (docs/usage.md, "Fleet use")."""
+    """audit.py must still run when copied off by itself (docs/usage.md, "Fleet use").
+
+    -S skips site-packages, so an installed copy of the package (which would
+    make the `from audit_ssh_keys import __version__` import succeed even
+    with PYTHONPATH stripped) cannot mask the standalone fallback either.
+    """
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     proc = subprocess.run(
-        [sys.executable, audit.__file__, "--version"],
+        [sys.executable, "-S", audit.__file__, "--version"],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -991,7 +1065,7 @@ def test_audit_py_runs_standalone_without_the_package(tmp_path: Path):
         check=False,
     )
     assert proc.returncode == 0
-    assert proc.stdout.startswith("audit-ssh-keys")
+    assert proc.stdout.strip() == "audit-ssh-keys unknown"
 
 
 # --- verbose report ------------------------------------------------------------
