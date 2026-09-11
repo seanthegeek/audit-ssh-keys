@@ -1,0 +1,68 @@
+# Usage
+
+```bash
+sudo audit-ssh-keys [OPTIONS]
+```
+
+## Options
+
+| Option | Effect |
+| ------ | ------ |
+| `--json` | Emit the full report as JSON instead of the human-readable text |
+| `--min-rsa-bits N` | RSA keys smaller than `N` bits are flagged MEDIUM (default 3072). RSA below 2048 is always CRITICAL; this option cannot lower that floor |
+| `--skip-host` | Skip host-key checks |
+| `--skip-authorized` | Skip `authorized_keys` checks |
+| `--skip-private` | Skip `~/.ssh` private-key checks |
+| `-v`, `--verbose` | List every host key, `authorized_keys` entry, and private key — not just those with findings. Entries are grouped by file in line order, with `ok` on clean ones |
+| `--debug` | Debug logging to stderr (for example, the raw `sshd -T` failure text) |
+| `--version` | Print the version and exit |
+
+## Why root
+
+- Other accounts' `authorized_keys` and private keys are usually mode 600.
+- Host private keys are root-only.
+- `sshd -T` refuses to run without root, and it is how the tool learns the *effective* configuration (custom `AuthorizedKeysFile`, `HostKey` list, accepted algorithms) rather than guessing from a partial parse of `sshd_config`.
+
+Without root the tool still runs, but only over files the invoking user can read, and it falls back to parsing `sshd_config` directly. The report header shows which source was used.
+
+## Exit codes
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | Audit ran (findings or not — see the report) |
+| 2 | Audit could not run at all (`ssh-keygen` missing) |
+
+The exit code does not reflect findings, so the tool is safe to run from cron or a config-management "gather facts" step. To gate on findings, use `--json` and inspect the severities.
+
+## JSON output
+
+`--json` prints one object with these top-level keys:
+
+| Key | Contents |
+| --- | -------- |
+| `config_source` | `"sshd -T"` or `"parsed sshd_config (sshd -T unavailable)"` |
+| `effective_authorized_keys_file` | The `AuthorizedKeysFile` patterns that were expanded per account |
+| `coverage_warnings` | Things the audit could not see (see [How it works](how-it-works.md)) |
+| `server_config_issues` | Findings about `sshd` settings |
+| `host_keys` | One entry per host key: `path`, `key_type`, `bits`, `fingerprint`, `issues` |
+| `authorized_key_files` | One entry per file: `user`, `file_path`, `key_count`, `issues` |
+| `authorized_keys` | One entry per key: `user`, `file_path`, `line_number`, `key_type`, `bits`, `fingerprint`, `comment`, `options`, `issues` |
+| `duplicate_authorized_keys` | `{fingerprint: ["user path:line", ...]}` for keys authorised in more than one place |
+| `private_keys` | One entry per private key: `user`, `path`, `key_type`, `bits`, `fingerprint`, `encrypted`, `issues` |
+
+Every `issues` entry is `{"severity": "...", "message": "..."}`.
+
+Fingerprints are SHA256, as printed by `ssh-keygen -l`, so they can be joined against other tooling and across hosts.
+
+## Fleet use
+
+The tool is a single stdlib-only package, so it can be copied to a host and run with `python3 -m audit_ssh_keys` without installing anything beyond `openssh-client`. A typical rollup:
+
+```bash
+for h in host1 host2 host3; do
+  ssh "$h" sudo audit-ssh-keys --json > "reports/$h.json"
+done
+jq -r '.authorized_keys[] | select(.issues[]?.severity == "CRITICAL") | "\(.user) \(.file_path):\(.line_number) \(.fingerprint)"' reports/*.json
+```
+
+Cross-host key reuse is a natural next step: concatenate the `authorized_keys` arrays and group by `fingerprint`.
