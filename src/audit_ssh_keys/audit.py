@@ -2253,11 +2253,15 @@ def audit_authorized_keys(
             # this needs the line loop to have run: a file with no working key
             # in it, and a file whose contents could not be read at all (which
             # returned above), say nothing about how old anyone's access is.
+            # "Working" means a key line sshd would parse; whether a line's
+            # expiry-time= has passed is not evaluated here, the same as in
+            # every other check in this tool.
             if unchanged_for_days is not None and active_keys and _unchanged_for(st.st_mtime, now, unchanged_for_days):
                 file_finding.issues.append(
                     Issue(
                         "LOW",
-                        f"not modified in {_days(unchanged_for_days)}; every key in it is at least that old",
+                        f"not modified in {_days(unchanged_for_days)}; "
+                        "review whether every key in it should still have access",
                     )
                 )
             files.append(file_finding)
@@ -2670,7 +2674,7 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help=(
             "Flag LOW every authorized_keys file that has not been modified in DAYS days and still "
-            "holds at least one key sshd would match (off unless given)"
+            "holds at least one key line sshd would parse (off unless given)"
         ),
     )
     parser.add_argument(

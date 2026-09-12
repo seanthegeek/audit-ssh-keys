@@ -2249,7 +2249,7 @@ def test_authorized_keys_unchanged_for_fires_only_outside_the_window(keys: dict[
 
     stale = _one_file_finding(alice, unchanged_for_days=30)
     assert [(i.severity, i.message) for i in stale.issues] == [
-        ("LOW", "not modified in 30 days; every key in it is at least that old")
+        ("LOW", "not modified in 30 days; review whether every key in it should still have access")
     ]
 
     _age(ak, 10)
@@ -2288,7 +2288,7 @@ def test_authorized_keys_unchanged_for_fires_on_a_file_whose_only_working_key_si
     finding = _one_file_finding(alice, unchanged_for_days=30)
 
     assert [(i.severity, i.message) for i in finding.issues] == [
-        ("LOW", "not modified in 30 days; every key in it is at least that old")
+        ("LOW", "not modified in 30 days; review whether every key in it should still have access")
     ]
 
 
@@ -2306,7 +2306,7 @@ def test_authorized_keys_both_thresholds_at_once_give_each_file_exactly_one_of_t
         ("MEDIUM", "modified within the last 7 days; confirm the change was expected")
     ]
     assert [(i.severity, i.message) for i in stale_finding.issues] == [
-        ("LOW", "not modified in 7 days; every key in it is at least that old")
+        ("LOW", "not modified in 7 days; review whether every key in it should still have access")
     ]
 
 
@@ -2319,7 +2319,7 @@ def test_authorized_keys_thresholds_use_the_singular_for_a_one_day_window(keys: 
         "modified within the last 1 day; confirm the change was expected"
     ]
     assert [i.message for i in _one_file_finding(stale, unchanged_for_days=1).issues] == [
-        "not modified in 1 day; every key in it is at least that old"
+        "not modified in 1 day; review whether every key in it should still have access"
     ]
 
 

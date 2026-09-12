@@ -10,7 +10,7 @@ sudo audit-ssh-keys [OPTIONS]
 | ------ | ------ |
 | `--json` | Emit the full report as JSON instead of the human-readable text |
 | `--min-rsa-bits N` | RSA keys smaller than `N` bits are flagged MEDIUM (default 3072). RSA below 2048 is always CRITICAL; this option cannot lower that floor |
-| `--authorized-keys-unchanged-for DAYS` | Flag LOW every `authorized_keys` file that holds at least one key `sshd` would match and has not been modified in `DAYS` days. Off unless given |
+| `--authorized-keys-unchanged-for DAYS` | Flag LOW every `authorized_keys` file that holds at least one key line `sshd` would parse and has not been modified in `DAYS` days. Off unless given |
 | `--authorized-keys-changed-within DAYS` | Flag MEDIUM every `authorized_keys` file modified within the last `DAYS` days, including one the tool cannot read. Off unless given |
 | `--host-keys-changed-within DAYS` | Flag MEDIUM every host key file modified within the last `DAYS` days. Off unless given |
 | `--skip-host` | Skip host-key checks |
