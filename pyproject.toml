@@ -34,7 +34,7 @@ Changelog = "https://github.com/seanthegeek/audit-ssh-keys/blob/main/CHANGELOG.m
 audit-ssh-keys = "audit_ssh_keys.audit:run"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff", "pyright"]
+dev = ["pytest>=8", "pytest-cov", "ruff", "pyright"]
 
 [tool.hatch.version]
 path = "src/audit_ssh_keys/__init__.py"

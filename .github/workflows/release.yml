@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]" build
+
+      - name: Check tag matches package version
+        run: |
+          set -euo pipefail
+          version=$(python -c "import audit_ssh_keys; print(audit_ssh_keys.__version__)")
+          tag=${GITHUB_REF_NAME#v}
+          if [ "$version" != "$tag" ]; then
+            echo "Tag $GITHUB_REF_NAME (version $tag) does not match audit_ssh_keys.__version__ ($version)"
+            exit 1
+          fi
+
+      - name: Check changelog has a heading for this version
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF_NAME#v}
+          if ! grep -q "^## \[$tag\]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## [$tag]' heading. Add one before tagging a release."
+            exit 1
+          fi
+
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pyright
+      - run: pytest
+
+      - run: python -m build
+
+      - name: Check that exactly one wheel and one sdist were built
+        run: |
+          set -euo pipefail
+          wheel_count=$(find dist -maxdepth 1 -name '*.whl' | wc -l)
+          sdist_count=$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)
+          if [ "$wheel_count" -ne 1 ] || [ "$sdist_count" -ne 1 ]; then
+            echo "Expected exactly one wheel and one sdist in dist/, found $wheel_count wheel(s) and $sdist_count sdist(s)"
+            ls -la dist/
+            exit 1
+          fi
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF_NAME#v}
+          prerelease_flag=()
+          if [[ "$tag" =~ [a-zA-Z] ]]; then
+            prerelease_flag=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" --title "$tag" --generate-notes "${prerelease_flag[@]}" dist/*

@@ -1,5 +1,8 @@
 # audit-ssh-keys
 
+[![CI](https://github.com/seanthegeek/audit-ssh-keys/actions/workflows/ci.yml/badge.svg)](https://github.com/seanthegeek/audit-ssh-keys/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/seanthegeek/audit-ssh-keys/graph/badge.svg)](https://codecov.io/gh/seanthegeek/audit-ssh-keys)
+
 Audit every SSH key on a Linux server in one pass: the server's own host keys,
 every account's `authorized_keys`, and any private keys sitting in `~/.ssh`.
 
