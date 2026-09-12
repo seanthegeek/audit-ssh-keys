@@ -83,6 +83,18 @@ The defects that author-side reviews miss are rarely inside one artifact — the
 - **Update tracking state only after the action it tracks has succeeded.** When code clears a counter, marks something done, or advances a cursor around an action that can fail (a temporary directory removed, a file read, a subprocess run), do the update after the action succeeds — then walk each failure branch and ask what the state means if the action fails right there. Reviews reliably verify that cleanup *exists*; they miss *when* it runs.
 - **If something can report failure two ways, handle both ways the same.** A helper that signals failure by return value in one configuration and by raised exception in another must run the same cleanup and safety logic on both paths. Find every place that raises, not just every place that returns — and remember that what happens to a raised exception depends on every caller it can propagate through.
 
+### Run the parity claim, don't read it
+
+A comment saying the code now matches `sshd` is really two claims: one about what `sshd` does, and one about what the Python line does. A reviewer who knows OpenSSH checks the first, finds it right, and lets the second stand — the code reads as idiomatic and the comment above it is true. Three defects reached a late review that way in a single cycle, every one of them a standard-library default that nobody executed:
+
+- **`path.read_text()` reads in universal-newline mode**, turning a bare `\r` into `\n` before anything else sees it. A hunk that changed `.splitlines()` to `.split("\n")` to match `getline()` therefore changed nothing at all: a carriage return inside a `Banner` value still began a second directive. The repair is to open the file with `newline="\n"`; the lesson is that the parity claim was read and never run.
+- **`str.strip()` removes Unicode whitespace**, while `sshd` removes only its own ASCII set (`" \t\r"` in front, `WHITESPACE " \t\r\n"` plus a form feed behind). A configuration value ending in a non-breaking space was quietly shortened here and kept by `sshd`.
+- **`readline(n)` counts the carriage return of a CRLF ending**, so a line of exactly the cap followed by `\r\n` came back one character too long and a valid key was thrown away.
+
+When a hunk claims to match an external system, write the one input that tells the two behaviours apart and run it. Reading the line and nodding at the comment is not the check. Treat every standard-library call in such a hunk the same way: look up what its default arguments actually do rather than what its name suggests, because a wrong default and a right one read identically.
+
+This class of defect survives a same-model fresh-context review, which shares the very priors that made the code look correct when it was written. It is caught by execution, or by a reviewer built differently — all three above were found by a line-level reviewer after two semantic reviews had passed them.
+
 ### Verify what CI enforces, not a plausible subset
 
 - **Run the checks in `docs/development.md` from the repo root**, all of them, exactly as written; once a workflow file exists, read it and run its literal commands rather than a plausible subset. When a repo-wide run is noisy because of untracked local directories, fix the exclusion in the tool's config rather than narrowing the command — a narrowed command is a different check that happens to share a name.

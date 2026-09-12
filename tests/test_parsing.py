@@ -26,22 +26,92 @@ def _blob(type_name: str) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+# Every shape of line that really does start with a key. _is_bare_key_line is
+# asserted over this list twice: directly, and through split_options, which
+# reaches it by way of its own option parsing. The other half of that
+# function's claim -- the shapes it has to say no to -- is
+# test_is_bare_key_line_rejects_known_hosts_syntax, which has a list of its own.
+_BARE_KEY_LINES = [
+    f"ssh-ed25519 {_blob('ssh-ed25519')} comment",
+    f"ssh-rsa {_blob('ssh-rsa')}",
+    f"ecdsa-sha2-nistp256 {_blob('ecdsa-sha2-nistp256')} c",
+    f"sk-ssh-ed25519@openssh.com {_blob('sk-ssh-ed25519@openssh.com')} c",
+    f"ssh-rsa-cert-v01@openssh.com {_blob('ssh-rsa-cert-v01@openssh.com')} c",
+    # Added in OpenSSH 10.4 (July 2026); never in any prefix list this
+    # tool had, so it proves the structural check.
+    f"ssh-mldsa44-ed25519@openssh.com {_blob('ssh-mldsa44-ed25519@openssh.com')} c",
+    f"ssh-mldsa44-ed25519-cert-v01@openssh.com {_blob('ssh-mldsa44-ed25519-cert-v01@openssh.com')} c",
+]
+
+
+@pytest.mark.parametrize("line", _BARE_KEY_LINES)
+def test_split_options_bare_key_has_no_options(line: str):
+    assert audit.split_options(line) == ([], line)
+
+
+@pytest.mark.parametrize("line", _BARE_KEY_LINES)
+def test_is_bare_key_line_accepts_every_shape_of_real_key_line(line: str):
+    """The positive half of the check, asserted on the function itself.
+
+    test_split_options_bare_key_has_no_options covers the same lines, but only
+    through split_options, which reaches this function by way of its own
+    option parsing. The negative half,
+    test_is_bare_key_line_rejects_known_hosts_syntax, calls the function
+    directly, so the positive half does too.
+    """
+    assert audit._is_bare_key_line(line) is True
+
+
+@pytest.mark.parametrize("gap", ["  ", "\t", " \t ", "\t\t"])
+def test_split_options_skips_every_space_and_tab_between_the_options_and_the_key(gap: str):
+    """sshd's skip_space() (misc.c) steps over the whole run of them, not just the first one.
+
+    A single separator hides the difference: the option loop has already
+    consumed that one character by the time it returns what is left, so
+    dropping the skip entirely would look the same. A run of two or more is
+    what tells them apart.
+    """
+    key = f"ssh-ed25519 {_blob('ssh-ed25519')} c"
+    assert audit.split_options(f"no-pty{gap}{key}") == (["no-pty"], key)
+
+
+@pytest.mark.parametrize("indent", [" ", "\t", "  \t "])
+def test_split_options_skips_spaces_and_tabs_at_the_front_of_the_line(indent: str):
+    """Those are the two characters sshd skips at the start of a line, so both shapes of line lose them."""
+    key = f"ssh-ed25519 {_blob('ssh-ed25519')} c"
+    assert audit.split_options(f"{indent}{key}") == ([], key)
+    assert audit.split_options(f"{indent}no-pty {key}") == (["no-pty"], key)
+
+
+def test_split_options_leaves_the_end_of_the_line_alone():
+    """Only the front of the line is trimmed; what is on the end is the caller's business.
+
+    str.strip() would take the trailing space off, along with any other
+    character Unicode counts as whitespace at either end -- a non-breaking
+    space among them, which sshd leaves exactly where it is.
+    """
+    key = f"ssh-ed25519 {_blob('ssh-ed25519')} c\u00a0 "
+    assert audit.split_options(f"no-pty {key}") == (["no-pty"], key)
+    assert audit.split_options(key) == ([], key)
+
+
 @pytest.mark.parametrize(
     "line",
     [
-        f"ssh-ed25519 {_blob('ssh-ed25519')} comment",
-        f"ssh-rsa {_blob('ssh-rsa')}",
-        f"ecdsa-sha2-nistp256 {_blob('ecdsa-sha2-nistp256')} c",
-        f"sk-ssh-ed25519@openssh.com {_blob('sk-ssh-ed25519@openssh.com')} c",
-        f"ssh-rsa-cert-v01@openssh.com {_blob('ssh-rsa-cert-v01@openssh.com')} c",
-        # Added in OpenSSH 10.4 (July 2026); never in any prefix list this
-        # tool had, so it proves the structural check.
-        f"ssh-mldsa44-ed25519@openssh.com {_blob('ssh-mldsa44-ed25519@openssh.com')} c",
-        f"ssh-mldsa44-ed25519-cert-v01@openssh.com {_blob('ssh-mldsa44-ed25519-cert-v01@openssh.com')} c",
+        f"somehost ssh-ed25519 {_blob('ssh-ed25519')} c",
+        f"@cert-authority ssh-ed25519 {_blob('ssh-ed25519')} c",
+        f"*.example.com,192.0.2.1 ssh-ed25519 {_blob('ssh-ed25519')} c",
+        f"|1|c2FsdA==|aGFzaA== ssh-ed25519 {_blob('ssh-ed25519')} c",
     ],
 )
-def test_split_options_bare_key_has_no_options(line: str):
-    assert audit.split_options(line) == ([], line)
+def test_is_bare_key_line_rejects_known_hosts_syntax(line: str):
+    """A known_hosts line has a host where the key type belongs, so sshd reads no key from it.
+
+    The positive half -- every shape of real key line answering True -- is
+    test_is_bare_key_line_accepts_every_shape_of_real_key_line, which runs the
+    same assertion over _BARE_KEY_LINES.
+    """
+    assert audit._is_bare_key_line(line) is False
 
 
 def test_split_options_type_name_not_matching_blob_is_treated_as_options():
