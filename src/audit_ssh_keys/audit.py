@@ -53,7 +53,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TextIO
 
 try:
     from audit_ssh_keys import __version__
@@ -130,6 +130,47 @@ PRIVATE_KEY_HEADERS_BYTES = tuple(header.encode("ascii") for header in PRIVATE_K
 LEGACY_PRIVATE_KEY_HEADERS_BYTES = tuple(
     header for header in PRIVATE_KEY_HEADERS_BYTES if header != OPENSSH_PRIVATE_KEY_HEADER_BYTES
 )
+
+# The largest private key file this tool will read into memory. This is the
+# tool's own sanity limit, not one ssh imposes: a real private key file is a
+# few kilobytes, and this tool reads every account's files in a single root
+# process, so it declines a file ssh would merely find slow. Any account can
+# leave a file in its own ~/.ssh that starts with a private-key header and
+# runs to gigabytes while costing one disk block (`truncate -s 3G`), and
+# reading that file whole would raise MemoryError, which is not an OSError and
+# is caught nowhere.
+#
+# ssh's own ceiling is far higher. sshbuf_load_fd() (sshbuf-io.c) turns down a
+# regular file only above SSHBUF_SIZE_MAX (sshbuf.h), which is 0x8000000 bytes
+# -- 128 MiB. The 1 MiB MAX_KEY_FILE_SIZE that sshkey_load_file() used to
+# apply was last in OpenSSH 8.1; both it and that function were gone by 8.2
+# (February 2020). So a key file between this limit and 128 MiB is one ssh
+# loads and this tool declines to read: it is reported as a key that could not
+# be fingerprinted and whose passphrase state could not be determined, which
+# is a gap in this tool's coverage and not a claim about what ssh does with
+# the file. Verified against OpenSSH_10.2p1: an Ed25519 key padded to
+# 1,048,577 bytes both fingerprints (`ssh-keygen -l -f`) and loads
+# (`ssh-keygen -y -P ""`).
+MAX_PRIVATE_KEY_FILE_SIZE = 1024 * 1024
+
+# The longest line this tool will read out of an authorized_keys file. sshd
+# applies no such limit: auth_check_authkeys_file() (auth2-pubkeyfile.c) reads
+# the file with `while (getline(&line, &linesize, f) != -1)`, which grows its
+# buffer to whatever the line needs. Diverging from sshd here is deliberate,
+# for the same reason as the private key limit above: sshd reads one account's
+# file in a process serving one connection, while this tool reads every
+# account's files in a single root process, so no one account can be allowed
+# to end the audit. A file that is one enormous line costs its owner almost
+# nothing -- `printf 'ssh-ed25519 AAAA' > ~/.ssh/authorized_keys; truncate -s
+# 3G ~/.ssh/authorized_keys` leaves a 3 GiB line occupying a handful of disk
+# blocks -- and reading it raises MemoryError, which is not an OSError and is
+# caught nowhere.
+#
+# For scale, the longest line anybody writes on purpose is a few kilobytes: a
+# 16384-bit RSA key is around 2.8 KB of base64, and a certificate with a long
+# principals list, or a line carrying a long `command=` option, is of that
+# order too. 64 KiB leaves room for any of them several times over.
+MAX_AUTHORIZED_KEYS_LINE = 64 * 1024
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
@@ -345,16 +386,26 @@ def read_effective_sshd_config(
     sshd = sshd_bin if sshd_bin is not None else _find_sshd()
     if sshd:
         try:
-            proc = subprocess.run([sshd, "-T"], capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
+            proc = subprocess.run([sshd, "-T"], capture_output=True, check=False, stdin=subprocess.DEVNULL)
         except OSError as exc:
             proc = None
             sshd_error = str(exc)
-        if proc is not None and proc.returncode == 0 and proc.stdout.strip():
-            return _parse_sshd_t_output(proc.stdout), "sshd -T", ""
         if proc is not None:
-            logger.debug("sshd -T exited %s: %s", proc.returncode, proc.stderr.strip())
+            # sshd prints each value as the bytes the config file holds, and a
+            # config file may legitimately hold a byte that is not valid UTF-8
+            # (a Banner path, say -- see _parse_sshd_config_file, which reads
+            # the same files). Decoding that in text mode would raise, and
+            # UnicodeDecodeError is not an OSError, so it would escape the
+            # guard above and end the run before the fallback parser -- which
+            # replaces such a byte rather than choking on it -- ever got a
+            # chance. Both streams are decoded the same way here.
+            stdout = proc.stdout.decode("utf-8", errors="replace")
+            if proc.returncode == 0 and stdout.strip():
+                return _parse_sshd_t_output(stdout), "sshd -T", ""
+            stderr = proc.stderr.decode("utf-8", errors="replace")
+            logger.debug("sshd -T exited %s: %s", proc.returncode, stderr.strip())
             # sshd -T validates the whole config, so its stderr is itself a finding.
-            lines = [ln for ln in proc.stderr.replace("\r", "").splitlines() if ln.strip() and not ln.startswith("@")]
+            lines = [ln for ln in stderr.replace("\r", "").splitlines() if ln.strip() and not ln.startswith("@")]
             sshd_error = "; ".join(lines[:6])
     else:
         sshd_error = "sshd binary not found"
@@ -532,7 +583,18 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
         return
 
     in_match = False
-    for raw in text.splitlines():
+    # sshd reads this file with getline() as well (load_server_config() in
+    # servconf.c), so a line ends at a newline and at nothing else; splitting
+    # on everything Python calls a line break would break one config line into
+    # two. Each line then has its surrounding whitespace removed, which covers
+    # the trailing carriage return of a CRLF file. sshd drops that carriage
+    # return too, though in two steps and not where load_server_config() sits:
+    # that function only strips what is in *front* of the line
+    # (`cp = line + strspn(line, " \t\r")`), and the trailing one goes later,
+    # in the "Strip trailing whitespace" loop at the top of
+    # process_server_config_line_depth(), which walks back over
+    # WHITESPACE " \t\r\n" plus a form feed. Read against OpenSSH 10.2p1.
+    for raw in text.split("\n"):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -625,9 +687,20 @@ def _parse_sshd_t_output(stdout: str) -> dict[str, list[str]]:
 
     Each line is "keyword value". Values are collected in a list because a few
     keywords (HostKey, for one) can appear more than once.
+
+    The output is split at newlines and at nothing else, for the same reason
+    _parse_sshd_config_file splits a config file that way: sshd prints each
+    value as the bytes the config file holds, so a value can contain a character Python
+    counts as a line break (a vertical tab, a form feed, a U+2028) without
+    being two lines. Splitting on those would read the tail of one such value
+    as a keyword line of its own -- a Banner path ending in
+    "<U+2028>authorizedkeysfile /evil/%u" would set this account's
+    AuthorizedKeysFile. Only root writes sshd_config, so that is a consistency
+    fix rather than a way in, but the two parsers have to agree about what a
+    line is.
     """
     config: dict[str, list[str]] = defaultdict(list)
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
         parts = line.split(None, 1)
         if len(parts) == 2:
             config[parts[0].lower()].append(parts[1].strip())
@@ -647,22 +720,29 @@ def read_user_sshd_config(user_name: str, sshd_bin: str) -> dict[str, list[str]]
     Returns None when sshd cannot be run, exits non-zero, or prints nothing;
     the caller then falls back to the global configuration for that account
     and records a coverage warning saying so.
+
+    The output is collected as bytes and decoded here with undecodable bytes
+    replaced, for the reason spelled out in read_effective_sshd_config: a
+    config value can hold a byte that is not valid UTF-8, and decoding in text
+    mode would raise UnicodeDecodeError past the OSError guard below instead
+    of falling back to the global configuration for this account.
     """
     try:
         proc = subprocess.run(
             [sshd_bin, "-T", "-C", f"user={user_name}"],
             capture_output=True,
-            text=True,
             check=False,
             stdin=subprocess.DEVNULL,
         )
     except OSError as exc:
         logger.debug("could not run sshd -T -C user=%s: %s", user_name, exc)
         return None
-    if proc.returncode != 0 or not proc.stdout.strip():
-        logger.debug("sshd -T -C user=%s exited %s: %s", user_name, proc.returncode, proc.stderr.strip())
+    stdout = proc.stdout.decode("utf-8", errors="replace")
+    if proc.returncode != 0 or not stdout.strip():
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        logger.debug("sshd -T -C user=%s exited %s: %s", user_name, proc.returncode, stderr.strip())
         return None
-    return _parse_sshd_t_output(proc.stdout)
+    return _parse_sshd_t_output(stdout)
 
 
 def _find_sshd() -> str | None:
@@ -790,17 +870,44 @@ def parse_fingerprint_output(out: str) -> tuple[str, int, str, str] | None:
 
 
 def fingerprint_line(key_line: str) -> tuple[str, int, str, str] | None:
-    """Fingerprint one public-key line via `ssh-keygen -lf -`."""
+    """Fingerprint one public-key line via `ssh-keygen -lf -`.
+
+    The line is handed over as bytes and the answer is decoded here, rather
+    than left to whatever codec the operator's locale names. A bare text=True
+    encodes what is written to the command with that codec and no error
+    handler, which is a crash waiting to happen: the line comes out of an
+    account's own authorized_keys file, so it can hold a name spelled in
+    Latin-1, or the U+FFFD this tool itself puts in place of a byte that did
+    not decode when it read the file. Under an ASCII locale -- a host with no
+    C.UTF-8 to fall back to (glibc before 2.27, musl) or one where Python's
+    UTF-8 coercion is switched off -- either of those raises
+    UnicodeEncodeError, and one such character in one unprivileged account's
+    key comment would end the whole audit. subprocess does take encoding= and
+    errors= alongside text=True, which would fix that as well; encoding and
+    decoding here keeps both choices, and the reasons for them, in one place.
+
+    UTF-8 with surrogateescape encodes every character that can reach this
+    function: the file was read with errors="replace", so a byte in it that
+    did not decode arrives as U+FFFD. That codec pair is not a blanket
+    guarantee -- it round-trips only the surrogates U+DC80 to U+DCFF, and a
+    lone surrogate outside that range still raises -- but errors="replace"
+    never produces a surrogate of any kind.
+
+    The output is decoded as UTF-8 with undecodable bytes replaced, for the
+    same reason: ssh-keygen prints a comment back through its mprintf(), which
+    escapes whatever the locale cannot show, so the answer is normally plain
+    ASCII -- but a byte that arrives anyway must show up as U+FFFD in the
+    report rather than end the run.
+    """
     proc = subprocess.run(
         ["ssh-keygen", "-lf", "-"],
-        input=key_line + "\n",
+        input=(key_line + "\n").encode("utf-8", "surrogateescape"),
         capture_output=True,
-        text=True,
         check=False,
     )
     if proc.returncode != 0:
         return None
-    return parse_fingerprint_output(proc.stdout)
+    return parse_fingerprint_output(proc.stdout.decode("utf-8", errors="replace"))
 
 
 def fingerprint_file(path: Path) -> tuple[str, int, str, str] | None:
@@ -943,6 +1050,32 @@ def _read_string(buf: bytes, offset: int) -> tuple[bytes, int]:
     return buf[offset:end], end
 
 
+def _read_private_key_bytes(path: Path) -> bytes | None:
+    """Read a private key file whole, or return None when it is bigger than this tool reads.
+
+    Too big means bigger than MAX_PRIVATE_KEY_FILE_SIZE, which is this tool's
+    own limit and not ssh's -- ssh loads a far larger file, as the comment on
+    that constant sets out. Exactly one byte more than the limit is read, so a
+    file over it can be told apart from a file exactly at it while the rest of
+    a file of any size is never brought into memory. Reading the length off the
+    file's stat would answer the same question most of the time, but this is
+    the answer for the bytes that were actually there to read.
+
+    Raises OSError when the file is not there or cannot be read, which every
+    caller already has an answer for.
+    """
+    with path.open("rb") as fh:
+        raw = fh.read(MAX_PRIVATE_KEY_FILE_SIZE + 1)
+    if len(raw) > MAX_PRIVATE_KEY_FILE_SIZE:
+        logger.debug(
+            "not reading %s: more than the %s bytes this tool reads of a private key file",
+            path,
+            MAX_PRIVATE_KEY_FILE_SIZE,
+        )
+        return None
+    return raw
+
+
 def _stripped_lines(path: Path) -> list[str] | None:
     """Read a private key file and return its non-blank lines with surrounding whitespace removed.
 
@@ -953,11 +1086,15 @@ def _stripped_lines(path: Path) -> list[str] | None:
     either side of it join up and decode as though the byte had never been
     there, reporting a file OpenSSH refuses to load as a healthy key.
 
-    Returns None when the file cannot be read, or when it is not ASCII.
+    Returns None when the file cannot be read -- including a file bigger than
+    this tool reads, see _read_private_key_bytes -- or when it is not ASCII.
     """
     try:
-        text = path.read_bytes().decode("ascii")
+        raw = _read_private_key_bytes(path)
+        text = raw.decode("ascii") if raw is not None else None
     except (OSError, UnicodeDecodeError):
+        return None
+    if text is None:
         return None
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
@@ -985,7 +1122,8 @@ def _private_key_format(path: Path) -> Literal["openssh", "legacy"] | None:
     formats, which do not, and which are therefore the only formats a `.pub`
     file sitting beside the key may be read as an answer for; and None for
     anything else -- an empty file, a file holding something that is not a
-    private key at all, or a file this tool cannot read.
+    private key at all, a file this tool cannot read, or one bigger than this
+    tool reads (see _read_private_key_bytes).
 
     None is a real third answer and not a quiet "legacy". A `.pub` file beside a
     key is only worth reading when the key itself is in a format that cannot
@@ -1010,9 +1148,11 @@ def _private_key_format(path: Path) -> Literal["openssh", "legacy"] | None:
     the fallback to an unrelated `.pub` file this check exists to prevent.
     """
     try:
-        raw = path.read_bytes()
+        raw = _read_private_key_bytes(path)
     except OSError as exc:
         logger.debug("could not read %s to tell which private key format it is in: %s", path, exc)
+        return None
+    if raw is None:
         return None
     for line in raw.splitlines():
         stripped = line.strip()
@@ -1146,10 +1286,11 @@ def fingerprint_private_key(path: Path) -> tuple[tuple[str, int, str, str] | Non
     unfingerprintable no matter what `.pub` file sits next to it -- that file
     says nothing about which key this one is. A file whose format cannot be
     established at all -- one this tool cannot read (another account's key on a
-    non-root run, say), an empty one, or one holding something that is not a
-    private key header -- gets no `.pub` answer either: the fallback is for the
-    formats that cannot answer for themselves, so there is no reason to think
-    the `.pub` file beside an unrecognised file describes it.
+    non-root run, say), one bigger than this tool reads (see
+    _read_private_key_bytes), an empty one, or one holding something that is
+    not a private key header -- gets no `.pub` answer either: the fallback is
+    for the formats that cannot answer for themselves, so there is no reason to
+    think the `.pub` file beside an unrecognised file describes it.
     """
     line = public_key_from_private(path)
     result = fingerprint_line(line) if line else None
@@ -1161,8 +1302,9 @@ def fingerprint_private_key(path: Path) -> tuple[tuple[str, int, str, str] | Non
         # public half in the clear, so either that half is missing or it is
         # there and unreadable -- a corrupt file either way, not merely an old
         # format. And a file whose format could not be established at all (it
-        # could not be read, it is empty, or its first line is not a
-        # private-key header) says nothing about which key it holds. In both
+        # could not be read, it is bigger than this tool reads, it is empty, or
+        # its first line is not a private-key header) says nothing about which
+        # key it holds. In both
         # cases the `.pub` file next to it could describe any other key.
         return None, None
 
@@ -1228,10 +1370,16 @@ def private_key_is_encrypted(path: Path) -> bool | None:
     file holding any other byte is reported as unrecognised rather than having
     that byte dropped -- dropping it could make a corrupt body decode as a
     clean one, answering this question from bytes that are not in the file.
+    A file bigger than this tool reads (see _read_private_key_bytes) is
+    unrecognised as well -- not because ssh would refuse it, which it would
+    not, but because this tool never looked at it.
     """
     try:
-        text = path.read_bytes().decode("ascii")
+        raw = _read_private_key_bytes(path)
+        text = raw.decode("ascii") if raw is not None else None
     except (OSError, UnicodeDecodeError):
+        return None
+    if text is None:
         return None
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines:
@@ -1291,12 +1439,31 @@ def looks_like_private_key(path: Path) -> bool:
 def _is_bare_key_line(stripped: str) -> bool:
     """True when an authorized_keys line starts with a key rather than with options.
 
-    This is the same test sshd makes before it goes looking for options: the
-    second field has to be base64 whose first item (a 4-byte length, then that
-    many bytes) spells out the same type name as the first field. Every OpenSSH
-    public key -- plain, certificate, security-key, and whatever is added next
-    -- is built that way, so key types this tool has never heard of are still
-    recognised, which a list of known type names could not do.
+    This is the front of sshd's own test: the second field has to be base64
+    whose first item (a 4-byte length, then that many bytes) spells out the
+    same type name as the first field. sshd's sshkey_read() (sshkey.c) goes on
+    to require a type name it knows and a blob it can build a key from, and it
+    splits fields on a space or a tab where this splits on any whitespace at
+    all (see below), so a yes here is "this looks like a key line", not "sshd
+    will read a key from it". Every
+    OpenSSH public key -- plain, certificate, security-key, and whatever is
+    added next -- is built that way, so key types this tool has never heard of
+    are still recognised, which a list of known type names could not do.
+
+    The fields are split with str.split(), on any run of what Python counts as
+    whitespace, which is wider than sshd's own reader in both directions. A
+    space or a tab between the type name and the blob is fine for both
+    (verified against OpenSSH 10.2, whose `ssh-keygen -l` runs the same reader
+    sshd does and fingerprints a tab-separated line). Everything else Python
+    counts as whitespace -- a non-breaking space, a vertical tab, a form feed,
+    U+2028 -- sshd does not, and str.split() drops a run of it from the front
+    of the line as well. So a line led by a non-breaking space gets a yes here,
+    when the field where sshd looks for a type name in fact begins with that
+    non-breaking space and sshd reads no key from the line at all. This
+    function is not the check that catches that line: `ssh-keygen -l` is, since
+    it is handed the line with the non-breaking space still on the front and
+    turns it down with "is not a public key file", so the caller reports it as
+    an entry sshd ignores. Both gates have to be in place for that answer.
     """
     fields = stripped.split(None, 2)
     if len(fields) < 2:
@@ -1320,8 +1487,14 @@ def split_options(line: str) -> tuple[list[str], str]:
     escaped quotes (e.g. command="foo,bar"). Inside a quoted value only \\" is
     an escape, the same rule _dequote_value() applies when it reads the value
     itself. A line whose second field is a key blob naming the same type as its
-    first field has no options -- the same test sshd applies before it looks
-    for options, so key types this tool has never seen still parse.
+    first field has no options -- the front of the test sshd applies before it
+    looks for options (see _is_bare_key_line for where the two part company),
+    so key types this tool has never seen still parse.
+
+    Spaces and tabs at the front of the line, and between the options and the
+    key, are skipped, because those are the ones sshd skips. Nothing else is:
+    the line is otherwise taken exactly as it was given, trailing whitespace
+    and all.
 
     An empty option (an empty string between two commas, or before the first
     comma) is dropped from the returned list rather than kept. sshd's option
@@ -1340,7 +1513,16 @@ def split_options(line: str) -> tuple[list[str], str]:
     no key material after the options, so it is already reported as
     malformed before options are even checked.
     """
-    stripped = line.strip()
+    # Only spaces and tabs are skipped, at the front of the line and between
+    # the options and the key: those are the two characters sshd's own loop
+    # skips (auth2-pubkeyfile.c skips them at the start of the line,
+    # sshkey_advance_past_options() ends the options at one of them, and
+    # skip_space() steps over the rest). str.strip() would also eat a
+    # non-breaking space, which sshd leaves in place as part of the text it
+    # then fails to read a key from -- so stripping one here would report a
+    # key on a line sshd throws away. The end of the line is the caller's to
+    # deal with; audit_authorized_keys() has already taken the line ending off.
+    stripped = line.lstrip(" \t")
     if _is_bare_key_line(stripped):
         return [], stripped
 
@@ -1371,7 +1553,7 @@ def split_options(line: str) -> tuple[list[str], str]:
             current = []
         elif ch in " \t":
             options.append("".join(current))
-            return [o for o in options if o], stripped[i:].strip()
+            return [o for o in options if o], stripped[i:].lstrip(" \t")
         else:
             current.append(ch)
         i += 1
@@ -2004,6 +2186,49 @@ def _bad_options_issue(line_number: int, reason: str) -> Issue:
     return Issue("LOW", f"line {line_number}: bad key options ({reason}); sshd rejects the whole line")
 
 
+def _too_long_line_issue(line_number: int) -> Issue:
+    """The finding for a line this tool would not read because it is longer than the limit.
+
+    sshd has no such limit and reads the line, so this says what the audit did
+    not do rather than what sshd does. See MAX_AUTHORIZED_KEYS_LINE for why the
+    limit is there at all.
+    """
+    return Issue(
+        "LOW",
+        f"line {line_number}: longer than {MAX_AUTHORIZED_KEYS_LINE} characters, so it was not read; "
+        "sshd has no such limit and does read it, so this line may hold a key that works",
+    )
+
+
+def _read_authorized_keys_line(handle: TextIO) -> tuple[str, bool] | None:
+    """Read one line of an authorized_keys file, keeping at most MAX_AUTHORIZED_KEYS_LINE of it.
+
+    Returns None at the end of the file; (line, False) for a line that fitted,
+    with its line ending still on it; and ("", True) for a line longer than the
+    limit, whose characters are thrown away rather than kept, so that reading
+    it costs no more memory than reading any other line.
+
+    After an over-long line the file is wound on to the start of the next one,
+    a bounded piece at a time. That keeps the rest of the file audited, and
+    keeps the line numbers reported for it the ones the operator's editor
+    shows: an over-long line is one line here as it is there.
+
+    Raises OSError, which the caller reports as a read that failed partway
+    through the file.
+    """
+    raw = handle.readline(MAX_AUTHORIZED_KEYS_LINE + 1)
+    if not raw:
+        return None
+    if raw.endswith("\n") or len(raw) <= MAX_AUTHORIZED_KEYS_LINE:
+        # One character over the limit was asked for, so a line of exactly the
+        # limit -- with or without its newline -- is still read whole.
+        return raw, False
+    while True:
+        chunk = handle.readline(MAX_AUTHORIZED_KEYS_LINE)
+        if not chunk or chunk.endswith("\n"):
+            return "", True
+
+
 def audit_authorized_keys(
     config: dict[str, list[str]],
     min_rsa_bits: int,
@@ -2161,7 +2386,28 @@ def audit_authorized_keys(
                 # rather than left to the locale: what this file holds is a
                 # property of the file, so the audit must not change with the
                 # LANG the operator happens to be running under.
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                #
+                # The file is read a line at a time, and each line is read
+                # no further than MAX_AUTHORIZED_KEYS_LINE: an authorized_keys
+                # file is as large as the account that owns it cares to make
+                # it, in as few lines as it likes, and pulling any of that into
+                # memory whole would end the audit with a MemoryError, which is
+                # not an OSError and so is caught nowhere. A line at a time on
+                # its own bounds nothing, because one line can be the whole
+                # file.
+                #
+                # newline="\n" is what makes the split the same one sshd
+                # makes. sshd reads the file with getline(), which ends a line
+                # at a newline and at nothing else. Neither of Python's own
+                # ways of splitting lines does that: reading a file in its
+                # default mode also ends a line at a bare carriage return, and
+                # str.splitlines() -- which is how this file used to be read --
+                # ends one at a vertical tab, a form feed, a file separator or
+                # a U+2028 as well. Any of those in a key comment, which the
+                # account owning the file chooses, would shift every line
+                # number printed below away from the one the operator's editor
+                # shows, and invent lines that sshd never reads.
+                handle = path.open(encoding="utf-8", errors="replace", newline="\n")
             except OSError as exc:
                 file_finding.issues.append(Issue("LOW", f"could not read file: {exc}"))
                 files.append(file_finding)
@@ -2172,91 +2418,213 @@ def audit_authorized_keys(
             # in for it: that counts certificate lines too, and a certificate
             # in an authorized_keys file grants nobody anything.
             active_keys = 0
-            for idx, raw in enumerate(lines, start=1):
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                options, key_material = split_options(line)
-                if not key_material and options:
-                    # split_options reads to the end of the line while a quote
-                    # is still open, so a line such as `command="x ssh-ed25519
-                    # AAAA...` leaves nothing behind that could be a key. sshd
-                    # turns that line down over its options, not its key
-                    # material, so report what sshd would actually complain
-                    # about rather than calling the line unparseable.
+            idx = 0
+            # Set when the file could not be read from end to end, either way
+            # that can happen: a read that failed partway, or a close that
+            # failed after it. Either leaves part of the file unaudited, so the
+            # unchanged-for check below is skipped, the same as for a file that
+            # could not be opened at all.
+            read_failed = False
+            try:
+                while True:
+                    try:
+                        line_read = _read_authorized_keys_line(handle)
+                    except OSError as exc:
+                        # The read failed partway through the file (a failing
+                        # disk, a network filesystem going away). Everything
+                        # read up to here has already been reported; the rest
+                        # of the file cannot be.
+                        file_finding.issues.append(Issue("LOW", f"could not read file: {exc}"))
+                        read_failed = True
+                        break
+                    if line_read is None:
+                        break
+                    raw, too_long = line_read
+                    idx += 1
+                    if too_long:
+                        # The line was wound past rather than read, so nothing
+                        # can be said about a key on it. sshd does read it, so
+                        # this is a hole in the audit and is reported as one.
+                        file_finding.issues.append(_too_long_line_issue(idx))
+                        continue
+                    # Take off the newline, and the carriage return in front of
+                    # it in a file with CRLF line endings. sshd keeps that
+                    # carriage return -- its getline() stops at the newline --
+                    # but it changes nothing sshd acts on. On a line that ends
+                    # in a comment the carriage return lands inside that
+                    # comment, which sshd only ever copies. On a line with no
+                    # comment it lands inside the base64 blob itself, because
+                    # sshkey_read() (sshkey.c) ends the blob at the first space
+                    # or tab (strcspn(cp, " \t")) and a carriage return is
+                    # neither -- and the blob still decodes, because b64_pton()
+                    # skips whitespace wherever it appears. Verified against
+                    # OpenSSH 10.2: `ssh-keygen -lf` fingerprints a
+                    # comment-less key line with a carriage return on the end.
+                    # Dropping it keeps a file edited on Windows reading like
+                    # any other: comments print without a stray escaped control
+                    # character on the end, and a line holding nothing else
+                    # reads as blank rather than as a broken entry. (A kept
+                    # carriage return makes such a line one character long, so
+                    # it would be reported as bad key options -- an unknown
+                    # option whose name is a control character -- which is
+                    # nobody's idea of a useful finding.)
+                    line = raw[:-1] if raw.endswith("\n") else raw
+                    if line.endswith("\r"):
+                        line = line[:-1]
+                    # sshd skips spaces and tabs at the start of a line and
+                    # nothing else (auth2-pubkeyfile.c). str.strip() also eats
+                    # a non-breaking space and everything else Unicode counts
+                    # as whitespace, which would turn a line sshd throws away
+                    # into a key counted here.
+                    line = line.lstrip(" \t")
+                    if not line or line.startswith("#"):
+                        continue
+                    options, key_material = split_options(line)
+                    if not key_material and options:
+                        # split_options reads to the end of the line while a quote
+                        # is still open, so a line such as `command="x ssh-ed25519
+                        # AAAA...` leaves nothing behind that could be a key. sshd
+                        # turns that line down over its options, not its key
+                        # material: sshkey_advance_past_options() (authfile.c)
+                        # returns -1 for an unterminated quote and nothing else,
+                        # and that is "invalid key option string" before sshd
+                        # looks for a key at all. So report what sshd would
+                        # actually complain about rather than calling the line
+                        # unparseable.
+                        #
+                        # A line that is one unknown word (`garbage`) leaves no
+                        # key material either, and sshd is silent about that
+                        # one: advance_past_options() succeeds, the second
+                        # sshkey_read() fails, and the line is ignored without
+                        # its options being parsed. This tool names the unknown
+                        # option anyway, which is more use to whoever has to
+                        # fix the file; both answers say the line grants
+                        # nothing. docs/findings.md records the difference.
+                        option_problem = check_options(options)
+                        if option_problem is not None:
+                            file_finding.issues.append(_bad_options_issue(idx, option_problem))
+                            continue
+                    if not _is_bare_key_line(key_material):
+                        # sshd reads the key with sshkey_read() (sshkey.c) at
+                        # exactly this offset -- auth_check_authkey_line() in
+                        # auth2-pubkeyfile.c calls it there -- and ignores the
+                        # whole line when that fails, so the key material is
+                        # held to the same test before it is fingerprinted. A
+                        # line that left no key material behind at all fails it
+                        # too. _is_bare_key_line is that test only up to the
+                        # whitespace it splits on: a line led by a non-breaking
+                        # space still answers yes to it, and is turned down
+                        # instead by `ssh-keygen -lf -` below, which is handed
+                        # the line with that character still on the front.
+                        # `ssh-keygen -l` is more forgiving than sshd here: it
+                        # accepts known_hosts syntax as well, so it prints a
+                        # fingerprint for anything that begins with a host name
+                        # or a host pattern -- text that authorises nobody.
+                        # (A line that begins with @cert-authority or @revoked
+                        # it does turn down, but by then this tool has taken
+                        # the marker off as an option and is offering it the
+                        # host pattern and key that followed, which it accepts.
+                        # Verified against OpenSSH 10.2: `ssh-keygen -lf -`
+                        # refuses `@cert-authority *.example.com <key>` and
+                        # fingerprints `*.example.com <key>`.) Counting one
+                        # would put a key in the report that grants no access,
+                        # and enter it in the comparison for keys reused across
+                        # accounts. Verified against OpenSSH 10.2 with a live
+                        # login: `no-pty somehost <key>` is refused, and sshd
+                        # says nothing about the options, because it never gets
+                        # as far as parsing them. A line whose key is a
+                        # certificate still passes: a certificate blob names
+                        # its own type in its first field, exactly as a plain
+                        # key does.
+                        result = None
+                    elif key_material in fingerprints:
+                        result = fingerprints[key_material]
+                    else:
+                        result = fingerprint_line(key_material)
+                        fingerprints[key_material] = result
+                    if result is None:
+                        file_finding.issues.append(Issue("LOW", f"line {idx}: unparseable entry (ignored by sshd)"))
+                        continue
+                    key_type, bits, fingerprint, comment = result
+                    # sshd throws the whole line away when the options do not
+                    # parse, so a line with a typo'd option name authorises
+                    # nobody. Counting it, or letting its key take part in the
+                    # reuse checks, would claim access that does not exist.
                     option_problem = check_options(options)
                     if option_problem is not None:
                         file_finding.issues.append(_bad_options_issue(idx, option_problem))
                         continue
-                if not key_material:
-                    result = None
-                elif key_material in fingerprints:
-                    result = fingerprints[key_material]
-                else:
-                    result = fingerprint_line(key_material)
-                    fingerprints[key_material] = result
-                if result is None:
-                    file_finding.issues.append(Issue("LOW", f"line {idx}: unparseable entry (ignored by sshd)"))
-                    continue
-                key_type, bits, fingerprint, comment = result
-                # sshd throws the whole line away when the options do not
-                # parse, so a line with a typo'd option name authorises
-                # nobody. Counting it, or letting its key take part in the
-                # reuse checks, would claim access that does not exist.
-                option_problem = check_options(options)
-                if option_problem is not None:
-                    file_finding.issues.append(_bad_options_issue(idx, option_problem))
-                    continue
-                file_finding.key_count += 1
+                    file_finding.key_count += 1
 
-                finding = AuthorizedKeyFinding(
-                    user=user.pw_name,
-                    file_path=str(path),
-                    line_number=idx,
-                    key_type=key_type,
-                    bits=bits,
-                    fingerprint=fingerprint,
-                    comment=comment,
-                    options=options,
-                    file_last_modified=modified,
-                )
-                if _is_certificate(key_type):
-                    # auth_check_authkey_line() (auth2-pubkeyfile.c) matches a plain
-                    # presented key only against the line itself, and a presented
-                    # certificate only against a cert-authority line holding the
-                    # CA's plain key. A line whose own blob is a certificate --
-                    # what ssh-keygen -l labels "<TYPE>-CERT" -- matches neither, so
-                    # it never grants access; grading its size/algorithm or its
-                    # options would wrongly imply it does something.
-                    finding.issues.append(
-                        Issue(
-                            "INFO",
-                            "certificate listed in authorized_keys; sshd never matches a certificate here, "
-                            "so this line grants no access",
-                        )
+                    finding = AuthorizedKeyFinding(
+                        user=user.pw_name,
+                        file_path=str(path),
+                        line_number=idx,
+                        key_type=key_type,
+                        bits=bits,
+                        fingerprint=fingerprint,
+                        comment=comment,
+                        options=options,
+                        file_last_modified=modified,
                     )
-                else:
-                    active_keys += 1
-                    finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
-                    finding.issues.extend(grade_options(options, user))
-                    # Only plain keys go into the reuse maps. ssh-keygen -l
-                    # reports a certificate under the fingerprint of the key
-                    # inside it, so a certificate line here would look like
-                    # that key authorised for this account as well -- and it
-                    # authorises nothing at all.
-                    fp_locations[fingerprint].append(f"{user.pw_name} {path}:{idx}")
-                    fp_users[fingerprint].add(user.pw_name)
-                keys.append(finding)
+                    if _is_certificate(key_type):
+                        # auth_check_authkey_line() (auth2-pubkeyfile.c) matches a plain
+                        # presented key only against the line itself, and a presented
+                        # certificate only against a cert-authority line holding the
+                        # CA's plain key. A line whose own blob is a certificate --
+                        # what ssh-keygen -l labels "<TYPE>-CERT" -- matches neither, so
+                        # it never grants access; grading its size/algorithm or its
+                        # options would wrongly imply it does something.
+                        finding.issues.append(
+                            Issue(
+                                "INFO",
+                                "certificate listed in authorized_keys; sshd never matches a certificate here, "
+                                "so this line grants no access",
+                            )
+                        )
+                    else:
+                        active_keys += 1
+                        finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
+                        finding.issues.extend(grade_options(options, user))
+                        # Only plain keys go into the reuse maps. ssh-keygen -l
+                        # reports a certificate under the fingerprint of the key
+                        # inside it, so a certificate line here would look like
+                        # that key authorised for this account as well -- and it
+                        # authorises nothing at all.
+                        fp_locations[fingerprint].append(f"{user.pw_name} {path}:{idx}")
+                        fp_users[fingerprint].add(user.pw_name)
+                    keys.append(finding)
+            finally:
+                try:
+                    handle.close()
+                except OSError as exc:
+                    # Reading this file can report failure in two ways -- the
+                    # read raising, and the close raising afterwards on the
+                    # same failing filesystem -- and both get the same answer:
+                    # a file-level finding and a file left out of the
+                    # unchanged-for check, rather than an exception escaping
+                    # into audit_authorized_keys' caller and ending the audit
+                    # for every account after this one.
+                    file_finding.issues.append(Issue("LOW", f"could not close file: {exc}"))
+                    read_failed = True
 
             # The opt-in --authorized-keys-unchanged-for tripwire. Only a file
             # that still authorises somebody is worth reporting as stale, so
             # this needs the line loop to have run: a file with no working key
             # in it, and a file whose contents could not be read at all (which
             # returned above), say nothing about how old anyone's access is.
+            # Nor does a file the tool started reading and could not finish:
+            # the keys it did read say nothing about the ones it did not, so a
+            # partial read is passed over the same way an unreadable file is.
             # "Working" means a key line sshd would parse; whether a line's
             # expiry-time= has passed is not evaluated here, the same as in
             # every other check in this tool.
-            if unchanged_for_days is not None and active_keys and _unchanged_for(st.st_mtime, now, unchanged_for_days):
+            if (
+                unchanged_for_days is not None
+                and active_keys
+                and not read_failed
+                and _unchanged_for(st.st_mtime, now, unchanged_for_days)
+            ):
                 file_finding.issues.append(
                     Issue(
                         "LOW",

@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Any, TextIO
 
 import pytest
 
@@ -69,10 +70,16 @@ def _age(path: Path, days: float) -> Path:
 
 
 def _write_ak(user: pwd.struct_passwd, lines: list[str], mode: int = 0o600) -> Path:
+    """Write an authorized_keys file for a fake account, one line per entry.
+
+    The encoding is named rather than left to the locale, so a line holding a
+    character outside ASCII lands in the file as the same bytes whatever LANG
+    the suite happens to run under.
+    """
     ssh_dir = Path(user.pw_dir) / ".ssh"
     ssh_dir.mkdir(mode=0o700, exist_ok=True)
     ak = ssh_dir / "authorized_keys"
-    ak.write_text("\n".join(lines) + "\n")
+    ak.write_text("\n".join(lines) + "\n", encoding="utf-8")
     ak.chmod(mode)
     return ak
 
@@ -473,6 +480,68 @@ def test_fingerprint_line_with_options(keys: dict[str, Path]):
 
 def test_fingerprint_line_garbage_is_none():
     assert audit.fingerprint_line("ssh-rsa notreallyakey garbage@x") is None
+
+
+@pytest.mark.parametrize("comment", ["j\u00fcrgen@host", "\ufffd@host"])
+def test_fingerprint_line_survives_a_non_ascii_comment_under_an_ascii_locale(
+    keys: dict[str, Path], tmp_path: Path, comment: str
+):
+    """A key comment that the operator's locale cannot encode must not end the audit.
+
+    The line is handed to `ssh-keygen -lf -` as the input of a subprocess. In
+    text mode that input is encoded with the locale's codec, and there is no
+    way to say what should happen to a character it cannot express, so under
+    an ASCII locale a comment holding a
+    name spelled in Latin-1 raised UnicodeEncodeError -- and so did a comment
+    holding the U+FFFD this tool itself writes in place of a byte that did not
+    decode when it read the file. Nothing on that path catches it, so one such
+    byte in one unprivileged account's authorized_keys ended the whole root
+    audit. Both comments are tried here for that reason.
+
+    The ASCII locale has to be set for the interpreter itself, which only
+    happens at start-up, so this runs in a child process: `env -i` with
+    `LC_ALL=C`, plus Python's UTF-8 mode and its PEP 538 C locale coercion both
+    switched off. That is not an exotic configuration -- coercion has nothing
+    to coerce to on a host with no C.UTF-8 locale, which covers glibc before
+    2.27 (RHEL and CentOS 7) and the musl images this tool gets copied onto.
+    """
+    script = tmp_path / "fingerprint_one_line.py"
+    script.write_text(
+        "import codecs, locale, sys\n"
+        "from audit_ssh_keys import audit\n"
+        "print(codecs.lookup(locale.getpreferredencoding(False)).name)\n"
+        "line = open(sys.argv[1], encoding='utf-8').read().rstrip('\\n')\n"
+        "result = audit.fingerprint_line(line)\n"
+        "print(result[0] if result is not None else 'no result')\n"
+    )
+    line_file = tmp_path / "key_line"
+    line_file.write_text(f"{pub(keys['ed25519']).rsplit(' ', 1)[0]} {comment}\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(script), str(line_file)],
+        # env -i: nothing but the PATH ssh-keygen is found on and the three
+        # variables that pin the child's locale.
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": str(Path(audit.__file__).parents[1]),
+            "LC_ALL": "C",
+            "PYTHONUTF8": "0",
+            "PYTHONCOERCECLOCALE": "0",
+        },
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    # Two words: the child's locale codec, then the key type it read. Anything
+    # else -- "no result", say -- should read as a failed assertion here and
+    # not as an unpacking error further down.
+    assert len(proc.stdout.split()) == 2, proc.stdout
+    child_encoding, key_type = proc.stdout.split()
+    # Without this the test would pass without ever exercising the bug.
+    assert child_encoding == "ascii", f"the child interpreter's locale codec is {child_encoding}, not ASCII"
+    assert key_type == "ED25519"
 
 
 def test_fingerprint_file_pub_and_private_match(keys: dict[str, Path]):
@@ -1315,6 +1384,29 @@ def test_no_ed25519_note_when_a_host_key_could_not_be_fingerprinted(keys: dict[s
     assert [f.path for f in findings] == [str(rsa), str(unreadable)]
     assert not any("Ed25519" in i.message for f in findings for i in f.issues)
     assert [i.message for i in findings[1].issues] == ["could not fingerprint host key"]
+
+
+def test_an_oversized_host_key_file_is_reported_as_one_that_could_not_be_fingerprinted(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """A host key file over this tool's own size limit gets the same finding as an unreadable one.
+
+    The limit is this tool's, not ssh's: sshd loads a host key file of this
+    size perfectly well (see MAX_PRIVATE_KEY_FILE_SIZE), so the finding says
+    that the audit could not fingerprint the key and nothing about what sshd
+    can do with it. As with any file whose format could not be established,
+    the `.pub` file beside it gets no say -- here it deliberately holds a
+    different key -- because nothing says that file describes this one.
+    """
+    key = tmp_path / "ssh_host_ed25519_key"
+    key.write_bytes(keys["ed25519"].read_bytes().ljust(audit.MAX_PRIVATE_KEY_FILE_SIZE + 1, b"\n"))
+    key.chmod(0o600)
+    audit.pub_sibling(key).write_text(pub(keys["rsa2048"]) + "\n")  # a valid, but unrelated, key
+
+    findings = audit.audit_host_keys({"hostkey": [str(key)]}, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    assert [(f.path, f.key_type, f.fingerprint) for f in findings] == [(str(key), "?", "")]
+    assert [(i.severity, i.message) for i in findings[0].issues] == [("LOW", "could not fingerprint host key")]
 
 
 # --- audit_host_keys ----------------------------------------------------------
@@ -2654,6 +2746,474 @@ def test_unparseable_key_material_with_bad_options_reports_only_the_unparseable_
     assert _by_sev(files[0].issues)["LOW"] == ["line 1: unparseable entry (ignored by sshd)"]
 
 
+@pytest.mark.parametrize(
+    "prefix", ["somehost", "@cert-authority", "@revoked", "*.example.com", "192.0.2.1,host.example"]
+)
+def test_authorized_keys_known_hosts_syntax_after_the_options_is_not_a_working_key(
+    keys: dict[str, Path], tmp_path: Path, prefix: str
+):
+    """sshd reads the key at exactly this offset, and `ssh-keygen -l` is more forgiving than it is.
+
+    After the options, sshd calls sshkey_read() (auth2-pubkeyfile.c) and
+    ignores the line when it fails -- and it fails on every shape of
+    known_hosts line, because the field where the key type belongs holds a host
+    name, a host pattern, or a marker instead. `ssh-keygen -lf -` accepts
+    known_hosts lines as well as authorized_keys lines, so it printed a
+    fingerprint for each of these, and the line was reported as a key granting
+    access that it grants to nobody -- and entered in the comparison for keys
+    reused across accounts, which is the negative half checked here through
+    bob, who really is authorised for this key.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    for u in (alice, bob):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    # A valid option in front, so that the line is turned down over the key
+    # material rather than over an option sshd does not know.
+    _write_ak(alice, [f"no-pty {prefix} {pub(keys['ed25519'])}"])
+    _write_ak(bob, [pub(keys["ed25519"])])
+
+    _, files, found, dupes, _ = audit.audit_authorized_keys({}, 3072, users=[alice, bob])
+
+    by_user = {f.user: f for f in files}
+    assert by_user["alice"].key_count == 0
+    assert _by_sev(by_user["alice"].issues)["LOW"] == ["line 1: unparseable entry (ignored by sshd)"]
+    assert [f.user for f in found] == ["bob"]
+    assert dupes == {}
+    assert found[0].issues == []
+
+
+def test_authorized_keys_certificate_line_still_parses_with_and_without_options(tmp_path: Path):
+    """A certificate line has to keep working now that key material is held to sshd's own test.
+
+    That test asks whether the second field is a key blob naming the type in
+    the first field, which a certificate satisfies exactly as a plain key does:
+    its blob names its own certificate type. Both shapes of line are checked,
+    because the test is applied to what is left after any options.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _, cert_line = _ed25519_certificate(tmp_path, "still-parses", "alice")
+    assert audit._is_bare_key_line(cert_line) is True
+    _write_ak(alice, [cert_line, f"no-pty {cert_line}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].issues == []
+    assert files[0].key_count == 2
+    assert [f.line_number for f in found] == [1, 2]
+    assert {f.key_type for f in found} == {"ED25519-CERT"}
+    assert [i.severity for f in found for i in f.issues] == ["INFO", "INFO"]
+
+
+@pytest.mark.parametrize(
+    ("name", "character"),
+    [
+        ("vertical tab", "\v"),
+        ("form feed", "\f"),
+        ("file separator", "\x1c"),
+        ("next line", "\x85"),
+        ("line separator", "\u2028"),
+    ],
+)
+def test_authorized_keys_line_numbers_survive_a_character_sshd_does_not_break_lines_on(
+    keys: dict[str, Path], tmp_path: Path, name: str, character: str
+):
+    """sshd's getline() ends a line at a newline and nothing else, so neither may this tool.
+
+    Python's line splitting breaks on every one of them, so a single one in a
+    key comment -- which the account owning the file chooses -- used to split
+    that line in two: every line number after it was reported one too high,
+    pointing the operator at the wrong line to delete, and the tail end of the
+    comment was reported as an entry of its own that sshd never sees.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    key_line = f"{pub(keys['ed25519']).rsplit(' ', 1)[0]} co{character}mment"
+    _write_ak(alice, [key_line, "ssh-rsa notreallyakey garbage@x"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 1
+    assert [f.line_number for f in found] == [1]
+    assert _by_sev(files[0].issues)["LOW"] == ["line 2: unparseable entry (ignored by sshd)"]
+
+
+def test_authorized_keys_line_starting_with_a_non_breaking_space_is_not_a_key(keys: dict[str, Path], tmp_path: Path):
+    """sshd skips a space and a tab at the start of a line, and nothing else.
+
+    A non-breaking space is left where it is, so it becomes part of the field
+    where the key type belongs and sshd reads no key from the line at all.
+    str.strip() removed it, which turned a line sshd throws away into a key the
+    report counted and graded.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f"\u00a0{pub(keys['ed25519'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert found == []
+    assert files[0].key_count == 0
+    assert _by_sev(files[0].issues)["LOW"] == ["line 1: unparseable entry (ignored by sshd)"]
+
+
+class _FailsAfterTheFirstLine:
+    """A file object that hands over line 1, then reports an I/O error on the next read."""
+
+    def __init__(self, wrapped: TextIO) -> None:
+        self._wrapped = wrapped
+        self._lines_read = 0
+
+    def readline(self, size: int = -1) -> str:
+        self._lines_read += 1
+        if self._lines_read > 1:
+            raise OSError("Input/output error")
+        return self._wrapped.readline(size)
+
+    def close(self) -> None:
+        self._wrapped.close()
+
+
+class _FailsOnClose:
+    """A file object that reads to the end normally and then reports an I/O error when it is closed."""
+
+    def __init__(self, wrapped: TextIO) -> None:
+        self._wrapped = wrapped
+
+    def readline(self, size: int = -1) -> str:
+        return self._wrapped.readline(size)
+
+    def close(self) -> None:
+        self._wrapped.close()
+        raise OSError("Input/output error")
+
+
+def _patch_open(monkeypatch: pytest.MonkeyPatch, target: Path, stand_in: Callable[[TextIO], Any]) -> None:
+    """Make Path.open hand back `stand_in(real handle)` for one file, and the real handle for all others."""
+    real_open = Path.open
+
+    def fake_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(self, *args, **kwargs)
+        return stand_in(handle) if self == target else handle
+
+    monkeypatch.setattr(Path, "open", fake_open)
+
+
+@pytest.mark.parametrize("indent", [" ", "\t", "  \t "])
+def test_authorized_keys_line_indented_with_spaces_or_tabs_is_still_a_key(
+    keys: dict[str, Path], tmp_path: Path, indent: str
+):
+    """The other half of the claim in the test above: sshd does skip a space and a tab.
+
+    auth_check_authkeys_file() (auth2-pubkeyfile.c) calls skip_space()
+    (misc.c), which steps over exactly ' ' and '\t' and stops at anything
+    else, before it reads the key. So an indented key line authorises its
+    account and this tool has to count it, however many of those two
+    characters are in front of it -- while the non-breaking space in the test
+    above is left where it is. Both shapes of line are indented here, because
+    a line with options and a line without take different paths through
+    split_options.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f"{indent}{pub(keys['ed25519'])}", f"{indent}no-pty {pub(keys['rsa4096'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].issues == []
+    assert files[0].key_count == 2
+    assert [(f.line_number, f.key_type) for f in found] == [(1, "ED25519"), (2, "RSA")]
+    assert found[1].options == ["no-pty"]
+
+
+@pytest.mark.parametrize("marker", ["@cert-authority", "@revoked"])
+def test_authorized_keys_marker_before_a_host_pattern_is_an_unparseable_entry(
+    keys: dict[str, Path], tmp_path: Path, marker: str
+):
+    """These lines changed which finding they get, and the new one is what sshd's own control flow implies.
+
+    `@cert-authority *.example.com <key>`, and the same with known_hosts'
+    other marker, used to be reported as bad key options -- `unknown key
+    option "@cert-authority"` -- because the options were checked as soon as
+    `ssh-keygen -l` had fingerprinted what came after the marker, which it
+    does, since it accepts known_hosts syntax. sshd never reaches its option
+    parser for such a line: auth_check_authkey_line() (auth2-pubkeyfile.c)
+    does `goto out` when the second sshkey_read() fails, without calling
+    sshauthopt_parse() at all. So the honest report is that sshd read no key
+    from the line, and that is what an operator now sees.
+
+    The same marker with no host pattern after it -- `@cert-authority <key>`
+    -- still reads as an option in front of a real key, and is still reported
+    as a bad option; docs/findings.md says which shapes go where.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f"{marker} *.example.com {pub(keys['ed25519'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert found == []
+    assert files[0].key_count == 0
+    assert _by_sev(files[0].issues)["LOW"] == ["line 1: unparseable entry (ignored by sshd)"]
+
+
+@pytest.mark.parametrize("marker", ["@cert-authority", "@revoked"])
+def test_authorized_keys_marker_with_no_host_pattern_is_a_bad_option(
+    keys: dict[str, Path], tmp_path: Path, marker: str
+):
+    """The other half: with no host pattern behind it, the marker is an option in front of a real key.
+
+    sshd reads the key fine at that offset and then turns the line down over
+    the option, which is not one it knows, so the bad-options finding is the
+    right one here and the row in docs/findings.md says so.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _write_ak(alice, [f"{marker} {pub(keys['ed25519'])}"])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert found == []
+    assert files[0].key_count == 0
+    assert _by_sev(files[0].issues)["LOW"] == [
+        f'line 1: bad key options (unknown key option "{marker}"); sshd rejects the whole line'
+    ]
+
+
+def test_authorized_keys_read_that_fails_partway_keeps_what_was_read(
+    keys: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A file read a line at a time can fail after the first line, and the lines already read still count.
+
+    Reading the file whole meant one failure or none; now that it is read a
+    line at a time -- so that a huge file cannot exhaust memory -- a failing
+    disk or a network filesystem going away partway through leaves the keys
+    read up to that point reported, with the read failure alongside them.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"]), pub(keys["rsa4096"])])
+    _patch_open(monkeypatch, ak, _FailsAfterTheFirstLine)
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 1
+    assert [f.line_number for f in found] == [1]
+    assert _by_sev(files[0].issues)["LOW"] == ["could not read file: Input/output error"]
+
+
+def test_authorized_keys_close_that_fails_is_reported_and_does_not_end_the_audit(
+    keys: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Reading a file can report failure two ways, and closing it is the second one.
+
+    A read that fails partway raises OSError from the read, which is caught;
+    closing the file afterwards can raise OSError too, on the same failing
+    disk or network filesystem. That one escaped audit_authorized_keys and
+    ended the run for every account after this one. It gets the same answer as
+    the first: a file-level finding, and the audit carries on to bob.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    bob = make_user("bob", USER_UID, tmp_path / "home" / "bob")
+    for u in (alice, bob):
+        mkdir_clean(Path(u.pw_dir), tmp_path)
+    ak = _write_ak(alice, [pub(keys["ed25519"])])
+    _write_ak(bob, [pub(keys["rsa4096"])])
+    _patch_open(monkeypatch, ak, _FailsOnClose)
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice, bob])
+
+    by_user = {f.user: f for f in files}
+    assert _by_sev(by_user["alice"].issues)["LOW"] == ["could not close file: Input/output error"]
+    # Every line was read before the close failed, so the key on it still counts.
+    assert by_user["alice"].key_count == 1
+    # The account after alice was still audited, which is the whole point.
+    assert by_user["bob"].issues == []
+    assert [f.user for f in found] == ["alice", "bob"]
+
+
+@pytest.mark.parametrize(
+    ("stand_in", "expected"),
+    [
+        (_FailsAfterTheFirstLine, "could not read file: Input/output error"),
+        (_FailsOnClose, "could not close file: Input/output error"),
+    ],
+)
+def test_a_file_the_audit_could_not_read_to_the_end_is_not_reported_as_unchanged_for(
+    keys: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stand_in: Callable[[TextIO], Any],
+    expected: str,
+):
+    """`not modified in N days` is for files the audit read, and a partial read is not one.
+
+    The docs say a file the tool could not read is passed over, because the
+    finding asks the operator to review every key in the file and the tool
+    could not list them. A read that failed after the first line still counted
+    that line, so the file picked the finding up anyway; so did a close that
+    failed after every line was read. Both are now passed over, whichever way
+    the failure was reported.
+
+    The negative half is the same file read with nothing patched, which must
+    still get the finding -- otherwise this test would pass against a version
+    that never reports it at all.
+    """
+    alice = _account_with_authorized_keys(tmp_path, [pub(keys["ed25519"]), pub(keys["rsa4096"])], days_old=400)
+    ak = Path(alice.pw_dir) / ".ssh" / "authorized_keys"
+    assert [i.message for i in _one_file_finding(alice, unchanged_for_days=30).issues] == [
+        "not modified in 30 days; review whether every key in it should still have access"
+    ]
+
+    _patch_open(monkeypatch, ak, stand_in)
+
+    messages = [i.message for i in _one_file_finding(alice, unchanged_for_days=30).issues]
+    assert messages == [expected]
+
+
+def test_authorized_keys_with_crlf_line_endings_reads_like_any_other_file(keys: dict[str, Path], tmp_path: Path):
+    """The carriage return of a CRLF file is dropped, so such a file reports exactly what sshd does with it.
+
+    sshd keeps that carriage return -- its getline() stops at the newline --
+    but it never reaches anything sshd acts on. On a line with a comment it
+    lands inside the comment; on a line without one it lands inside the base64
+    blob, which still decodes, because b64_pton() skips whitespace wherever it
+    appears. Keeping it here would print an escaped control character at the
+    end of every comment and turn every blank line in the file into a
+    one-character line reported as bad key options.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ssh_dir = Path(alice.pw_dir) / ".ssh"
+    ssh_dir.mkdir(mode=0o700)
+    ak = ssh_dir / "authorized_keys"
+    ak.write_bytes(f"# managed by hand\r\n\r\n{pub(keys['ed25519'])}\r\n".encode())
+    ak.chmod(0o600)
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].issues == []
+    assert files[0].key_count == 1
+    assert [(f.line_number, f.comment) for f in found] == [(3, "ed@test")]
+
+
+def test_authorized_keys_line_longer_than_the_limit_is_reported_and_the_rest_is_still_audited(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """Reading a line at a time bounds nothing on its own, because one line can be the whole file.
+
+    sshd applies no per-line limit -- auth_check_authkeys_file()
+    (auth2-pubkeyfile.c) reads the file with `getline()`, which grows its
+    buffer to whatever the line needs -- so this limit is a deliberate
+    divergence, for the reason set out on MAX_AUTHORIZED_KEYS_LINE. The line
+    is reported rather than passed over in silence, because sshd does read it
+    and may well authorise a key on it; and the file is wound on to the next
+    line, so the keys after it are still audited, under the line numbers the
+    operator's editor shows.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    over = "ssh-ed25519 " + "A" * (audit.MAX_AUTHORIZED_KEYS_LINE + 1 - len("ssh-ed25519 "))
+    assert len(over) == audit.MAX_AUTHORIZED_KEYS_LINE + 1
+    _write_ak(alice, [pub(keys["ed25519"]), over, pub(keys["rsa4096"])])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].key_count == 2
+    # Line 3 is still line 3: the over-long line counts as the one line it is.
+    assert [f.line_number for f in found] == [1, 3]
+    assert _by_sev(files[0].issues)["LOW"] == [
+        f"line 2: longer than {audit.MAX_AUTHORIZED_KEYS_LINE} characters, so it was not read; "
+        "sshd has no such limit and does read it, so this line may hold a key that works"
+    ]
+
+
+def test_authorized_keys_line_of_exactly_the_limit_is_read_as_an_ordinary_key(keys: dict[str, Path], tmp_path: Path):
+    """The limit is the longest line still read, not the shortest one refused.
+
+    One character more is the test above; this is the clean case, and it must
+    leave no finding on the file at all. A real key line is padded out to the
+    limit exactly with a long comment.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    base = f"{pub(keys['ed25519']).rsplit(' ', 1)[0]} "
+    comment = "c" * (audit.MAX_AUTHORIZED_KEYS_LINE - len(base))
+    at_the_limit = base + comment
+    assert len(at_the_limit) == audit.MAX_AUTHORIZED_KEYS_LINE
+    _write_ak(alice, [at_the_limit, pub(keys["rsa4096"])])
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].issues == []
+    assert files[0].key_count == 2
+    assert [f.line_number for f in found] == [1, 2]
+    assert found[0].comment == comment
+
+
+def test_a_huge_one_line_authorized_keys_file_is_reported_not_read(tmp_path: Path):
+    """Any account can end the root audit with a file that costs it a handful of disk blocks.
+
+    `printf 'ssh-ed25519 AAAA' > ~/.ssh/authorized_keys; truncate -s 3G
+    ~/.ssh/authorized_keys` leaves a file with no newline anywhere in it, so
+    the whole three gigabytes is a single line. Reading the file a line at a
+    time does not help: that bounds memory by the longest line, and here the
+    longest line is the file. MemoryError is not an OSError, so nothing caught
+    it and the audit of every remaining account died with it.
+
+    The audit runs in a child process with a one-gigabyte cap on its address
+    space, so the outcome is decided by the code rather than by how much
+    memory the machine running the tests happens to have.
+    """
+    # Probe for sparse-file support on a throwaway file first. On a filesystem
+    # without it, truncate() writes the bytes out, and finding that out with
+    # the 3 GiB file would mean writing 3 GiB before deciding to skip.
+    probe = tmp_path / "sparse_probe"
+    probe.write_bytes(b"x")
+    os.truncate(probe, 8 * 1024**2)
+    if probe.stat().st_blocks * 512 > 1024**2:
+        pytest.skip("this filesystem gave the sparse file real blocks, so the test would write 3 GiB")
+    probe.unlink()
+
+    home = tmp_path / "home"
+    ssh_dir = mkdir_clean(home / ".ssh", tmp_path, mode=0o700)
+    ak = ssh_dir / "authorized_keys"
+    ak.write_bytes(b"ssh-ed25519 AAAA")
+    os.truncate(ak, 3 * 1024**3)
+    ak.chmod(0o600)
+
+    script = tmp_path / "audit_one_authorized_keys.py"
+    script.write_text(
+        "import json, os, pwd, resource, sys\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (1024**3, 1024**3))\n"
+        "from audit_ssh_keys import audit\n"
+        "user = pwd.struct_passwd(('tester', 'x', os.getuid(), os.getgid(), '', sys.argv[1], '/bin/sh'))\n"
+        "_, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[user])\n"
+        "print(json.dumps({'keys': len(found),\n"
+        "                  'issues': [[i.severity, i.message] for f in files for i in f.issues]}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, str(script), str(home)],
+        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(Path(audit.__file__).parents[1])},
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "keys": 0,
+        "issues": [
+            [
+                "LOW",
+                f"line 1: longer than {audit.MAX_AUTHORIZED_KEYS_LINE} characters, so it was not read; "
+                "sshd has no such limit and does read it, so this line may hold a key that works",
+            ]
+        ],
+    }
+
+
 def _rewrite_ak_key_line(ak: Path, blob_byte: bytes = b"", comment: bytes = b"") -> None:
     """Rewrite the single key line in an authorized_keys file, splicing raw bytes into it.
 
@@ -3143,7 +3703,102 @@ def test_authorized_keys_empty_file_still_reports_file_issues(tmp_path: Path):
     assert any(i.severity == "HIGH" and str(ak) in i.message for i in files[0].issues)
 
 
+def test_read_private_key_bytes_stops_at_this_tools_own_size_limit(tmp_path: Path):
+    """MAX_PRIVATE_KEY_FILE_SIZE is the largest file still read whole, not the smallest one refused.
+
+    The limit is this tool's own and not ssh's: ssh reads a key file up to
+    SSHBUF_SIZE_MAX (sshbuf.h), 128 MiB, and has done since OpenSSH 8.2.
+    """
+    at_the_limit = tmp_path / "at_the_limit"
+    at_the_limit.write_bytes(b"x" * audit.MAX_PRIVATE_KEY_FILE_SIZE)
+    one_byte_over = tmp_path / "one_byte_over"
+    one_byte_over.write_bytes(b"x" * (audit.MAX_PRIVATE_KEY_FILE_SIZE + 1))
+
+    assert audit._read_private_key_bytes(at_the_limit) == b"x" * audit.MAX_PRIVATE_KEY_FILE_SIZE
+    assert audit._read_private_key_bytes(one_byte_over) is None
+
+
+def test_an_oversized_key_file_answers_nothing_about_the_key(tmp_path: Path):
+    """The cheap header check still says "private key", so every reader behind it has to hold the limit itself.
+
+    Each of these took the whole file before, which is what a sparse file in
+    somebody's ~/.ssh turned into a MemoryError.
+    """
+    over = tmp_path / "id_over"
+    over.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + b"A" * audit.MAX_PRIVATE_KEY_FILE_SIZE)
+
+    assert audit.looks_like_private_key(over) is True
+    assert audit._private_key_format(over) is None
+    assert audit.private_key_is_encrypted(over) is None
+    assert audit.public_key_from_private(over) is None
+
+
 # --- audit_private_keys --------------------------------------------------------
+
+
+def test_a_huge_sparse_key_file_in_a_home_is_reported_not_read(tmp_path: Path):
+    """Any account can end the audit with a file that costs it nothing.
+
+    `printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\\n' > f; truncate -s 3G f`
+    in its own ~/.ssh leaves a file that passes the 64-byte header check and
+    then goes to three gigabytes while occupying one disk block. Every reader
+    behind that check took the whole file, and MemoryError is not an OSError,
+    so nothing caught it: one unprivileged account could stop the root audit.
+    Stopping at MAX_PRIVATE_KEY_FILE_SIZE instead reports a key the audit
+    could not fingerprint and could not tell the passphrase state of. ssh
+    itself would load a file this size, so the finding says what this tool did
+    not do, not what ssh cannot do.
+
+    The audit runs in a child process with a one-gigabyte cap on its address
+    space, so the outcome is decided by the code rather than by how much memory
+    the machine running the tests happens to have.
+    """
+    # Probe for sparse-file support on a throwaway file first. On a filesystem
+    # without it, truncate() writes the bytes out, and finding that out with
+    # the 3 GiB file would mean writing 3 GiB before deciding to skip.
+    probe = tmp_path / "sparse_probe"
+    probe.write_bytes(b"x")
+    os.truncate(probe, 8 * 1024**2)
+    if probe.stat().st_blocks * 512 > 1024**2:
+        pytest.skip("this filesystem gave the sparse file real blocks, so the test would write 3 GiB")
+    probe.unlink()
+
+    home = tmp_path / "home"
+    ssh_dir = mkdir_clean(home / ".ssh", tmp_path, mode=0o700)
+    huge = ssh_dir / "id_huge"
+    huge.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    os.truncate(huge, 3 * 1024**3)
+    huge.chmod(0o600)
+
+    script = tmp_path / "audit_one_home.py"
+    script.write_text(
+        "import json, os, pwd, resource, sys\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (1024**3, 1024**3))\n"
+        "from audit_ssh_keys import audit\n"
+        "user = pwd.struct_passwd(('tester', 'x', os.getuid(), os.getgid(), '', sys.argv[1], '/bin/sh'))\n"
+        "found = audit.audit_private_keys(3072, host_key_paths=set(), users=[user])\n"
+        "print(json.dumps([{'type': f.key_type, 'encrypted': f.encrypted,\n"
+        "                   'issues': [i.message for i in f.issues]} for f in found]))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, str(script), str(home)],
+        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(Path(audit.__file__).parents[1])},
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        {
+            "type": "?",
+            "encrypted": None,
+            "issues": [
+                "could not fingerprint private key; algorithm and size were not checked",
+                "could not determine whether the key is passphrase-protected",
+            ],
+        }
+    ]
 
 
 def test_private_keys_end_to_end(keys: dict[str, Path], tmp_path: Path):

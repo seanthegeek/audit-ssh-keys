@@ -55,6 +55,111 @@ def test_no_sshd_binary_reports_missing(tmp_path: Path):
     assert err == "sshd binary not found"
 
 
+def _fake_sshd_printing_raw_bytes(tmp_path: Path, name: str, stdout: str = "", stderr: str = "", rc: int = 0) -> str:
+    """A fake sshd whose output holds a byte that is not valid UTF-8.
+
+    The text is handed to `printf` as its format string, so a `\\344` in it
+    reaches the pipe as that one raw byte -- the way sshd prints a config value
+    that holds a byte from some other encoding, since it copies the file's
+    bytes rather than transcoding them.
+    """
+    script = tmp_path / name
+    script.write_text(f"#!/bin/sh\nprintf '{stdout}'\nprintf '{stderr}' >&2\nexit {rc}\n")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    return str(script)
+
+
+def test_sshd_t_output_holding_a_byte_that_is_not_utf8_is_read_not_a_crash(tmp_path: Path):
+    """A config value can hold a byte that is not valid UTF-8, and sshd -T prints it as it stands.
+
+    Decoding that output strictly raised UnicodeDecodeError, which is not an
+    OSError and so escaped the guard around the call: the audit ended before it
+    could even fall back to parsing the config file, whose own parser replaces
+    such a byte rather than choking on it.
+    """
+    sshd = _fake_sshd_printing_raw_bytes(
+        tmp_path,
+        "sshd_raw",
+        stdout="banner /etc/ssh/b\\344nner\\nauthorizedkeysfile .ssh/authorized_keys\\n",
+    )
+    config, source, err = audit.read_effective_sshd_config(sshd_bin=sshd)
+
+    assert source == "sshd -T"
+    assert err == ""
+    assert config["banner"] == ["/etc/ssh/b\ufffdnner"]
+    assert config["authorizedkeysfile"] == [".ssh/authorized_keys"]
+
+
+def test_sshd_t_stderr_holding_a_byte_that_is_not_utf8_still_reaches_the_coverage_warning(tmp_path: Path):
+    """The stderr of a failed sshd -T is quoted into a finding, so it has to survive the same byte."""
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("AuthorizedKeysFile /custom/%u\n")
+    sshd = _fake_sshd_printing_raw_bytes(
+        tmp_path, "sshd_raw_err", stderr="Unable to load host key: /etc/ssh/b\\344d\\n", rc=255
+    )
+    config, source, err = audit.read_effective_sshd_config(sshd_bin=sshd, config_paths=[cfg])
+
+    assert source.startswith("parsed sshd_config")
+    assert err == "Unable to load host key: /etc/ssh/b\ufffdd"
+    assert config["authorizedkeysfile"] == ["/custom/%u"]
+
+
+def test_read_user_sshd_config_reads_output_holding_a_byte_that_is_not_utf8(tmp_path: Path):
+    """The per-account run decodes the same way; strict decoding ended the audit instead of returning None."""
+    sshd = _fake_sshd_printing_raw_bytes(
+        tmp_path, "sshd_raw_user", stdout="banner /etc/ssh/b\\344nner\\nauthorizedkeysfile /custom/keys\\n"
+    )
+    assert audit.read_user_sshd_config("bob", sshd) == {
+        "banner": ["/etc/ssh/b\ufffdnner"],
+        "authorizedkeysfile": ["/custom/keys"],
+    }
+
+
+def test_sshd_t_value_holding_a_line_separator_is_read_as_one_line(tmp_path: Path):
+    """`sshd -T` prints each value as the bytes the config file holds, so a value can hold a line break.
+
+    Python's own line splitting breaks on a vertical tab, a form feed, U+2028
+    and more, none of which end a line for sshd, whose getline() ends one at a
+    newline and at nothing else. A Banner path holding a U+2028 therefore read
+    as two lines, and the tail of it became a keyword line in its own right --
+    here it would have set this host's AuthorizedKeysFile to /evil/%u. Only
+    root writes sshd_config, so this is a consistency fix rather than a way
+    in: it is the same split _parse_sshd_config_file makes, and the two
+    parsers have to agree about what a line is.
+    """
+    sshd = _fake_sshd_printing_raw_bytes(
+        tmp_path,
+        "sshd_line_separator",
+        # \342\200\250 is U+2028 in UTF-8, and %%u reaches printf as a literal %u.
+        stdout="banner /etc/ssh/b\\342\\200\\250authorizedkeysfile /evil/%%u\\nauthorizedkeysfile .ssh/ok\\n",
+    )
+    config, source, err = audit.read_effective_sshd_config(sshd_bin=sshd)
+
+    assert source == "sshd -T"
+    assert err == ""
+    assert config["banner"] == ["/etc/ssh/b\u2028authorizedkeysfile /evil/%u"]
+    assert config["authorizedkeysfile"] == [".ssh/ok"]
+
+
+def test_config_file_value_holding_a_line_separator_is_read_as_one_line(tmp_path: Path):
+    """The fallback parser splits the file the same way, and for the same reason.
+
+    sshd reads sshd_config with getline() too (load_server_config() in
+    servconf.c), so one of these characters inside a value does not start a
+    new directive. Splitting on them let the tail of a Banner path set
+    AuthorizedKeysFile, which -- because the first value seen for a keyword
+    wins -- displaced the real setting further down the file.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("Banner /etc/ssh/b\u2028AuthorizedKeysFile /evil/%u\nAuthorizedKeysFile .ssh/ok\n", encoding="utf-8")
+
+    config, source, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert source.startswith("parsed sshd_config")
+    assert config["banner"] == ["/etc/ssh/b\u2028AuthorizedKeysFile /evil/%u"]
+    assert config["authorizedkeysfile"] == [".ssh/ok"]
+
+
 def _fake_sshd_with_match(tmp_path: Path) -> str:
     """A fake sshd whose -T output depends on `-C user=`, the way a Match User block would."""
     script = tmp_path / "sshd_match"
