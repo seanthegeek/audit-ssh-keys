@@ -105,10 +105,17 @@ That registration names no environment, so the release job must not declare one
 — PyPI rejects the token if the two disagree.
 
 The upload runs before the GitHub release is created, because PyPI never
-accepts the same version twice. If the upload fails, nothing was uploaded: fix
-the cause and re-run the failed job from the Actions tab, leaving the tag where
-it is. If the upload succeeded and a later step failed, PyPI already has the
-files and only the GitHub release still needs creating, by hand as above.
+accepts the same version twice, and a GitHub release can be made by hand while
+an upload cannot.
+
+If the upload fails, fix the cause and re-run the failed job from the Actions
+tab, leaving the tag where it is. The wheel and the sdist go up as two separate
+files, so a failure part way through can leave one of them on PyPI; the step
+runs with `skip-existing`, so the re-run uploads whichever file is still
+missing instead of stopping at the one already there. Check the project's
+release page on PyPI afterwards to confirm both files are present. If the
+upload succeeded and a later step failed, PyPI already has the files and only
+the GitHub release still needs creating, by hand as above.
 
 There is no manual upload path — that is why the by-hand steps above stop at
 the GitHub release. A release whose files have to change gets a new version

@@ -160,6 +160,156 @@ def test_config_file_value_holding_a_line_separator_is_read_as_one_line(tmp_path
     assert config["authorizedkeysfile"] == [".ssh/ok"]
 
 
+def test_config_file_value_holding_a_carriage_return_is_read_as_one_line(tmp_path: Path):
+    """A bare carriage return inside a value does not start a new directive either.
+
+    Splitting the text on newlines is only half of it: Python's default text
+    mode turns a lone carriage return, and a carriage return followed by a
+    newline, into a newline as the file is read, so the split saw two lines
+    where the file holds one. sshd reads the file with getline(), which ends a
+    line at a newline and at nothing else, and its argv_split() (misc.c) then
+    ends an argument at a space or a tab and at nothing else, so the carriage
+    return stays inside the value. Verified against OpenSSH_10.2p1, whose
+    `sshd -T` prints this file's Banner with the carriage return still in it,
+    and its AuthorizedKeysFile as `.ssh/ok`.
+
+    The keyword injected here is the one that decides which files this tool
+    scans, and because the first value seen for a keyword wins, it displaced
+    the real setting further down the file.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_bytes(b"Banner /etc/ssh/b\rAuthorizedKeysFile=/evil/%u\nAuthorizedKeysFile .ssh/ok\n")
+
+    config, source, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert source.startswith("parsed sshd_config")
+    assert config["banner"] == ["/etc/ssh/b\rAuthorizedKeysFile=/evil/%u"]
+    assert config["authorizedkeysfile"] == [".ssh/ok"]
+
+
+@pytest.mark.parametrize(
+    ("name", "character"),
+    [("non-breaking space", "\u00a0"), ("line separator", "\u2028")],
+)
+def test_fallback_parser_keeps_trailing_whitespace_that_sshd_keeps(tmp_path: Path, name: str, character: str):
+    r"""sshd trims " \t\r\n" and a form feed off the end of a line, and nothing else.
+
+    That is the "Strip trailing whitespace" loop at the top of
+    process_server_config_line_depth() (servconf.c). str.strip() trims
+    everything Unicode counts as whitespace, which is a good deal more.
+    Verified against OpenSSH_10.2p1: an AuthorizedKeysFile ending in a
+    non-breaking space is printed by `sshd -T` with that space still on the
+    end, so it names a file whose name ends in one, and this parser has to
+    read the same value.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f"AuthorizedKeysFile /custom/%u{character}\n", encoding="utf-8")
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert config["authorizedkeysfile"] == [f"/custom/%u{character}"]
+
+
+def test_fallback_parser_skips_only_the_leading_whitespace_sshd_skips(tmp_path: Path):
+    r"""sshd steps over a run of " \t\r" at the front of a line, and over nothing else.
+
+    load_server_config() (servconf.c) does that with
+    `cp = line + strspn(line, " \t\r")`. A non-breaking space is not in that
+    set, so it stays where it is and becomes the first character of the
+    keyword: OpenSSH_10.2p1 refuses this file with `Bad configuration option:
+    \302\240AuthorizedKeysFile`. str.strip() took that space off and read the
+    line as an AuthorizedKeysFile setting -- and, because the first value seen
+    for a keyword wins, that setting displaced the real one.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("\u00a0AuthorizedKeysFile /evil/%u\n \t\rAuthorizedKeysFile .ssh/ok\n", encoding="utf-8")
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    # The second line proves the other half of the claim: the three characters
+    # sshd does skip are still skipped, so that line is read as a setting.
+    assert config["authorizedkeysfile"] == [".ssh/ok"]
+
+
+def test_fallback_parser_does_not_take_a_non_breaking_space_for_a_keyword_separator(tmp_path: Path):
+    r"""A keyword ends at sshd's own whitespace or an '=', not at everything Python calls whitespace.
+
+    strdelim_internal() (misc.c) ends the keyword at one of WHITESPACE
+    " \t\r\n", a quote, or an '='. A non-breaking space is none of those, so
+    the keyword runs on through it and sshd refuses the line --
+    `no argument after keyword "AuthorizedKeysFile\302\240/evil/%u"` against
+    OpenSSH_10.2p1. The regular expression that finds the separator here used
+    Python's \s, which does match a non-breaking space, so this tool honoured
+    a setting sshd will not even start with.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("AuthorizedKeysFile\u00a0/evil/%u\nAuthorizedKeysFile .ssh/ok\n", encoding="utf-8")
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert config["authorizedkeysfile"] == [".ssh/ok"]
+
+
+def test_fallback_parser_keeps_whitespace_sshd_keeps_at_the_front_of_a_value(tmp_path: Path):
+    r"""Only sshd's own whitespace is skipped between a keyword and its value.
+
+    strdelim_internal() (misc.c) skips a run of WHITESPACE " \t\r\n" after the
+    keyword, and argv_split() (misc.c) then ends an argument at a space or a
+    tab, so a non-breaking space in front of the value is part of the value.
+    str.lstrip() with no argument took it off, naming a different file from
+    the one sshd opens.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("AuthorizedKeysFile \u00a0/custom/%u\n", encoding="utf-8")
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert config["authorizedkeysfile"] == ["\u00a0/custom/%u"]
+
+
+def test_sshd_t_value_keeps_the_whitespace_sshd_printed(tmp_path: Path):
+    r"""`sshd -T` prints the value it stored, so nothing may be trimmed off either end of it.
+
+    sshd prints one space between the keyword and the value (`printf("%s
+    %s\n", ...)` in the dump_cfg_* helpers in servconf.c) and then the value as
+    it stands. A quoted value in sshd_config can start or end with whitespace
+    that sshd keeps: verified against OpenSSH_10.2p1, for an
+    AuthorizedKeysFile whose quoted value is a space, `.ssh/ak`, and a tab,
+    `sshd -T` prints the keyword, the one separating space, and then that
+    value with both the space and the tab still on it -- so sshd goes looking
+    for a file whose name begins with a space and ends with a tab. Splitting
+    on any run of whitespace swallowed the leading space, and str.strip() the
+    trailing tab, so this tool went looking for a different file from the one
+    sshd reads.
+    """
+    sshd = _fake_sshd_printing_raw_bytes(tmp_path, "sshd_padded_value", stdout="authorizedkeysfile  .ssh/ak\\t\\n")
+
+    config, source, err = audit.read_effective_sshd_config(sshd_bin=sshd)
+
+    assert source == "sshd -T"
+    assert err == ""
+    assert config["authorizedkeysfile"] == [" .ssh/ak\t"]
+
+
+def test_sshd_t_line_with_no_value_after_the_keyword_is_skipped(tmp_path: Path):
+    """A line that is a keyword and nothing else names no value, so it is not recorded.
+
+    Every keyword `sshd -T` prints comes with a value, so this is about what
+    the parser does with a line it should never see rather than about sshd.
+    Recording an empty value would be worse than dropping the line: a caller
+    asking for hostkeyagent, say, would be handed "" and read it as an agent
+    that is configured.
+    """
+    sshd = _fake_sshd_printing_raw_bytes(
+        tmp_path, "sshd_bare_keyword", stdout="hostkeyagent\\nhostkeyagent \\nauthorizedkeysfile .ssh/ak\\n"
+    )
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin=sshd)
+
+    assert "hostkeyagent" not in config
+    assert config["authorizedkeysfile"] == [".ssh/ak"]
+
+
 def _fake_sshd_with_match(tmp_path: Path) -> str:
     """A fake sshd whose -T output depends on `-C user=`, the way a Match User block would."""
     script = tmp_path / "sshd_match"

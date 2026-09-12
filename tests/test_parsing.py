@@ -26,22 +26,40 @@ def _blob(type_name: str) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        f"ssh-ed25519 {_blob('ssh-ed25519')} comment",
-        f"ssh-rsa {_blob('ssh-rsa')}",
-        f"ecdsa-sha2-nistp256 {_blob('ecdsa-sha2-nistp256')} c",
-        f"sk-ssh-ed25519@openssh.com {_blob('sk-ssh-ed25519@openssh.com')} c",
-        f"ssh-rsa-cert-v01@openssh.com {_blob('ssh-rsa-cert-v01@openssh.com')} c",
-        # Added in OpenSSH 10.4 (July 2026); never in any prefix list this
-        # tool had, so it proves the structural check.
-        f"ssh-mldsa44-ed25519@openssh.com {_blob('ssh-mldsa44-ed25519@openssh.com')} c",
-        f"ssh-mldsa44-ed25519-cert-v01@openssh.com {_blob('ssh-mldsa44-ed25519-cert-v01@openssh.com')} c",
-    ],
-)
+# Every shape of line that really does start with a key. _is_bare_key_line is
+# asserted over this list twice: directly, and through split_options, which
+# reaches it by way of its own option parsing. The other half of that
+# function's claim -- the shapes it has to say no to -- is
+# test_is_bare_key_line_rejects_known_hosts_syntax, which has a list of its own.
+_BARE_KEY_LINES = [
+    f"ssh-ed25519 {_blob('ssh-ed25519')} comment",
+    f"ssh-rsa {_blob('ssh-rsa')}",
+    f"ecdsa-sha2-nistp256 {_blob('ecdsa-sha2-nistp256')} c",
+    f"sk-ssh-ed25519@openssh.com {_blob('sk-ssh-ed25519@openssh.com')} c",
+    f"ssh-rsa-cert-v01@openssh.com {_blob('ssh-rsa-cert-v01@openssh.com')} c",
+    # Added in OpenSSH 10.4 (July 2026); never in any prefix list this
+    # tool had, so it proves the structural check.
+    f"ssh-mldsa44-ed25519@openssh.com {_blob('ssh-mldsa44-ed25519@openssh.com')} c",
+    f"ssh-mldsa44-ed25519-cert-v01@openssh.com {_blob('ssh-mldsa44-ed25519-cert-v01@openssh.com')} c",
+]
+
+
+@pytest.mark.parametrize("line", _BARE_KEY_LINES)
 def test_split_options_bare_key_has_no_options(line: str):
     assert audit.split_options(line) == ([], line)
+
+
+@pytest.mark.parametrize("line", _BARE_KEY_LINES)
+def test_is_bare_key_line_accepts_every_shape_of_real_key_line(line: str):
+    """The positive half of the check, asserted on the function itself.
+
+    test_split_options_bare_key_has_no_options covers the same lines, but only
+    through split_options, which reaches this function by way of its own
+    option parsing. The negative half,
+    test_is_bare_key_line_rejects_known_hosts_syntax, calls the function
+    directly, so the positive half does too.
+    """
+    assert audit._is_bare_key_line(line) is True
 
 
 @pytest.mark.parametrize("gap", ["  ", "\t", " \t ", "\t\t"])
@@ -89,9 +107,9 @@ def test_split_options_leaves_the_end_of_the_line_alone():
 def test_is_bare_key_line_rejects_known_hosts_syntax(line: str):
     """A known_hosts line has a host where the key type belongs, so sshd reads no key from it.
 
-    The positive half -- every shape of real key line answering True -- is the
-    parametrized test above, which asserts that each of those lines is read as
-    having no options at all.
+    The positive half -- every shape of real key line answering True -- is
+    test_is_bare_key_line_accepts_every_shape_of_real_key_line, which runs the
+    same assertion over _BARE_KEY_LINES.
     """
     assert audit._is_bare_key_line(line) is False
 

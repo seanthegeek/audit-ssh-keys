@@ -172,6 +172,41 @@ MAX_PRIVATE_KEY_FILE_SIZE = 1024 * 1024
 # order too. 64 KiB leaves room for any of them several times over.
 MAX_AUTHORIZED_KEYS_LINE = 64 * 1024
 
+# The characters sshd counts as whitespace when it reads sshd_config, which
+# are not the ones Python counts: str.strip(), str.lstrip() and the regular
+# expression \s all take off a non-breaking space, a U+2028, and the rest of
+# what Unicode calls whitespace, none of which is whitespace to sshd. It keeps
+# every one of them -- verified against OpenSSH_10.2p1, whose `sshd -T` prints
+# an AuthorizedKeysFile ending in a non-breaking space with that space still
+# on the end, and which refuses a line whose keyword and value are separated
+# by one ("no argument after keyword").
+#
+# SSHD_CONFIG_WHITESPACE is sshd's own WHITESPACE (misc.c and servconf.c both
+# define it): the run strdelim() skips on either side of the keyword. The two
+# ends of the line are trimmed with sets of their own, and those two are not
+# the same set. The front is trimmed in load_server_config() (servconf.c),
+# which steps over a run of " \t\r" (`cp = line + strspn(line, " \t\r")`)
+# before the line is stored -- no newline, because the line still ends in one
+# at that point and it is deliberately kept, so that error messages can count
+# lines. The back is trimmed later, in the "Strip trailing whitespace" loop at
+# the top of process_server_config_line_depth(), which walks back over
+# WHITESPACE plus a form feed. That trailing set is what takes the carriage
+# return off the end of a line in a file with CRLF line endings.
+SSHD_CONFIG_WHITESPACE = " \t\r\n"
+SSHD_CONFIG_LEADING_WHITESPACE = " \t\r"
+SSHD_CONFIG_TRAILING_WHITESPACE = SSHD_CONFIG_WHITESPACE + "\f"
+
+# The keyword at the front of a config line, and the character that ends it,
+# as strdelim_internal() (misc.c) finds them: the keyword runs up to one of
+# sshd's own whitespace characters or an '=', and which of the two ended it is
+# kept as a group of its own, because the caller has to tell those apart. The
+# class holds the characters of SSHD_CONFIG_WHITESPACE just above, spelled out
+# rather than written as \s, which would also match a non-breaking space:
+# sshd does not, so a keyword and a value with one between them are a single
+# keyword to it, and it refuses the config over the line ("no argument after
+# keyword", OpenSSH_10.2p1).
+_SSHD_CONFIG_KEYWORD_RE = re.compile(r"([^ \t\r\n=]*)([ \t\r\n]+|=)(.*)")
+
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
 
@@ -578,7 +613,16 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
         # The encoding is named rather than left to the locale: what this file
         # holds is a property of the file, so the audit must not change with
         # the LANG the operator happens to be running under.
-        text = path.read_text(encoding="utf-8", errors="replace")
+        #
+        # newline="\n" turns off the translation Python does by default,
+        # which is what makes the split below sshd's own. In its default text
+        # mode Python turns a lone carriage return, and the pair of a carriage
+        # return and a newline, into a single newline before any of this code
+        # sees the text, so a carriage return sitting inside a value would
+        # start a new directive here while sshd read it as one line and kept
+        # the carriage return in the value.
+        with path.open(encoding="utf-8", errors="replace", newline="\n") as handle:
+            text = handle.read()
     except OSError:
         return
 
@@ -586,16 +630,15 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
     # sshd reads this file with getline() as well (load_server_config() in
     # servconf.c), so a line ends at a newline and at nothing else; splitting
     # on everything Python calls a line break would break one config line into
-    # two. Each line then has its surrounding whitespace removed, which covers
-    # the trailing carriage return of a CRLF file. sshd drops that carriage
-    # return too, though in two steps and not where load_server_config() sits:
-    # that function only strips what is in *front* of the line
-    # (`cp = line + strspn(line, " \t\r")`), and the trailing one goes later,
-    # in the "Strip trailing whitespace" loop at the top of
-    # process_server_config_line_depth(), which walks back over
-    # WHITESPACE " \t\r\n" plus a form feed. Read against OpenSSH 10.2p1.
+    # two, and so would reading the file in Python's default text mode, which
+    # is why it was opened with newline="\n" above.
+    #
+    # Each line then has trimmed off it what sshd trims and nothing else --
+    # the two ends differ, and neither is what str.strip() takes off; see
+    # SSHD_CONFIG_LEADING_WHITESPACE. The trailing set is what takes the
+    # carriage return off the end of a line in a file with CRLF line endings.
     for raw in text.split("\n"):
-        line = raw.strip()
+        line = raw.lstrip(SSHD_CONFIG_LEADING_WHITESPACE).rstrip(SSHD_CONFIG_TRAILING_WHITESPACE)
         if not line or line.startswith("#"):
             continue
         # sshd's strdelim_internal() (misc.c) ends the keyword at the first
@@ -604,8 +647,10 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
         # So "Keyword=value", "Keyword = value" and "Keyword =value" all mean
         # the same thing, while "Keyword==value" leaves a value of "=value",
         # which sshd then refuses ("unsupported option"). Whichever character
-        # ended the keyword has to be remembered to tell those apart.
-        keyword_split = re.match(r"([^\s=]*)(\s+|=)(.*)", line)
+        # ended the keyword has to be remembered to tell those apart. The
+        # whitespace the pattern ends a keyword at is sshd's own and not
+        # Python's; see _SSHD_CONFIG_KEYWORD_RE.
+        keyword_split = _SSHD_CONFIG_KEYWORD_RE.match(line)
         if keyword_split is None:
             # Nothing separates a keyword from a value on this line, so the
             # whole line is the keyword and it has no value. sshd refuses a
@@ -621,9 +666,14 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
                 logger.debug("ignoring line with no argument in %s: %s", path, line)
             continue
         key = keyword_split.group(1).lower()
-        rest = keyword_split.group(3).lstrip()
+        # strdelim() skips a run of sshd's own whitespace after the keyword,
+        # and another after the '=' it may skip, so those are the characters
+        # taken off here as well -- str.lstrip() with no argument would take
+        # off a non-breaking space too, which sshd leaves as the first
+        # character of the value.
+        rest = keyword_split.group(3).lstrip(SSHD_CONFIG_WHITESPACE)
         if keyword_split.group(2) != "=" and rest.startswith("="):
-            rest = rest[1:].lstrip()
+            rest = rest[1:].lstrip(SSHD_CONFIG_WHITESPACE)
         if key == "match":
             # Decide this before looking at the value, because the value is not
             # used for Match and a Match line sshd would reject -- an unclosed
@@ -698,12 +748,27 @@ def _parse_sshd_t_output(stdout: str) -> dict[str, list[str]]:
     AuthorizedKeysFile. Only root writes sshd_config, so that is a consistency
     fix rather than a way in, but the two parsers have to agree about what a
     line is.
+
+    The keyword is separated from its value by the one space sshd prints
+    between them (`printf("%s %s\\n", ...)` in the dump_cfg_* helpers in
+    servconf.c), and the value is then taken exactly as printed. Nothing may
+    be trimmed off it: sshd prints the value it stored, and a quoted value in
+    sshd_config can start or end with whitespace that sshd keeps. Splitting on
+    any run of whitespace would swallow a leading space, and str.strip() a
+    trailing tab. Verified against OpenSSH_10.2p1: for an AuthorizedKeysFile
+    whose quoted value is a space, `.ssh/ak`, and a tab, `sshd -T` prints the
+    keyword, the one separating space, and then that value with both the space
+    and the tab still on it -- and sshd goes looking for a file whose name
+    begins with a space and ends with a tab.
+
+    A line with no space in it, or with nothing after the space, is skipped:
+    every keyword sshd -T prints is printed with a value.
     """
     config: dict[str, list[str]] = defaultdict(list)
     for line in stdout.split("\n"):
-        parts = line.split(None, 1)
-        if len(parts) == 2:
-            config[parts[0].lower()].append(parts[1].strip())
+        keyword, separator, value = line.partition(" ")
+        if separator and value:
+            config[keyword.lower()].append(value)
     return dict(config)
 
 
@@ -2201,7 +2266,12 @@ def _too_long_line_issue(line_number: int) -> Issue:
 
 
 def _read_authorized_keys_line(handle: TextIO) -> tuple[str, bool] | None:
-    """Read one line of an authorized_keys file, keeping at most MAX_AUTHORIZED_KEYS_LINE of it.
+    """Read one line of an authorized_keys file, and keep it only if it fits the limit.
+
+    A line fits when what sits in front of its line ending is at most
+    MAX_AUTHORIZED_KEYS_LINE characters long. The ending itself is not counted,
+    whether it is a newline, a carriage return and a newline, or the end of the
+    file with no line ending at all.
 
     Returns None at the end of the file; (line, False) for a line that fitted,
     with its line ending still on it; and ("", True) for a line longer than the
@@ -2216,12 +2286,29 @@ def _read_authorized_keys_line(handle: TextIO) -> tuple[str, bool] | None:
     Raises OSError, which the caller reports as a read that failed partway
     through the file.
     """
-    raw = handle.readline(MAX_AUTHORIZED_KEYS_LINE + 1)
+    # Two characters over the limit are asked for, which is what it takes to
+    # tell a line of exactly the limit from one character more in a file with
+    # CRLF line endings: the file is opened with newline="\n", so such a line
+    # arrives with both of its ending characters on it, and the limit counts
+    # what is in front of them.
+    raw = handle.readline(MAX_AUTHORIZED_KEYS_LINE + 2)
     if not raw:
         return None
-    if raw.endswith("\n") or len(raw) <= MAX_AUTHORIZED_KEYS_LINE:
-        # One character over the limit was asked for, so a line of exactly the
-        # limit -- with or without its newline -- is still read whole.
+    if raw.endswith("\n"):
+        # The whole line is here, line ending and all. Only what sits in front
+        # of that ending counts against the limit, and the ending is measured
+        # the way the caller strips it: the newline, and one carriage return
+        # in front of it if there is one.
+        length = len(raw) - 1
+        if raw.endswith("\r\n"):
+            length -= 1
+        if length <= MAX_AUTHORIZED_KEYS_LINE:
+            return raw, False
+        # The newline has already been read, so there is nothing to wind past.
+        return "", True
+    if len(raw) <= MAX_AUTHORIZED_KEYS_LINE:
+        # No newline and short of what was asked for, so the file ended here:
+        # a last line with no line ending on it, and one that fits.
         return raw, False
     while True:
         chunk = handle.readline(MAX_AUTHORIZED_KEYS_LINE)
@@ -2497,8 +2584,8 @@ def audit_authorized_keys(
                         # one: advance_past_options() succeeds, the second
                         # sshkey_read() fails, and the line is ignored without
                         # its options being parsed. This tool names the unknown
-                        # option anyway, which is more use to whoever has to
-                        # fix the file; both answers say the line grants
+                        # option anyway, which is more useful to whoever has
+                        # to fix the file; both answers say the line grants
                         # nothing. docs/findings.md records the difference.
                         option_problem = check_options(options)
                         if option_problem is not None:

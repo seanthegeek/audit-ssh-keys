@@ -69,17 +69,19 @@ def _age(path: Path, days: float) -> Path:
     return _set_mtime(path, NOW - days * DAY)
 
 
-def _write_ak(user: pwd.struct_passwd, lines: list[str], mode: int = 0o600) -> Path:
+def _write_ak(user: pwd.struct_passwd, lines: list[str], mode: int = 0o600, ending: str = "\n") -> Path:
     """Write an authorized_keys file for a fake account, one line per entry.
 
     The encoding is named rather than left to the locale, so a line holding a
     character outside ASCII lands in the file as the same bytes whatever LANG
-    the suite happens to run under.
+    the suite happens to run under. newline="" is named so that Python leaves
+    the line ending asked for alone rather than translating it, which is what
+    makes `ending="\r\n"` really write a file with CRLF line endings.
     """
     ssh_dir = Path(user.pw_dir) / ".ssh"
     ssh_dir.mkdir(mode=0o700, exist_ok=True)
     ak = ssh_dir / "authorized_keys"
-    ak.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    ak.write_text(ending.join(lines) + ending, encoding="utf-8", newline="")
     ak.chmod(mode)
     return ak
 
@@ -1386,17 +1388,21 @@ def test_no_ed25519_note_when_a_host_key_could_not_be_fingerprinted(keys: dict[s
     assert [i.message for i in findings[1].issues] == ["could not fingerprint host key"]
 
 
-def test_an_oversized_host_key_file_is_reported_as_one_that_could_not_be_fingerprinted(
+def test_an_oversized_private_host_key_file_is_reported_as_one_that_could_not_be_fingerprinted(
     keys: dict[str, Path], tmp_path: Path
 ):
-    """A host key file over this tool's own size limit gets the same finding as an unreadable one.
+    """A host key file holding a private key, over this tool's own size limit, is not read past it.
 
-    The limit is this tool's, not ssh's: sshd loads a host key file of this
-    size perfectly well (see MAX_PRIVATE_KEY_FILE_SIZE), so the finding says
-    that the audit could not fingerprint the key and nothing about what sshd
-    can do with it. As with any file whose format could not be established,
-    the `.pub` file beside it gets no say -- here it deliberately holds a
-    different key -- because nothing says that file describes this one.
+    The limit is on reading a private key file into memory, and it is this
+    tool's, not ssh's: sshd loads a host key file of this size perfectly well
+    (see MAX_PRIVATE_KEY_FILE_SIZE), so the finding says that the audit could
+    not fingerprint the key and nothing about what sshd can do with it. As
+    with any file whose format could not be established, the `.pub` file
+    beside it gets no say -- here it deliberately holds a different key --
+    because nothing says that file describes this one.
+
+    A HostKey naming an oversized *public* key file is the test below, and it
+    is not treated this way at all.
     """
     key = tmp_path / "ssh_host_ed25519_key"
     key.write_bytes(keys["ed25519"].read_bytes().ljust(audit.MAX_PRIVATE_KEY_FILE_SIZE + 1, b"\n"))
@@ -1407,6 +1413,39 @@ def test_an_oversized_host_key_file_is_reported_as_one_that_could_not_be_fingerp
 
     assert [(f.path, f.key_type, f.fingerprint) for f in findings] == [(str(key), "?", "")]
     assert [(i.severity, i.message) for i in findings[0].issues] == [("LOW", "could not fingerprint host key")]
+
+
+def test_an_oversized_public_host_key_file_is_still_fingerprinted(keys: dict[str, Path], tmp_path: Path):
+    """The 1 MiB limit is on reading a private key file, so it does not reach a public one.
+
+    A HostKey that names a public key file is handed straight to `ssh-keygen`,
+    which reads the file itself -- there is no bounded read in this tool to
+    apply a limit to, and adding one would turn down a file `ssh-keygen`
+    fingerprints without complaint. With a HostKeyAgent set that is a working
+    arrangement, so the key is fingerprinted and graded like any other, at any
+    size. That is what docs/how-it-works.md and the `could not fingerprint
+    host key` row of docs/findings.md now say; both used to say that any host
+    key file over 1 MiB went unfingerprinted, which was never true of this
+    shape.
+    """
+    hk = tmp_path / "ssh_host_ed25519_key.pub"
+    # Padded past the limit with the blank lines ssh-keygen ignores, so the
+    # file is over the limit while still holding exactly one readable key.
+    hk.write_bytes((pub(keys["ed25519"]) + "\n").encode().ljust(audit.MAX_PRIVATE_KEY_FILE_SIZE + 1, b"\n"))
+    assert hk.stat().st_size > audit.MAX_PRIVATE_KEY_FILE_SIZE
+
+    config = {"hostkey": [str(hk)], "hostkeyagent": ["/run/host-key-agent.sock"]}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+
+    finding = next(f for f in findings if f.path == str(hk))
+    assert (finding.key_type, finding.bits) == ("ED25519", 256)
+    assert finding.fingerprint
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        ("INFO", "public key file; the private half is held by HostKeyAgent and cannot be audited here")
+    ]
+    # Graded, so the host counts as having an Ed25519 key: no "no Ed25519 host
+    # key present" finding is added for it.
+    assert not any(f.path == "(none)" for f in findings)
 
 
 # --- audit_host_keys ----------------------------------------------------------
@@ -3072,6 +3111,29 @@ def test_a_file_the_audit_could_not_read_to_the_end_is_not_reported_as_unchanged
     assert messages == [expected]
 
 
+def test_authorized_keys_last_line_without_a_line_ending_is_still_read(keys: dict[str, Path], tmp_path: Path):
+    """A file that does not end in a newline still has its last line audited.
+
+    sshd reads that line -- getline() hands back what it found before the end
+    of the file -- and an editor leaving the final newline off is common
+    enough. The read stops for want of more file rather than at the limit, so
+    the line fits and is read whole.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ssh_dir = Path(alice.pw_dir) / ".ssh"
+    ssh_dir.mkdir(mode=0o700)
+    ak = ssh_dir / "authorized_keys"
+    ak.write_text(f"{pub(keys['ed25519'])}\n{pub(keys['rsa4096'])}", encoding="utf-8", newline="")
+    ak.chmod(0o600)
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].issues == []
+    assert files[0].key_count == 2
+    assert [f.line_number for f in found] == [1, 2]
+
+
 def test_authorized_keys_with_crlf_line_endings_reads_like_any_other_file(keys: dict[str, Path], tmp_path: Path):
     """The carriage return of a CRLF file is dropped, so such a file reports exactly what sshd does with it.
 
@@ -3098,8 +3160,9 @@ def test_authorized_keys_with_crlf_line_endings_reads_like_any_other_file(keys: 
     assert [(f.line_number, f.comment) for f in found] == [(3, "ed@test")]
 
 
+@pytest.mark.parametrize("ending", ["\n", "\r\n"], ids=["LF", "CRLF"])
 def test_authorized_keys_line_longer_than_the_limit_is_reported_and_the_rest_is_still_audited(
-    keys: dict[str, Path], tmp_path: Path
+    keys: dict[str, Path], tmp_path: Path, ending: str
 ):
     """Reading a line at a time bounds nothing on its own, because one line can be the whole file.
 
@@ -3111,12 +3174,16 @@ def test_authorized_keys_line_longer_than_the_limit_is_reported_and_the_rest_is_
     and may well authorise a key on it; and the file is wound on to the next
     line, so the keys after it are still audited, under the line numbers the
     operator's editor shows.
+
+    Both line endings are tried, because what counts against the limit is
+    what sits in front of the ending: a carriage return that is part of a
+    CRLF ending is no more part of the line than the newline is.
     """
     alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
     mkdir_clean(Path(alice.pw_dir), tmp_path)
     over = "ssh-ed25519 " + "A" * (audit.MAX_AUTHORIZED_KEYS_LINE + 1 - len("ssh-ed25519 "))
     assert len(over) == audit.MAX_AUTHORIZED_KEYS_LINE + 1
-    _write_ak(alice, [pub(keys["ed25519"]), over, pub(keys["rsa4096"])])
+    _write_ak(alice, [pub(keys["ed25519"]), over, pub(keys["rsa4096"])], ending=ending)
 
     _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
 
@@ -3129,12 +3196,21 @@ def test_authorized_keys_line_longer_than_the_limit_is_reported_and_the_rest_is_
     ]
 
 
-def test_authorized_keys_line_of_exactly_the_limit_is_read_as_an_ordinary_key(keys: dict[str, Path], tmp_path: Path):
+@pytest.mark.parametrize("ending", ["\n", "\r\n"], ids=["LF", "CRLF"])
+def test_authorized_keys_line_of_exactly_the_limit_is_read_as_an_ordinary_key(
+    keys: dict[str, Path], tmp_path: Path, ending: str
+):
     """The limit is the longest line still read, not the shortest one refused.
 
     One character more is the test above; this is the clean case, and it must
     leave no finding on the file at all. A real key line is padded out to the
     limit exactly with a long comment.
+
+    A file with CRLF line endings is the case that used to fail. The file is
+    opened with newline="\n", so such a line arrives with its carriage return
+    still on it, and reading one character past the limit could not tell that
+    carriage return from a line one character too long: a key line of exactly
+    the limit was thrown away and reported as unread.
     """
     alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
     mkdir_clean(Path(alice.pw_dir), tmp_path)
@@ -3142,7 +3218,7 @@ def test_authorized_keys_line_of_exactly_the_limit_is_read_as_an_ordinary_key(ke
     comment = "c" * (audit.MAX_AUTHORIZED_KEYS_LINE - len(base))
     at_the_limit = base + comment
     assert len(at_the_limit) == audit.MAX_AUTHORIZED_KEYS_LINE
-    _write_ak(alice, [at_the_limit, pub(keys["rsa4096"])])
+    _write_ak(alice, [at_the_limit, pub(keys["rsa4096"])], ending=ending)
 
     _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
 

@@ -58,12 +58,20 @@ jobs:
           fi
 
       # Publishing comes before the GitHub release because PyPI never accepts
-      # the same version twice: this is the one step that cannot be redone. If
-      # it fails, nothing was uploaded, so the cause can be fixed and the job
-      # re-run from the Actions tab without moving the tag. If the release were
-      # created first, that re-run would stop at `gh release create` ("already
-      # exists") and never reach the upload. Reads dist/, the action's default,
-      # which is where `python -m build` wrote the two files checked just above.
+      # the same version twice, and a GitHub release can be made by hand while
+      # an upload cannot. If the release were created first, a re-run would
+      # stop at `gh release create` ("already exists") and never reach the
+      # upload. Reads dist/, the action's default, which is where
+      # `python -m build` wrote the two files checked just above.
+      #
+      # skip-existing is on because the wheel and the sdist are uploaded as
+      # separate files: a failure part way through can leave one of them on
+      # PyPI and not the other, and without this a re-run would abort on the
+      # one already there instead of uploading the one still missing. Since
+      # PyPI is never asked to replace a file, only to accept one it does not
+      # have, the flag cannot paper over changed contents -- re-running after a
+      # fully successful upload simply uploads nothing and the job then fails
+      # at `gh release create` instead.
       #
       # No API token is stored anywhere: the project is registered on pypi.org
       # as a trusted publisher naming this repository and this workflow file,
@@ -72,6 +80,8 @@ jobs:
       # the token if the two disagree.
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          skip-existing: true
 
       - name: Create the GitHub release
         env:
