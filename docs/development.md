@@ -20,6 +20,9 @@ pytest
 
 `ruff format .` fixes formatting in place.
 
+CI runs these same four commands on every push and pull request, plus a
+Markdown lint, and runs the root-only tests under `sudo` in a separate job.
+
 ## Tests
 
 - Tests generate real keys with `ssh-keygen` into `tmp_path`; nothing key-shaped is committed. Tests that need `ssh-keygen` are skipped if it is not installed.
@@ -54,20 +57,27 @@ docs/
    git push origin vX.Y.Z
    ```
 
-4. Build the wheel and sdist:
+Pushing the tag runs the release workflow
+(`.github/workflows/release.yml`), which checks the tag against
+`__version__` and the changelog heading, runs the checks, builds the wheel
+and sdist, and creates the GitHub release titled without the `v` with both
+files attached.
 
-   ```bash
-   uvx hatch build
-   ```
+### If the workflow fails
 
-   (or `python -m build`). Both land in `dist/`.
+Do the same steps by hand. Build the wheel and sdist:
 
-5. Create the GitHub release, attaching those files:
+```bash
+uvx hatch build
+```
 
-   ```bash
-   gh release create vX.Y.Z --title X.Y.Z --generate-notes dist/*
-   ```
+(or `python -m build`). Both land in `dist/`. Then create the GitHub release,
+attaching those files:
 
-   The title has no `v` prefix, per this repo's release rules, even though the tag does.
+```bash
+gh release create vX.Y.Z --title X.Y.Z --generate-notes dist/*
+```
+
+The title has no `v` prefix, per this repo's release rules, even though the tag does.
 
 PyPI publishing is not set up yet.
