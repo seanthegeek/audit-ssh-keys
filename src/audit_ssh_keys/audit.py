@@ -22,6 +22,9 @@ Also reports when sshd sources keys from somewhere a file audit cannot see
 Usage:
     sudo audit-ssh-keys [--json] [--min-rsa-bits 3072]
                         [--skip-host] [--skip-authorized] [--skip-private]
+                        [--authorized-keys-unchanged-for DAYS]
+                        [--authorized-keys-changed-within DAYS]
+                        [--host-keys-changed-within DAYS]
 
 Run as root: other users' files are unreadable otherwise, and `sshd -T`
 (used to read the effective config) needs root.
@@ -43,6 +46,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from collections import defaultdict
 from collections.abc import Callable
@@ -280,6 +284,41 @@ def _last_modified(mtime: float) -> str | None:
         return datetime.fromtimestamp(mtime).date().isoformat()
     except (OverflowError, OSError, ValueError):
         return None
+
+
+SECONDS_PER_DAY = 86400
+
+
+def _days(count: int) -> str:
+    """A number of days as text, with the word in the right form: "1 day", "30 days"."""
+    return f"{count} day" if count == 1 else f"{count} days"
+
+
+def _changed_within(mtime: float, now: float, days: int) -> bool:
+    """True when a file was last modified no more than the given number of days ago.
+
+    A modification time in the future counts as changed within the window: its
+    age is negative, which is still less than any window, and a file dated
+    ahead of the clock has certainly been written recently. A day is taken as
+    86400 seconds, so a daylight-saving change can move the boundary by an
+    hour; the thresholds here are tripwires measured in days, so that does not
+    matter.
+
+    A modification time that is not a number is nothing stat() returns (it
+    builds st_mtime from two integers), but both this and _unchanged_for() are
+    plain comparisons, so such a value compares false rather than raising and
+    neither check fires on it.
+    """
+    return now - mtime <= days * SECONDS_PER_DAY
+
+
+def _unchanged_for(mtime: float, now: float, days: int) -> bool:
+    """True when a file has not been modified for longer than the given number of days.
+
+    The exact opposite of _changed_within() for the same number of days, apart
+    from a modification time that is not a number, which neither accepts.
+    """
+    return now - mtime > days * SECONDS_PER_DAY
 
 
 # --------------------------------------------------------------------------- #
@@ -1692,7 +1731,14 @@ def audit_server_config(
     return issues, coverage
 
 
-def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_uid: int = 0) -> list[HostKeyFinding]:
+def audit_host_keys(
+    config: dict[str, list[str]],
+    min_rsa_bits: int,
+    *,
+    owner_uid: int = 0,
+    changed_within_days: int | None = None,
+    now: float | None = None,
+) -> list[HostKeyFinding]:
     """Fingerprint and grade each configured (or default) host key.
 
     Host keys must be owned by root, so owner_uid defaults to 0. It is
@@ -1700,10 +1746,18 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
     `sshd_bin=`) so tests can run as an ordinary user and still exercise the
     ownership check without needing real root-owned files.
 
+    changed_within_days turns on the opt-in tripwire behind
+    --host-keys-changed-within: every host key file that was modified within
+    that many days gets a MEDIUM finding saying so. None (the default) leaves
+    the check off. now is the moment the ages are measured from, defaulting to
+    the current time; tests pass a fixed value.
+
     A `HostKey none` entry is not a file and is dropped before anything is
     looked up on disk (see below). When it is the only entry, the one finding
     returned says sshd has no host key at all.
     """
+    if now is None:
+        now = time.time()
     configured = config.get("hostkey") or []
     # sshd keeps "none" as a sentinel rather than as the name of a file:
     # derelativise_path() hands the literal "none" straight back instead of
@@ -1764,6 +1818,21 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
                 )
             continue
         modified = _last_modified(st.st_mtime)
+        # The opt-in --host-keys-changed-within tripwire. A host key file that
+        # has just changed is either a rotation somebody carried out or the
+        # first sign that somebody else replaced the server's identity, and
+        # the report cannot tell those apart, so it asks. Every finding built
+        # below for a file that is there carries it; entries that name no file
+        # -- a placeholder, a configured key that is missing, one that could
+        # not be stat'd -- have no modification time to compare.
+        recent_change: list[Issue] = []
+        if changed_within_days is not None and _changed_within(st.st_mtime, now, changed_within_days):
+            recent_change.append(
+                Issue(
+                    "MEDIUM",
+                    f"modified within the last {_days(changed_within_days)}; confirm this was a planned rotation",
+                )
+            )
 
         if not looks_like_private_key(path):
             public = fingerprint_file(path)
@@ -1786,22 +1855,22 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
                     # "no hostkeys available". The host offers nothing from this
                     # line, so its type is not recorded as present and its
                     # algorithm and size are not graded.
-                    findings.append(
-                        HostKeyFinding(
-                            str(path),
-                            key_type,
-                            bits,
-                            fingerprint,
-                            [
-                                Issue(
-                                    "LOW",
-                                    "HostKey names a certificate file; sshd cannot load a host key from it "
-                                    "(a certificate belongs on a HostCertificate line)",
-                                )
-                            ],
-                            last_modified=modified,
-                        )
+                    certificate = HostKeyFinding(
+                        str(path),
+                        key_type,
+                        bits,
+                        fingerprint,
+                        [
+                            Issue(
+                                "LOW",
+                                "HostKey names a certificate file; sshd cannot load a host key from it "
+                                "(a certificate belongs on a HostCertificate line)",
+                            )
+                        ],
+                        last_modified=modified,
                     )
+                    certificate.issues.extend(recent_change)
+                    findings.append(certificate)
                     continue
                 agent = cfg_value(config, "hostkeyagent", "none")
                 if agent.lower() != "none":
@@ -1822,28 +1891,29 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
                     # offer this key type, and its algorithm and size still matter.
                     types_present.add(key_type.upper())
                     finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
+                    finding.issues.extend(recent_change)
                     findings.append(finding)
                 else:
                     # No agent, so sshd has no usable key from this line at
                     # all: the type is deliberately not recorded as present,
                     # and the algorithm and size are deliberately not graded
                     # either, because sshd never offers this key to anyone.
-                    findings.append(
-                        HostKeyFinding(
-                            str(path),
-                            key_type,
-                            bits,
-                            fingerprint,
-                            [
-                                Issue(
-                                    "LOW",
-                                    "HostKey names a public key file and no HostKeyAgent is set; "
-                                    "sshd cannot load a private key from it",
-                                )
-                            ],
-                            last_modified=modified,
-                        )
+                    public_only = HostKeyFinding(
+                        str(path),
+                        key_type,
+                        bits,
+                        fingerprint,
+                        [
+                            Issue(
+                                "LOW",
+                                "HostKey names a public key file and no HostKeyAgent is set; "
+                                "sshd cannot load a private key from it",
+                            )
+                        ],
+                        last_modified=modified,
                     )
+                    public_only.issues.extend(recent_change)
+                    findings.append(public_only)
                 continue
 
         result, mismatch = fingerprint_private_key(path)
@@ -1857,6 +1927,7 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
             types_present.add(key_type.upper())
             finding = HostKeyFinding(str(path), key_type, bits, fingerprint, last_modified=modified)
             finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
+        finding.issues.extend(recent_change)
 
         # These checks apply regardless of whether the key could be fingerprinted:
         # an unreadable or corrupt key can still be world-readable, wrongly owned,
@@ -1938,6 +2009,10 @@ def audit_authorized_keys(
     min_rsa_bits: int,
     users: list[pwd.struct_passwd] | None = None,
     user_config: Callable[[pwd.struct_passwd], dict[str, list[str]] | None] | None = None,
+    *,
+    unchanged_for_days: int | None = None,
+    changed_within_days: int | None = None,
+    now: float | None = None,
 ) -> tuple[list[str], list[FileFinding], list[AuthorizedKeyFinding], dict[str, list[str]], list[str]]:
     """Scan every account's authorized_keys files per the effective AuthorizedKeysFile.
 
@@ -1949,7 +2024,17 @@ def audit_authorized_keys(
     user=<account> run could not be trusted.
 
     The returned pattern list is the global one, not any per-account override.
+
+    changed_within_days and unchanged_for_days turn on the two opt-in
+    tripwires behind --authorized-keys-changed-within and
+    --authorized-keys-unchanged-for: a file modified within that many days
+    gets a MEDIUM finding, and a file that holds at least one working key and
+    has not been modified for that many days gets a LOW one. None (the
+    default) leaves each check off. now is the moment the ages are measured
+    from, defaulting to the current time; tests pass a fixed value.
     """
+    if now is None:
+        now = time.time()
     patterns = cfg_value(config, "authorizedkeysfile", " ".join(DEFAULT_AUTHORIZED_KEYS_PATTERNS)).split()
     coverage: list[str] = []
     remaining = _without_none(patterns)
@@ -2053,6 +2138,18 @@ def audit_authorized_keys(
             modified = _last_modified(st.st_mtime)
             file_finding = FileFinding(user=user.pw_name, file_path=str(path), key_count=0, last_modified=modified)
             file_finding.issues.extend(check_strictmodes_path(path, user))
+            # The opt-in --authorized-keys-changed-within tripwire, decided
+            # from the stat alone so that a file this tool cannot read still
+            # gets it. It fires whether or not the file holds any keys: a file
+            # emptied out, or cut down to comments, is a change like any other,
+            # and the change is what the operator asked to be told about.
+            if changed_within_days is not None and _changed_within(st.st_mtime, now, changed_within_days):
+                file_finding.issues.append(
+                    Issue(
+                        "MEDIUM",
+                        f"modified within the last {_days(changed_within_days)}; confirm the change was expected",
+                    )
+                )
 
             try:
                 # A comment field can hold whatever the person who wrote it
@@ -2070,6 +2167,11 @@ def audit_authorized_keys(
                 files.append(file_finding)
                 continue
 
+            # Lines holding a key sshd would actually match, which is what
+            # the unchanged-for check below asks about. key_count cannot stand
+            # in for it: that counts certificate lines too, and a certificate
+            # in an authorized_keys file grants nobody anything.
+            active_keys = 0
             for idx, raw in enumerate(lines, start=1):
                 line = raw.strip()
                 if not line or line.startswith("#"):
@@ -2134,6 +2236,7 @@ def audit_authorized_keys(
                         )
                     )
                 else:
+                    active_keys += 1
                     finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
                     finding.issues.extend(grade_options(options, user))
                     # Only plain keys go into the reuse maps. ssh-keygen -l
@@ -2145,6 +2248,18 @@ def audit_authorized_keys(
                     fp_users[fingerprint].add(user.pw_name)
                 keys.append(finding)
 
+            # The opt-in --authorized-keys-unchanged-for tripwire. Only a file
+            # that still authorises somebody is worth reporting as stale, so
+            # this needs the line loop to have run: a file with no working key
+            # in it, and a file whose contents could not be read at all (which
+            # returned above), say nothing about how old anyone's access is.
+            if unchanged_for_days is not None and active_keys and _unchanged_for(st.st_mtime, now, unchanged_for_days):
+                file_finding.issues.append(
+                    Issue(
+                        "LOW",
+                        f"not modified in {_days(unchanged_for_days)}; every key in it is at least that old",
+                    )
+                )
             files.append(file_finding)
 
     if config_failures:
@@ -2270,12 +2385,25 @@ def audit_private_keys(
 # --------------------------------------------------------------------------- #
 
 
-def run_audit(min_rsa_bits: int, do_host: bool, do_authorized: bool, do_private: bool) -> Report:
-    """Run the selected sections and assemble a Report."""
+def run_audit(
+    min_rsa_bits: int,
+    do_host: bool,
+    do_authorized: bool,
+    do_private: bool,
+    *,
+    authorized_keys_unchanged_for: int | None = None,
+    authorized_keys_changed_within: int | None = None,
+    host_keys_changed_within: int | None = None,
+) -> Report:
+    """Run the selected sections and assemble a Report.
+
+    The three day counts are the opt-in modification-time thresholds; each is
+    None when its option was not given, which leaves that check off.
+    """
     config, config_source, sshd_error = read_effective_sshd_config()
     server_issues, coverage = audit_server_config(config, config_source, sshd_error)
 
-    host_keys = audit_host_keys(config, min_rsa_bits) if do_host else []
+    host_keys = audit_host_keys(config, min_rsa_bits, changed_within_days=host_keys_changed_within) if do_host else []
     host_key_paths = set(config.get("hostkey") or DEFAULT_HOST_KEYS)
 
     patterns: list[str] = []
@@ -2295,7 +2423,11 @@ def run_audit(min_rsa_bits: int, do_host: bool, do_authorized: bool, do_private:
 
                 user_config = read_for_user
         patterns, files, keys, duplicates, ak_coverage = audit_authorized_keys(
-            config, min_rsa_bits, user_config=user_config
+            config,
+            min_rsa_bits,
+            user_config=user_config,
+            unchanged_for_days=authorized_keys_unchanged_for,
+            changed_within_days=authorized_keys_changed_within,
         )
         coverage.extend(ak_coverage)
 
@@ -2531,6 +2663,30 @@ def main(argv: list[str] | None = None) -> None:
             "below 2048 is always CRITICAL"
         ),
     )
+    parser.add_argument(
+        "--authorized-keys-unchanged-for",
+        type=int,
+        metavar="DAYS",
+        default=None,
+        help=(
+            "Flag LOW every authorized_keys file that has not been modified in DAYS days and still "
+            "holds at least one key sshd would match (off unless given)"
+        ),
+    )
+    parser.add_argument(
+        "--authorized-keys-changed-within",
+        type=int,
+        metavar="DAYS",
+        default=None,
+        help="Flag MEDIUM every authorized_keys file modified within the last DAYS days (off unless given)",
+    )
+    parser.add_argument(
+        "--host-keys-changed-within",
+        type=int,
+        metavar="DAYS",
+        default=None,
+        help="Flag MEDIUM every host key file modified within the last DAYS days (off unless given)",
+    )
     parser.add_argument("--json", action="store_true", help="Emit the full report as JSON")
     parser.add_argument("--skip-host", action="store_true", help="Skip host key checks")
     parser.add_argument("--skip-authorized", action="store_true", help="Skip authorized_keys checks")
@@ -2541,6 +2697,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--debug", action="store_true", help="Debug logging to stderr")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
+    # A window of zero days would mean "modified in no time at all", and a
+    # negative one means nothing, so neither is accepted. argparse has already
+    # turned down anything that is not a whole number, including a value with
+    # more digits than int() will parse.
+    for option, days in (
+        ("--authorized-keys-unchanged-for", args.authorized_keys_unchanged_for),
+        ("--authorized-keys-changed-within", args.authorized_keys_changed_within),
+        ("--host-keys-changed-within", args.host_keys_changed_within),
+    ):
+        if days is not None and days < 1:
+            parser.error(f"{option}: DAYS must be 1 or more, not {days}")
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.WARNING, format="%(levelname)s: %(message)s")
 
     if shutil.which("ssh-keygen") is None:
@@ -2557,6 +2724,9 @@ def main(argv: list[str] | None = None) -> None:
         do_host=not args.skip_host,
         do_authorized=not args.skip_authorized,
         do_private=not args.skip_private,
+        authorized_keys_unchanged_for=args.authorized_keys_unchanged_for,
+        authorized_keys_changed_within=args.authorized_keys_changed_within,
+        host_keys_changed_within=args.host_keys_changed_within,
     )
     if args.json:
         print(json.dumps(asdict(report), indent=2))
