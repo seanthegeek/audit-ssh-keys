@@ -57,6 +57,17 @@ def _set_mtime(path: Path, when: float = KNOWN_MTIME) -> Path:
     return path
 
 
+# A fixed "now" for the modification-time threshold tests, passed to the audit
+# functions so the ages they measure never depend on when the suite runs.
+NOW = datetime(2026, 3, 1, 12).timestamp()
+DAY = 86400
+
+
+def _age(path: Path, days: float) -> Path:
+    """Backdate a file by a number of days from NOW."""
+    return _set_mtime(path, NOW - days * DAY)
+
+
 def _write_ak(user: pwd.struct_passwd, lines: list[str], mode: int = 0o600) -> Path:
     ssh_dir = Path(user.pw_dir) / ".ssh"
     ssh_dir.mkdir(mode=0o700, exist_ok=True)
@@ -129,6 +140,39 @@ def test_last_modified_is_none_for_a_timestamp_out_of_range(mtime: float):
     than aborting the audit part way through.
     """
     assert audit._last_modified(mtime) is None
+
+
+# --- modification-time thresholds -------------------------------------------
+
+
+def test_days_uses_the_singular_for_one_day():
+    assert audit._days(1) == "1 day"
+    assert audit._days(30) == "30 days"
+
+
+def test_changed_within_and_unchanged_for_split_at_the_window():
+    """With the same number of days a file is one or the other, never both and never neither."""
+    on_the_boundary = NOW - 7 * DAY
+    assert audit._changed_within(on_the_boundary, NOW, 7) is True
+    assert audit._unchanged_for(on_the_boundary, NOW, 7) is False
+
+    a_second_older = NOW - 7 * DAY - 1
+    assert audit._changed_within(a_second_older, NOW, 7) is False
+    assert audit._unchanged_for(a_second_older, NOW, 7) is True
+
+
+def test_a_modification_time_in_the_future_counts_as_changed_within():
+    """A file dated ahead of the clock was certainly written recently, and is not old."""
+    tomorrow = NOW + DAY
+    assert audit._changed_within(tomorrow, NOW, 7) is True
+    assert audit._unchanged_for(tomorrow, NOW, 7) is False
+
+
+def test_neither_threshold_fires_on_a_modification_time_that_is_not_a_number():
+    """stat() never returns nan, but the helpers are plain comparisons, so it compares false rather than raising."""
+    nan = float("nan")
+    assert audit._changed_within(nan, NOW, 7) is False
+    assert audit._unchanged_for(nan, NOW, 7) is False
 
 
 # --- check_strictmodes_path -------------------------------------------------
@@ -1811,6 +1855,160 @@ def test_host_key_placeholder_entry_has_no_date():
     assert [(f.path, f.last_modified) for f in findings] == [("(none)", None)]
 
 
+HOST_KEY_ROTATION_MESSAGE = "modified within the last 7 days; confirm this was a planned rotation"
+
+
+def _host_key_file(keys: dict[str, Path], tmp_path: Path, days_old: float) -> Path:
+    """A clean, root-style Ed25519 host key file, backdated by a number of days."""
+    hk = tmp_path / "ssh_host_ed25519_key"
+    hk.write_bytes(keys["ed25519"].read_bytes())
+    hk.chmod(0o600)
+    return _age(hk, days_old)
+
+
+def test_host_keys_changed_within_fires_only_inside_the_window(keys: dict[str, Path], tmp_path: Path):
+    """The MEDIUM is on a key modified inside the window, and on nothing else.
+
+    All three halves are checked against the same otherwise-clean key file: a
+    key changed two days ago with a seven-day window, the same key aged past
+    the window, and the same key with the option left off, which is the
+    default.
+    """
+    hk = _host_key_file(keys, tmp_path, days_old=2)
+    config = {"hostkey": [str(hk)]}
+
+    recent = audit.audit_host_keys(config, 3072, owner_uid=os.getuid(), changed_within_days=7, now=NOW)
+    finding = next(f for f in recent if f.path == str(hk))
+    assert [(i.severity, i.message) for i in finding.issues] == [("MEDIUM", HOST_KEY_ROTATION_MESSAGE)]
+
+    _age(hk, 10)
+    older = audit.audit_host_keys(config, 3072, owner_uid=os.getuid(), changed_within_days=7, now=NOW)
+    assert next(f for f in older if f.path == str(hk)).issues == []
+
+    _age(hk, 2)
+    off = audit.audit_host_keys(config, 3072, owner_uid=os.getuid(), now=NOW)
+    assert next(f for f in off if f.path == str(hk)).issues == []
+
+
+def test_host_keys_changed_within_fires_on_a_public_key_file_with_and_without_an_agent(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """A HostKey naming a public key file is still a file with a modification time.
+
+    sshd loads that entry (through HostKeyAgent) or does not, but either way
+    the file changing is what the operator asked to hear about, so both shapes
+    of finding carry the MEDIUM alongside whatever they already said.
+    """
+    hk = tmp_path / "ssh_host_ed25519_key.pub"
+    hk.write_text(pub(keys["ed25519"]) + "\n")
+    hk.chmod(0o644)
+    _age(hk, 2)
+
+    with_agent = audit.audit_host_keys(
+        {"hostkey": [str(hk)], "hostkeyagent": ["/run/host-key-agent.sock"]},
+        3072,
+        owner_uid=os.getuid(),
+        changed_within_days=7,
+        now=NOW,
+    )
+    finding = next(f for f in with_agent if f.path == str(hk))
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        ("INFO", "public key file; the private half is held by HostKeyAgent and cannot be audited here"),
+        ("MEDIUM", HOST_KEY_ROTATION_MESSAGE),
+    ]
+
+    without_agent = audit.audit_host_keys(
+        {"hostkey": [str(hk)]}, 3072, owner_uid=os.getuid(), changed_within_days=7, now=NOW
+    )
+    finding = next(f for f in without_agent if f.path == str(hk))
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        ("LOW", "HostKey names a public key file and no HostKeyAgent is set; sshd cannot load a private key from it"),
+        ("MEDIUM", HOST_KEY_ROTATION_MESSAGE),
+    ]
+
+
+def test_host_keys_changed_within_fires_on_a_certificate_file(tmp_path: Path):
+    """A HostKey naming a certificate is unusable to sshd, but the file still changed."""
+    cert = _age(_ed25519_host_certificate(tmp_path, "ssh_host_ed25519_key"), 2)
+
+    findings = audit.audit_host_keys(
+        {"hostkey": [str(cert)]}, 3072, owner_uid=os.getuid(), changed_within_days=7, now=NOW
+    )
+
+    finding = next(f for f in findings if f.path == str(cert))
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        (
+            "LOW",
+            "HostKey names a certificate file; sshd cannot load a host key from it "
+            "(a certificate belongs on a HostCertificate line)",
+        ),
+        ("MEDIUM", HOST_KEY_ROTATION_MESSAGE),
+    ]
+
+
+def test_host_keys_changed_within_says_nothing_about_an_entry_with_no_file(keys: dict[str, Path], tmp_path: Path):
+    """A configured key that is not there, and a `(none)` placeholder, have no modification time.
+
+    The placeholder has to actually be in the findings for the claim to mean
+    anything: `HostKey none` is dropped before any finding is built, so the
+    two placeholders that do get built are used instead -- the Ed25519 note
+    that follows a host with only an RSA key, and the entry for a host whose
+    only HostKey is `none`. A recently modified RSA key sits alongside the
+    first, so the option is demonstrably doing something in the same run.
+    """
+    present = tmp_path / "ssh_host_rsa_key"
+    present.write_bytes(keys["rsa4096"].read_bytes())
+    present.chmod(0o600)
+    _age(present, 2)
+    missing = tmp_path / "ssh_host_ecdsa_key"
+
+    findings = audit.audit_host_keys(
+        {"hostkey": [str(present), str(missing)]}, 3072, owner_uid=os.getuid(), changed_within_days=7, now=NOW
+    )
+
+    by_path = {f.path: f for f in findings}
+    assert [i.message for i in by_path[str(present)].issues] == [HOST_KEY_ROTATION_MESSAGE]
+    assert [i.message for i in by_path[str(missing)].issues] == ["configured HostKey does not exist"]
+    assert [(i.severity, i.message) for i in by_path["(none)"].issues] == [
+        ("LOW", "no Ed25519 host key present; consider ssh-keygen -A")
+    ]
+
+    none_only = audit.audit_host_keys({"hostkey": ["none"]}, 3072, changed_within_days=7, now=NOW)
+    assert [(f.path, [(i.severity, i.message) for i in f.issues]) for f in none_only] == [
+        (
+            "(none)",
+            [
+                (
+                    "LOW",
+                    "HostKey is set to none and no other HostKey is configured; "
+                    "sshd has no host key and will not start",
+                )
+            ],
+        )
+    ]
+
+
+@needs_non_root
+def test_host_keys_changed_within_says_nothing_about_a_key_that_cannot_be_stat_d(tmp_path: Path):
+    """No stat means no modification time, so the option cannot say anything about the file."""
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    host_key = blocked / "ssh_host_ed25519_key"
+    host_key.write_text("not read\n")
+    _age(host_key, 2)
+    blocked.chmod(0o000)
+    try:
+        findings = audit.audit_host_keys(
+            {"hostkey": [str(host_key)]}, 3072, owner_uid=os.getuid(), changed_within_days=7, now=NOW
+        )
+    finally:
+        blocked.chmod(0o700)
+
+    finding = next(f for f in findings if f.path == str(host_key))
+    assert [i.severity for i in finding.issues] == ["LOW"]
+    assert finding.issues[0].message.startswith("could not stat host key")
+
+
 # --- audit_authorized_keys ---------------------------------------------------
 
 
@@ -1940,6 +2138,189 @@ def test_authorized_keys_symlink_reports_the_date_of_the_file_sshd_reads(keys: d
 
     assert [f.last_modified for f in files] == [KNOWN_DATE]
     assert [k.file_last_modified for k in ak] == [KNOWN_DATE]
+
+
+ONE_PATTERN = {"authorizedkeysfile": [".ssh/authorized_keys"]}  # a single pattern keeps these tests to one file
+
+
+def _account_with_authorized_keys(tmp_path: Path, lines: list[str], days_old: float) -> pwd.struct_passwd:
+    """An account whose authorized_keys file holds the given lines and was last modified that long ago."""
+    alice = make_user("alice", USER_UID, tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    _age(_write_ak(alice, lines), days_old)
+    return alice
+
+
+def _one_file_finding(
+    user: pwd.struct_passwd, *, changed_within_days: int | None = None, unchanged_for_days: int | None = None
+) -> audit.FileFinding:
+    """The single file finding for an account, audited at the fixed NOW.
+
+    Passing neither threshold is how the tests check that a file is left alone
+    when the options are off, which is the default.
+    """
+    _, files, _, _, _ = audit.audit_authorized_keys(
+        ONE_PATTERN,
+        3072,
+        users=[user],
+        now=NOW,
+        changed_within_days=changed_within_days,
+        unchanged_for_days=unchanged_for_days,
+    )
+    assert len(files) == 1
+    return files[0]
+
+
+def test_authorized_keys_changed_within_fires_only_inside_the_window(keys: dict[str, Path], tmp_path: Path):
+    """The MEDIUM is on a file modified inside the window, and on nothing else.
+
+    The same otherwise-clean file is audited three ways: changed two days ago
+    with a seven-day window, aged past that window, and with the option left
+    off, which is the default.
+    """
+    alice = _account_with_authorized_keys(tmp_path, [pub(keys["ed25519"])], days_old=2)
+    ak = Path(alice.pw_dir) / ".ssh" / "authorized_keys"
+
+    inside = _one_file_finding(alice, changed_within_days=7)
+    assert [(i.severity, i.message) for i in inside.issues] == [
+        ("MEDIUM", "modified within the last 7 days; confirm the change was expected")
+    ]
+
+    _age(ak, 10)
+    outside = _one_file_finding(alice, changed_within_days=7)
+    assert outside.issues == []
+
+    _age(ak, 2)
+    assert _one_file_finding(alice).issues == []
+
+
+def test_authorized_keys_changed_within_fires_on_a_file_holding_no_keys(tmp_path: Path):
+    """A file emptied out or cut down to comments has changed, which is the thing being watched for."""
+    alice = _account_with_authorized_keys(tmp_path, ["# every key was removed this morning"], days_old=2)
+
+    finding = _one_file_finding(alice, changed_within_days=7)
+
+    assert finding.key_count == 0
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        ("MEDIUM", "modified within the last 7 days; confirm the change was expected")
+    ]
+
+
+@needs_non_root
+def test_authorized_keys_changed_within_fires_on_a_file_that_cannot_be_read(keys: dict[str, Path], tmp_path: Path):
+    """The check is decided from the stat, so a file whose contents are out of reach still gets it."""
+    alice = _account_with_authorized_keys(tmp_path, [pub(keys["ed25519"])], days_old=2)
+    ak = Path(alice.pw_dir) / ".ssh" / "authorized_keys"
+    ak.chmod(0o000)
+    try:
+        finding = _one_file_finding(alice, changed_within_days=7, unchanged_for_days=1)
+    finally:
+        ak.chmod(0o600)
+
+    assert finding.key_count == 0
+    assert [i.severity for i in finding.issues] == ["MEDIUM", "LOW"]
+    assert finding.issues[0].message == "modified within the last 7 days; confirm the change was expected"
+    assert finding.issues[1].message.startswith("could not read file: ")
+    # Nothing is known about what the file authorises, so it cannot be called stale
+    # either, even though the unchanged-for window it was given is one day.
+    assert not any("not modified in" in i.message for i in finding.issues)
+
+
+@needs_non_root
+def test_authorized_keys_thresholds_say_nothing_about_a_file_that_cannot_be_stat_d(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """No stat means no modification time, so neither threshold can say anything about the file."""
+    alice = _account_with_authorized_keys(tmp_path, [pub(keys["ed25519"])], days_old=2)
+    Path(alice.pw_dir).chmod(0o000)
+    try:
+        finding = _one_file_finding(alice, changed_within_days=7, unchanged_for_days=1)
+    finally:
+        Path(alice.pw_dir).chmod(0o700)
+
+    assert [i.severity for i in finding.issues] == ["LOW"]
+    assert finding.issues[0].message.startswith("could not stat ")
+
+
+def test_authorized_keys_unchanged_for_fires_only_outside_the_window(keys: dict[str, Path], tmp_path: Path):
+    """The LOW is on a file that has gone untouched for longer than the window, and on nothing else."""
+    alice = _account_with_authorized_keys(tmp_path, [pub(keys["ed25519"])], days_old=40)
+    ak = Path(alice.pw_dir) / ".ssh" / "authorized_keys"
+
+    stale = _one_file_finding(alice, unchanged_for_days=30)
+    assert [(i.severity, i.message) for i in stale.issues] == [
+        ("LOW", "not modified in 30 days; review whether every key in it should still have access")
+    ]
+
+    _age(ak, 10)
+    recent = _one_file_finding(alice, unchanged_for_days=30)
+    assert recent.issues == []
+
+    _age(ak, 40)
+    assert _one_file_finding(alice).issues == []
+
+
+def test_authorized_keys_unchanged_for_says_nothing_about_a_file_with_no_working_key(tmp_path: Path):
+    """A file nobody can log in with says nothing about how old anyone's access is.
+
+    A file holding only comments and a file holding only a certificate line are
+    both in that position: sshd never matches a certificate blob in
+    authorized_keys, so such a line grants nobody anything even though it is
+    counted as a key entry in the report.
+    """
+    _, certificate_line = _ed25519_certificate(tmp_path, "cert-only", "alice")
+    comments_only = _account_with_authorized_keys(tmp_path / "comments", ["# nothing here"], days_old=40)
+    cert_only = _account_with_authorized_keys(tmp_path / "cert", [certificate_line], days_old=40)
+
+    assert _one_file_finding(comments_only, unchanged_for_days=30).issues == []
+    cert_finding = _one_file_finding(cert_only, unchanged_for_days=30)
+    assert cert_finding.key_count == 1  # the line is counted, but it authorises nobody
+    assert cert_finding.issues == []
+
+
+def test_authorized_keys_unchanged_for_fires_on_a_file_whose_only_working_key_sits_beside_a_certificate(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """One working key is enough, however many inert lines keep it company."""
+    _, certificate_line = _ed25519_certificate(tmp_path, "cert", "alice")
+    alice = _account_with_authorized_keys(tmp_path, [certificate_line, pub(keys["ed25519"])], days_old=40)
+
+    finding = _one_file_finding(alice, unchanged_for_days=30)
+
+    assert [(i.severity, i.message) for i in finding.issues] == [
+        ("LOW", "not modified in 30 days; review whether every key in it should still have access")
+    ]
+
+
+def test_authorized_keys_both_thresholds_at_once_give_each_file_exactly_one_of_them(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """With the same window, a file is either recently changed or stale, never both and never neither."""
+    recent = _account_with_authorized_keys(tmp_path / "recent", [pub(keys["ed25519"])], days_old=2)
+    stale = _account_with_authorized_keys(tmp_path / "stale", [pub(keys["rsa4096"])], days_old=10)
+
+    recent_finding = _one_file_finding(recent, changed_within_days=7, unchanged_for_days=7)
+    stale_finding = _one_file_finding(stale, changed_within_days=7, unchanged_for_days=7)
+
+    assert [(i.severity, i.message) for i in recent_finding.issues] == [
+        ("MEDIUM", "modified within the last 7 days; confirm the change was expected")
+    ]
+    assert [(i.severity, i.message) for i in stale_finding.issues] == [
+        ("LOW", "not modified in 7 days; review whether every key in it should still have access")
+    ]
+
+
+def test_authorized_keys_thresholds_use_the_singular_for_a_one_day_window(keys: dict[str, Path], tmp_path: Path):
+    """The messages are built from a day count, so a window of one day has to read as English."""
+    recent = _account_with_authorized_keys(tmp_path / "recent", [pub(keys["ed25519"])], days_old=0.5)
+    stale = _account_with_authorized_keys(tmp_path / "stale", [pub(keys["rsa4096"])], days_old=3)
+
+    assert [i.message for i in _one_file_finding(recent, changed_within_days=1).issues] == [
+        "modified within the last 1 day; confirm the change was expected"
+    ]
+    assert [i.message for i in _one_file_finding(stale, unchanged_for_days=1).issues] == [
+        "not modified in 1 day; review whether every key in it should still have access"
+    ]
 
 
 def test_authorized_keys_certificate_is_reported_as_inert_not_graded(tmp_path: Path):
@@ -3461,6 +3842,97 @@ def test_cli_verbose_flag(keys, tmp_path, monkeypatch, capsys):
     assert "rsa4096@test" in capsys.readouterr().out
     audit.main([])
     assert "rsa4096@test" not in capsys.readouterr().out
+
+
+def _record_threshold_kwargs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, dict[str, int | None]]:
+    """Stand in for the two audit functions that take thresholds and record what they were given.
+
+    The rest of the run is kept off the real system the same way
+    test_run_audit_and_report_smoke does it.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("PasswordAuthentication no\n")
+    monkeypatch.setattr(audit, "SSHD_CONFIG", cfg)
+    monkeypatch.setattr(audit, "_find_sshd", lambda: None)
+    monkeypatch.setattr(audit.pwd, "getpwall", lambda: [])
+    recorded: dict[str, dict[str, int | None]] = {}
+
+    def fake_authorized_keys(config, min_rsa_bits, users=None, user_config=None, **kwargs):
+        recorded["authorized_keys"] = kwargs
+        return [], [], [], {}, []
+
+    def fake_host_keys(config, min_rsa_bits, **kwargs):
+        recorded["host_keys"] = kwargs
+        return []
+
+    monkeypatch.setattr(audit, "audit_authorized_keys", fake_authorized_keys)
+    monkeypatch.setattr(audit, "audit_host_keys", fake_host_keys)
+    return recorded
+
+
+def test_cli_hands_each_threshold_to_the_audit_it_belongs_to(tmp_path, monkeypatch, capsys):
+    """Each option reaches one audit function, under the name that function expects."""
+    recorded = _record_threshold_kwargs(monkeypatch, tmp_path)
+
+    audit.main(
+        [
+            "--skip-private",
+            "--authorized-keys-unchanged-for",
+            "30",
+            "--authorized-keys-changed-within",
+            "7",
+            "--host-keys-changed-within",
+            "3",
+        ]
+    )
+    capsys.readouterr()
+
+    assert recorded["authorized_keys"] == {"unchanged_for_days": 30, "changed_within_days": 7}
+    assert recorded["host_keys"] == {"changed_within_days": 3}
+
+
+def test_cli_leaves_every_threshold_off_when_no_option_is_given(tmp_path, monkeypatch, capsys):
+    """The other half of the claim above: nothing is switched on by default."""
+    recorded = _record_threshold_kwargs(monkeypatch, tmp_path)
+
+    audit.main(["--skip-private"])
+    capsys.readouterr()
+
+    assert recorded["authorized_keys"] == {"unchanged_for_days": None, "changed_within_days": None}
+    assert recorded["host_keys"] == {"changed_within_days": None}
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["--authorized-keys-unchanged-for", "--authorized-keys-changed-within", "--host-keys-changed-within"],
+)
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_cli_rejects_a_window_shorter_than_a_day(option: str, value: str, capsys):
+    """Zero days is a window nothing can fall inside, and a negative one means nothing at all."""
+    with pytest.raises(SystemExit) as exit_info:
+        audit.main([option, value])
+
+    assert exit_info.value.code == 2
+    assert f"{option}: DAYS must be 1 or more, not {value}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["--authorized-keys-unchanged-for", "--authorized-keys-changed-within", "--host-keys-changed-within"],
+)
+def test_cli_rejects_a_window_with_more_digits_than_int_will_parse(option: str, monkeypatch, capsys):
+    """int() refuses a string above 4300 digits, and that has to be a usage error, not a traceback.
+
+    The digit limit arrived in Python 3.10.7; on an interpreter without it the
+    value parses, so the audit is stubbed out to make sure this test can never
+    fall through into a real audit of the host it runs on.
+    """
+    monkeypatch.setattr(audit, "run_audit", lambda *_a, **_k: pytest.fail("the option was accepted"))
+    with pytest.raises(SystemExit) as exit_info:
+        audit.main([option, "9" * 5000])
+
+    assert exit_info.value.code == 2
+    assert "invalid int value" in capsys.readouterr().err
 
 
 # --- escaping control characters in the text report ----------------------------

@@ -50,6 +50,7 @@ readable otherwise, and `sshd -T` needs root.
 sudo audit-ssh-keys            # human-readable report
 sudo audit-ssh-keys -v         # list every key, not just those with findings
 sudo audit-ssh-keys --json     # machine-readable, for pipelines and fleet rollups
+sudo audit-ssh-keys --authorized-keys-changed-within 7   # flag authorized_keys files modified in the last 7 days
 ```
 
 ## What it checks
@@ -57,12 +58,13 @@ sudo audit-ssh-keys --json     # machine-readable, for pipelines and fleet rollu
 | Section | Checks |
 | ------- | ------ |
 | Server configuration | Weak signature algorithms still accepted (`ssh-dss`, SHA-1 `ssh-rsa`); `StrictModes no`; `PermitRootLogin yes`; password auth enabled |
-| Host keys | Algorithm and size; ownership and mode (`sshd` refuses a root-owned key with group/other permission bits; a key owned by anyone else loads regardless, which is its own problem); a `.pub` file next to the key checked against the key itself; configured-but-missing keys; passphrase-protected keys; missing Ed25519 key |
-| `authorized_keys` | Every account, every configured path; algorithm and size; what `StrictModes` would reject (the file and every directory above it, up to `$HOME` for a file inside the home directory and otherwise up to `/`, must be owned by the user or root and not group/world-writable); the same key reused across accounts; unrestricted keys on uid-0 accounts; malformed lines |
+| Host keys | Algorithm and size; ownership and mode (`sshd` refuses a root-owned key with group/other permission bits; a key owned by anyone else loads regardless, which is its own problem); a `.pub` file next to the key checked against the key itself; configured-but-missing keys; passphrase-protected keys; missing Ed25519 key; optionally, keys whose file changed inside a window you name (`--host-keys-changed-within`) |
+| `authorized_keys` | Every account, every configured path; algorithm and size; what `StrictModes` would reject (the file and every directory above it, up to `$HOME` for a file inside the home directory and otherwise up to `/`, must be owned by the user or root and not group/world-writable); the same key reused across accounts; unrestricted keys on uid-0 accounts; malformed lines; optionally, files changed inside, or untouched for longer than, a window you name (`--authorized-keys-changed-within`, `--authorized-keys-unchanged-for`) |
 | Private keys in `~/.ssh` | Algorithm and size; ownership and mode; whether a passphrase is set; a `.pub` file next to the key checked against the key itself |
 
 Every host key, `authorized_keys` file and private key is also reported with
-the date it was last modified.
+the date it was last modified. The three `DAYS` options in the table turn
+that date into a finding; they are off unless you ask for them.
 
 Every finding has a severity (CRITICAL, HIGH, MEDIUM, LOW, INFO). See
 [docs/findings.md](docs/findings.md) for what each one means and why it has the
