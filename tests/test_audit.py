@@ -74,9 +74,12 @@ def _write_ak(user: pwd.struct_passwd, lines: list[str], mode: int = 0o600, endi
 
     The encoding is named rather than left to the locale, so a line holding a
     character outside ASCII lands in the file as the same bytes whatever LANG
-    the suite happens to run under. newline="" is named so that Python leaves
-    the line ending asked for alone rather than translating it, which is what
-    makes `ending="\r\n"` really write a file with CRLF line endings.
+    the suite happens to run under. newline="" turns off the one translation
+    Python does when it writes text -- turning "\n" into os.linesep -- so the
+    endings asked for reach the file as they are written here on any platform.
+    On Linux it changes nothing: os.linesep is already "\n", and a "\r" is
+    never translated on the way out whatever the setting, so `ending="\r\n"`
+    would write CRLF endings without it too.
     """
     ssh_dir = Path(user.pw_dir) / ".ssh"
     ssh_dir.mkdir(mode=0o700, exist_ok=True)
@@ -1388,6 +1391,9 @@ def test_no_ed25519_note_when_a_host_key_could_not_be_fingerprinted(keys: dict[s
     assert [i.message for i in findings[1].issues] == ["could not fingerprint host key"]
 
 
+# --- audit_host_keys ----------------------------------------------------------
+
+
 def test_an_oversized_private_host_key_file_is_reported_as_one_that_could_not_be_fingerprinted(
     keys: dict[str, Path], tmp_path: Path
 ):
@@ -1446,9 +1452,6 @@ def test_an_oversized_public_host_key_file_is_still_fingerprinted(keys: dict[str
     # Graded, so the host counts as having an Ed25519 key: no "no Ed25519 host
     # key present" finding is added for it.
     assert not any(f.path == "(none)" for f in findings)
-
-
-# --- audit_host_keys ----------------------------------------------------------
 
 
 def test_host_keys_from_config(keys: dict[str, Path], tmp_path: Path):
@@ -3226,6 +3229,43 @@ def test_authorized_keys_line_of_exactly_the_limit_is_read_as_an_ordinary_key(
     assert files[0].key_count == 2
     assert [f.line_number for f in found] == [1, 2]
     assert found[0].comment == comment
+
+
+def test_authorized_keys_last_line_of_exactly_the_limit_with_a_stray_carriage_return_is_read(
+    keys: dict[str, Path], tmp_path: Path
+):
+    """A carriage return with no newline after it is an ending too, and must not count against the limit.
+
+    A file whose last line has no newline on it can still end in a carriage
+    return -- a file with CRLF endings that was cut short, or one written by a
+    program that put the two characters out separately. The reader is what
+    decides whether that character is part of the line, and it has to decide
+    it the way the caller does: the caller takes a trailing carriage return
+    off every line, newline or no newline, so a last line of exactly the limit
+    with one on the end fits once it is off. Counting it threw the line away
+    and reported a key that works as unread.
+
+    Nothing about sshd changes here: its getline() keeps the carriage return
+    and it has no line limit at all.
+    """
+    alice = make_user("alice", USER_UID, tmp_path / "home" / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    base = f"{pub(keys['ed25519']).rsplit(' ', 1)[0]} "
+    comment = "c" * (audit.MAX_AUTHORIZED_KEYS_LINE - len(base))
+    at_the_limit = base + comment
+    assert len(at_the_limit) == audit.MAX_AUTHORIZED_KEYS_LINE
+    ssh_dir = Path(alice.pw_dir) / ".ssh"
+    ssh_dir.mkdir(mode=0o700, exist_ok=True)
+    ak = ssh_dir / "authorized_keys"
+    # No newline anywhere: the carriage return is the last byte in the file.
+    ak.write_text(at_the_limit + "\r", encoding="utf-8", newline="")
+    ak.chmod(0o600)
+
+    _, files, found, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert files[0].issues == []
+    assert files[0].key_count == 1
+    assert [(f.line_number, f.comment) for f in found] == [(1, comment)]
 
 
 def test_a_huge_one_line_authorized_keys_file_is_reported_not_read(tmp_path: Path):

@@ -182,30 +182,43 @@ MAX_AUTHORIZED_KEYS_LINE = 64 * 1024
 # by one ("no argument after keyword").
 #
 # SSHD_CONFIG_WHITESPACE is sshd's own WHITESPACE (misc.c and servconf.c both
-# define it): the run strdelim() skips on either side of the keyword. The two
-# ends of the line are trimmed with sets of their own, and those two are not
-# the same set. The front is trimmed in load_server_config() (servconf.c),
-# which steps over a run of " \t\r" (`cp = line + strspn(line, " \t\r")`)
-# before the line is stored -- no newline, because the line still ends in one
-# at that point and it is deliberately kept, so that error messages can count
-# lines. The back is trimmed later, in the "Strip trailing whitespace" loop at
-# the top of process_server_config_line_depth(), which walks back over
-# WHITESPACE plus a form feed. That trailing set is what takes the carriage
-# return off the end of a line in a file with CRLF line endings.
+# define it): the run strdelim() skips after each token it hands back. Nothing
+# skips such a run in front of the keyword -- the front of the line is trimmed
+# in load_server_config() with a smaller set of its own, and a line that still
+# starts with a separator yields an empty first token, which
+# process_server_config_line_depth() answers by asking for one more token (see
+# _split_config_keyword).
+#
+# The two ends of the line are trimmed with sets that are not the same set.
+# The front is trimmed in load_server_config() (servconf.c), which steps over
+# a run of " \t\r" (`cp = line + strspn(line, " \t\r")`) before the line is
+# stored -- no newline, because the line still ends in one at that point and
+# it is deliberately kept, so that error messages can count lines. The back is
+# trimmed later, in the "Strip trailing whitespace" loop at the top of
+# process_server_config_line_depth(), which walks back over WHITESPACE plus a
+# form feed. That trailing set is what takes the carriage return off the end
+# of a line in a file with CRLF line endings.
+#
+# That loop is `for (len--; len > 0; len--)`, so it stops before the first
+# character of the line and leaves a line made of nothing but those characters
+# one character long, where str.rstrip() below empties it. Both readings end
+# with the line ignored here -- an empty line is skipped, and a keyword of one
+# form feed matches nothing and has no value -- while sshd refuses the whole
+# configuration over such a line ('no argument after keyword "\014"',
+# OpenSSH_10.2p1).
 SSHD_CONFIG_WHITESPACE = " \t\r\n"
 SSHD_CONFIG_LEADING_WHITESPACE = " \t\r"
 SSHD_CONFIG_TRAILING_WHITESPACE = SSHD_CONFIG_WHITESPACE + "\f"
 
-# The keyword at the front of a config line, and the character that ends it,
-# as strdelim_internal() (misc.c) finds them: the keyword runs up to one of
-# sshd's own whitespace characters or an '=', and which of the two ended it is
-# kept as a group of its own, because the caller has to tell those apart. The
-# class holds the characters of SSHD_CONFIG_WHITESPACE just above, spelled out
-# rather than written as \s, which would also match a non-breaking space:
-# sshd does not, so a keyword and a value with one between them are a single
-# keyword to it, and it refuses the config over the line ("no argument after
-# keyword", OpenSSH_10.2p1).
-_SSHD_CONFIG_KEYWORD_RE = re.compile(r"([^ \t\r\n=]*)([ \t\r\n]+|=)(.*)")
+# What ends a token in a config line, as strdelim_internal() (misc.c) looks
+# for it: one of sshd's own whitespace characters, an '=', or a double quote
+# (`strpbrk(*s, WHITESPACE QUOTE "=")`). The class is built from
+# SSHD_CONFIG_WHITESPACE above so that the two cannot drift apart, and holds
+# those characters rather than \s, which would also match a non-breaking
+# space: sshd does not, so a keyword and a value with one between them are a
+# single keyword to it, and it refuses the config over the line ("no argument
+# after keyword", OpenSSH_10.2p1).
+_SSHD_CONFIG_TOKEN_END = re.compile(f'[{re.escape(SSHD_CONFIG_WHITESPACE)}="]')
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
@@ -454,6 +467,83 @@ def read_effective_sshd_config(
     return dict(config), "parsed sshd_config (sshd -T unavailable)", sshd_error
 
 
+def _next_config_token(text: str) -> tuple[str, str] | None:
+    """Take one token off the front of a config line, the way sshd's strdelim() does.
+
+    Returns the token and what is left of the line after it, or None when the
+    token opens a double quote that is never closed: strdelim_internal()
+    (misc.c) returns NULL there, and sshd then ignores the whole line without
+    a word -- verified against OpenSSH_10.2p1, where a file whose only line is
+    `Authorized"KeysFile /evil/%u` loads and leaves AuthorizedKeysFile at its
+    default.
+
+    A token ends at the first of sshd's own whitespace, an '=', or a double
+    quote, whichever comes first (_SSHD_CONFIG_TOKEN_END), and what happens
+    next depends on which of the three it was:
+
+    - whitespace ends the token, and the run of whitespace after it is
+      skipped, as is one '=' after that run;
+    - an '=' ends the token and is skipped along with the whitespace run
+      after it, but only one '=' is ever skipped, so `StrictModes==no` has
+      the value `=no` (which sshd refuses: `unsupported option "=no"`);
+    - a double quote is taken out of the line, and the token then runs on to
+      the next double quote, which is taken out as well and ends the token
+      there. So a quote does not end the keyword -- it joins what is on
+      either side of it into one token, and `Authorized"KeysFile" /evil/%u`
+      sets AuthorizedKeysFile just as the unquoted spelling does, while
+      `AuthorizedKeysFile"/evil/%u"` is the single keyword
+      `AuthorizedKeysFile/evil/%u` with no value at all. Only that one pair
+      of quotes is handled: a second quoted run in the same word starts after
+      the token has already ended, so `Auth"orized"KeysFile /evil/%u` is the
+      keyword `Authorized` followed by `KeysFile /evil/%u`. No '=' is skipped
+      after a quoted token either, so `"AuthorizedKeysFile"=/evil/%u` has the
+      value `=/evil/%u`.
+
+    Every one of those was run against OpenSSH_10.2p1's `sshd -T`.
+    """
+    end = _SSHD_CONFIG_TOKEN_END.search(text)
+    if end is None:
+        # Nothing ends this token, so it is the whole of what is left.
+        return text, ""
+    index = end.start()
+    if text[index] == '"':
+        closing = text.find('"', index + 1)
+        if closing < 0:
+            return None
+        rest = text[closing + 1 :].lstrip(SSHD_CONFIG_WHITESPACE)
+        return text[:index] + text[index + 1 : closing], rest
+    rest = text[index + 1 :].lstrip(SSHD_CONFIG_WHITESPACE)
+    if text[index] != "=" and rest.startswith("="):
+        rest = rest[1:].lstrip(SSHD_CONFIG_WHITESPACE)
+    return text[:index], rest
+
+
+def _split_config_keyword(line: str) -> tuple[str, str] | None:
+    """Take the keyword off the front of one config line, and return it with the rest of the line.
+
+    This is the keyword-reading prologue of process_server_config_line_depth()
+    (servconf.c): one token, and -- when that token is empty, which is how a
+    line beginning with an '=' or with an empty pair of quotes starts -- one
+    more. Both `=AuthorizedKeysFile /evil/%u` and `""AuthorizedKeysFile
+    /evil/%u` therefore set AuthorizedKeysFile, as OpenSSH_10.2p1 confirms.
+
+    Returns None for a line sshd reads no keyword from and passes over in
+    silence: a double quote that is never closed, and a line that is nothing
+    but separators. The rest of the line is returned unsplit, because sshd
+    hands it to argv_split() rather than to strdelim() (see
+    _split_config_args).
+    """
+    token = _next_config_token(line)
+    if token is None:
+        return None
+    if token[0]:
+        return token
+    token = _next_config_token(token[1])
+    if token is None or not token[0]:
+        return None
+    return token
+
+
 def _split_config_args(text: str) -> list[str] | None:
     """Split the argument part of one sshd_config line into arguments, the way sshd does.
 
@@ -590,11 +680,14 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
     skipped. depth counts how many Includes deep this file is; nesting stops at
     MAX_INCLUDE_DEPTH, which is also what stops a file that includes itself.
 
-    Each line's arguments are split the way sshd splits them (see
-    _split_config_args), so a trailing comment is dropped, quotes and
-    backslash escapes are honoured, and a line sshd would reject over an
-    unclosed quote is skipped here too. The arguments are stored joined back
-    together with single spaces, which is how `sshd -T` prints them as well.
+    Each line's keyword is read the way sshd reads it (see
+    _split_config_keyword), so a quote inside the keyword joins the text on
+    either side of it rather than ending it. The arguments after the keyword
+    are split the way sshd splits those (see _split_config_args), so a
+    trailing comment is dropped, quotes and backslash escapes are honoured,
+    and a line sshd would reject over an unclosed quote is skipped here too.
+    The arguments are stored joined back together with single spaces, which is
+    how `sshd -T` prints them as well.
     """
     try:
         if not _is_regular_file(path):
@@ -641,47 +734,31 @@ def _parse_sshd_config_file(path: Path, config: dict[str, list[str]], depth: int
         line = raw.lstrip(SSHD_CONFIG_LEADING_WHITESPACE).rstrip(SSHD_CONFIG_TRAILING_WHITESPACE)
         if not line or line.startswith("#"):
             continue
-        # sshd's strdelim_internal() (misc.c) ends the keyword at the first
-        # whitespace or '=', then skips the whitespace around it -- and skips
-        # one '=' as well, but only if the keyword did not already end at one.
-        # So "Keyword=value", "Keyword = value" and "Keyword =value" all mean
-        # the same thing, while "Keyword==value" leaves a value of "=value",
-        # which sshd then refuses ("unsupported option"). Whichever character
-        # ended the keyword has to be remembered to tell those apart. The
-        # whitespace the pattern ends a keyword at is sshd's own and not
-        # Python's; see _SSHD_CONFIG_KEYWORD_RE.
-        keyword_split = _SSHD_CONFIG_KEYWORD_RE.match(line)
+        # The keyword, and the rest of the line after the whitespace or '='
+        # that ends it -- or after the pair of quotes that ends it, which is
+        # why this cannot be a plain split on a separator: a quote joins the
+        # text on either side of it into one keyword, so
+        # `Authorized"KeysFile" /evil/%u` names the same setting as the
+        # unquoted spelling. See _split_config_keyword and _next_config_token
+        # for the whole of that rule and for the lines sshd reads no keyword
+        # from at all.
+        keyword_split = _split_config_keyword(line)
         if keyword_split is None:
-            # Nothing separates a keyword from a value on this line, so the
-            # whole line is the keyword and it has no value. sshd refuses a
-            # config like that outright (for a bare "Match": 'no argument after
-            # keyword "Match"', verified against OpenSSH 10.2) -- which is one
-            # of the reasons this fallback parser would be running at all. The
-            # one thing that still matters is the Match case: skipping the line
-            # here would leave the block's body to be read as global
-            # configuration, which is far worse than skipping the block.
-            if line.lower() == "match":
-                in_match = True
-            else:
-                logger.debug("ignoring line with no argument in %s: %s", path, line)
+            # sshd read no keyword here and went on to the next line without a
+            # word, so there is nothing on this one to record.
+            logger.debug("ignoring line with no keyword in %s: %s", path, line)
             continue
-        key = keyword_split.group(1).lower()
-        # strdelim() skips a run of sshd's own whitespace after the keyword,
-        # and another after the '=' it may skip, so those are the characters
-        # taken off here as well -- str.lstrip() with no argument would take
-        # off a non-breaking space too, which sshd leaves as the first
-        # character of the value.
-        rest = keyword_split.group(3).lstrip(SSHD_CONFIG_WHITESPACE)
-        if keyword_split.group(2) != "=" and rest.startswith("="):
-            rest = rest[1:].lstrip(SSHD_CONFIG_WHITESPACE)
+        keyword, rest = keyword_split
+        key = keyword.lower()
         if key == "match":
             # Decide this before looking at the value, because the value is not
-            # used for Match and a Match line sshd would reject -- an unclosed
-            # quote, say -- still opens a block as far as this parser's reading
-            # of the rest of the file goes. Going on to read the block's body
-            # as global configuration would be much worse than skipping it:
-            # a Match-block AuthorizedKeysFile would become the global pattern
-            # and no account's real file would ever be scanned.
+            # used for Match and a Match line sshd would reject -- one with an
+            # unclosed quote in its value, say -- still opens a block as far as
+            # this parser's reading of the rest of the file goes. Going on to
+            # read the block's body as global configuration would be much worse
+            # than skipping it: a Match-block AuthorizedKeysFile would become
+            # the global pattern and no account's real file would ever be
+            # scanned.
             in_match = True
             continue
         arguments = _split_config_args(rest)
@@ -740,10 +817,10 @@ def _parse_sshd_t_output(stdout: str) -> dict[str, list[str]]:
 
     The output is split at newlines and at nothing else, for the same reason
     _parse_sshd_config_file splits a config file that way: sshd prints each
-    value as the bytes the config file holds, so a value can contain a character Python
-    counts as a line break (a vertical tab, a form feed, a U+2028) without
-    being two lines. Splitting on those would read the tail of one such value
-    as a keyword line of its own -- a Banner path ending in
+    value as the bytes the config file holds, so a value can contain a
+    character Python counts as a line break (a vertical tab, a form feed, a
+    U+2028) without being two lines. Splitting on those would read the tail of
+    one such value as a keyword line of its own -- a Banner path ending in
     "<U+2028>authorizedkeysfile /evil/%u" would set this account's
     AuthorizedKeysFile. Only root writes sshd_config, so that is a consistency
     fix rather than a way in, but the two parsers have to agree about what a
@@ -976,7 +1053,21 @@ def fingerprint_line(key_line: str) -> tuple[str, int, str, str] | None:
 
 
 def fingerprint_file(path: Path) -> tuple[str, int, str, str] | None:
-    """Fingerprint a key file (public or unencrypted private) via `ssh-keygen -lf`."""
+    """Fingerprint a key file (public or unencrypted private) via `ssh-keygen -lf`.
+
+    text=True is safe here, unlike in fingerprint_line: nothing is written to
+    the command, so there is no encode step to fail, and the comment coming
+    back cannot fail to decode either. ssh-keygen prints comments through
+    mprintf(), which escapes whatever the locale cannot express, so under an
+    ASCII locale a comment reading "jürgen@host" arrives as the ASCII text
+    "j\\303\\274rgen@host" -- checked against OpenSSH 10.2p1, including a raw
+    non-UTF-8 byte planted in a .pub comment, which came back as "bad\\344byte".
+    The output is plain ASCII exactly when the decoder is strictest, and the
+    two cannot drift apart, because Python's codec and ssh-keygen's locale come
+    from the same environment and the overrides that decouple them (PYTHONUTF8,
+    PYTHONCOERCECLOCALE) only ever move Python towards UTF-8, the more
+    forgiving side.
+    """
     proc = subprocess.run(
         ["ssh-keygen", "-lf", str(path)],
         capture_output=True,
@@ -2270,7 +2361,8 @@ def _read_authorized_keys_line(handle: TextIO) -> tuple[str, bool] | None:
 
     A line fits when what sits in front of its line ending is at most
     MAX_AUTHORIZED_KEYS_LINE characters long. The ending itself is not counted,
-    whether it is a newline, a carriage return and a newline, or the end of the
+    whether it is a newline, a carriage return and a newline, a carriage
+    return at the end of the file with no newline after it, or the end of the
     file with no line ending at all.
 
     Returns None at the end of the file; (line, False) for a line that fitted,
@@ -2306,9 +2398,15 @@ def _read_authorized_keys_line(handle: TextIO) -> tuple[str, bool] | None:
             return raw, False
         # The newline has already been read, so there is nothing to wind past.
         return "", True
-    if len(raw) <= MAX_AUTHORIZED_KEYS_LINE:
-        # No newline and short of what was asked for, so the file ended here:
-        # a last line with no line ending on it, and one that fits.
+    # No newline, so either the file ends here or the line runs past the
+    # limit. A carriage return on the end is measured the way the caller
+    # strips it here as well: the caller takes a trailing carriage return off
+    # a last line that has no newline after it, so counting it against the
+    # limit would throw away a line that fits once it is off.
+    length = len(raw) - 1 if raw.endswith("\r") else len(raw)
+    if length <= MAX_AUTHORIZED_KEYS_LINE:
+        # Short of what was asked for, so the file ended here: a last line
+        # with no newline on it, and one that fits.
         return raw, False
     while True:
         chunk = handle.readline(MAX_AUTHORIZED_KEYS_LINE)

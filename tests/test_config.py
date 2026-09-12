@@ -56,12 +56,14 @@ def test_no_sshd_binary_reports_missing(tmp_path: Path):
 
 
 def _fake_sshd_printing_raw_bytes(tmp_path: Path, name: str, stdout: str = "", stderr: str = "", rc: int = 0) -> str:
-    """A fake sshd whose output holds a byte that is not valid UTF-8.
+    """A fake sshd whose output is written by `printf` from an escaped string.
 
-    The text is handed to `printf` as its format string, so a `\\344` in it
-    reaches the pipe as that one raw byte -- the way sshd prints a config value
-    that holds a byte from some other encoding, since it copies the file's
-    bytes rather than transcoding them.
+    The text is handed to `printf` as its format string, so an escape in it
+    reaches the pipe as the bytes it names: `\\344` as that one raw byte -- the
+    way sshd prints a config value that holds a byte from some other encoding,
+    since it copies the file's bytes rather than transcoding them -- and `\\t`
+    or `\\n` as the whitespace it stands for. Callers that need none of those
+    escapes use _fake_sshd above, whose output is printed as a literal string.
     """
     script = tmp_path / name
     script.write_text(f"#!/bin/sh\nprintf '{stdout}'\nprintf '{stderr}' >&2\nexit {rc}\n")
@@ -235,8 +237,11 @@ def test_fallback_parser_does_not_take_a_non_breaking_space_for_a_keyword_separa
     r"""A keyword ends at sshd's own whitespace or an '=', not at everything Python calls whitespace.
 
     strdelim_internal() (misc.c) ends the keyword at one of WHITESPACE
-    " \t\r\n", a quote, or an '='. A non-breaking space is none of those, so
-    the keyword runs on through it and sshd refuses the line --
+    " \t\r\n" or at an '='. (A quote stops its search too, but it does not end
+    the keyword there -- it joins the text on either side of it into one
+    keyword instead; see test_split_config_keyword_matches_sshd.) A
+    non-breaking space is none of those, so the keyword runs on through it and
+    sshd refuses the line --
     `no argument after keyword "AuthorizedKeysFile\302\240/evil/%u"` against
     OpenSSH_10.2p1. The regular expression that finds the separator here used
     Python's \s, which does match a non-breaking space, so this tool honoured
@@ -507,6 +512,182 @@ def test_fallback_parser_relative_include_is_read_from_the_config_directory(
     assert config["permitrootlogin"] == ["no"]
 
 
+# --- _split_config_keyword and the fallback parser's keyword handling --------
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        # The everyday shapes: whitespace, an '=', and both together.
+        ("AuthorizedKeysFile .ssh/ok", ("AuthorizedKeysFile", ".ssh/ok")),
+        ("AuthorizedKeysFile\t\t.ssh/ok", ("AuthorizedKeysFile", ".ssh/ok")),
+        ("AuthorizedKeysFile=.ssh/ok", ("AuthorizedKeysFile", ".ssh/ok")),
+        ("AuthorizedKeysFile = .ssh/ok", ("AuthorizedKeysFile", ".ssh/ok")),
+        # Only one '=' is ever skipped, so the second one starts the value.
+        ("AuthorizedKeysFile==.ssh/ok", ("AuthorizedKeysFile", "=.ssh/ok")),
+        # A quote does not end the keyword: it is taken out, and the text on
+        # either side of it is joined into one keyword.
+        ('Authorized"KeysFile" /evil/%u', ("AuthorizedKeysFile", "/evil/%u")),
+        ('"AuthorizedKeysFile" /evil/%u', ("AuthorizedKeysFile", "/evil/%u")),
+        # No whitespace is needed after the closing quote.
+        ('Authorized"KeysFile"/evil/%u', ("AuthorizedKeysFile", "/evil/%u")),
+        # ... so a quoted value written with no space in front of it becomes
+        # part of the keyword, and the line has no value at all.
+        ('AuthorizedKeysFile"/evil/%u"', ("AuthorizedKeysFile/evil/%u", "")),
+        # An '=' after a quoted keyword is not skipped; it starts the value.
+        ('"AuthorizedKeysFile"=/evil/%u', ("AuthorizedKeysFile", "=/evil/%u")),
+        # Only one pair of quotes is handled: the keyword ends at the closing
+        # quote, and a second quoted run is left for the value.
+        ('Auth"orized"KeysFile /evil/%u', ("Authorized", "KeysFile /evil/%u")),
+        # An empty first token is answered with one more token, so both of
+        # these set AuthorizedKeysFile.
+        ('""AuthorizedKeysFile /evil/%u', ("AuthorizedKeysFile", "/evil/%u")),
+        ("=AuthorizedKeysFile /evil/%u", ("AuthorizedKeysFile", "/evil/%u")),
+        # A line with no separator at all is all keyword and has no value.
+        ("Match", ("Match", "")),
+        # A form feed is not one of sshd's separators, so it is a keyword.
+        ("\f", ("\f", "")),
+        # Only sshd's own whitespace separates a keyword from its value.
+        ("AuthorizedKeysFile \u00a0/evil/%u", ("AuthorizedKeysFile", "\u00a0/evil/%u")),
+        # No keyword to be had: a quote that is never closed, and lines that
+        # hold nothing but separators.
+        ('Authorized"KeysFile /evil/%u', None),
+        ('"', None),
+        ('""', None),
+        ("=", None),
+    ],
+)
+def test_split_config_keyword_matches_sshd(line: str, expected: tuple[str, str] | None):
+    """The keyword is read the way strdelim_internal() (misc.c) reads a token, quotes and all.
+
+    Every row was run against OpenSSH_10.2p1's `sshd -T`: the rows whose
+    keyword is AuthorizedKeysFile print that setting with the value this row
+    names, the rows whose keyword is something else are refused as a bad
+    configuration option or as a keyword with no argument, and the four None
+    rows leave AuthorizedKeysFile at its default with the configuration still
+    loading. The quoting rows are the ones that used to be read wrongly: a
+    quote was not a character this parser knew, so
+    `Authorized"KeysFile" /evil/%u` was filed under a keyword of its own and
+    the audit went on to read whatever .ssh/ok further down the file named,
+    while sshd read the file in /evil.
+    """
+    assert audit._split_config_keyword(line) == expected
+
+
+def test_fallback_parser_reads_a_keyword_written_with_quotes_in_it(tmp_path: Path):
+    """A quoted keyword names the same setting as the unquoted spelling, so it must not be missed.
+
+    Verified against OpenSSH_10.2p1: for this file `sshd -T` prints
+    `authorizedkeysfile /evil/%u`. The .ssh/ok line below it is the trap --
+    the first value seen for a keyword wins, so a parser that does not
+    recognise the quoted keyword audits .ssh/ok while sshd is reading
+    /evil/%u.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text('Authorized"KeysFile" /evil/%u\nAuthorizedKeysFile .ssh/ok\n')
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert config["authorizedkeysfile"] == ["/evil/%u"]
+
+
+@pytest.mark.parametrize("prefix", ['""', "="], ids=["empty-quotes", "equals"])
+def test_fallback_parser_reads_a_keyword_after_an_empty_first_token(tmp_path: Path, prefix: str):
+    """A line starting with an '=' or an empty pair of quotes still sets the keyword after it.
+
+    strdelim() hands back an empty token for either one, and
+    process_server_config_line_depth() (servconf.c) asks for one more rather
+    than dropping the line: OpenSSH_10.2p1 prints `authorizedkeysfile
+    /evil/%u` for both spellings.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(f"{prefix}AuthorizedKeysFile /evil/%u\nAuthorizedKeysFile .ssh/ok\n")
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert config["authorizedkeysfile"] == ["/evil/%u"]
+
+
+def test_fallback_parser_ignores_a_line_whose_keyword_opens_a_quote_and_never_closes_it(tmp_path: Path):
+    """sshd reads no keyword from such a line and passes over it in silence, so nothing may be filed under it.
+
+    strdelim() returns NULL for an unclosed quote, which
+    process_server_config_line_depth() treats as end of line. The
+    configuration still loads: verified against OpenSSH_10.2p1, this file
+    leaves AuthorizedKeysFile at its default and `sshd -T` prints no error at
+    all -- so the .ssh/ok line below is the one that counts, and the ignored
+    line must leave no keyword of its own behind.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text('Authorized"KeysFile /evil/%u\nAuthorizedKeysFile .ssh/ok\n')
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert config == {"authorizedkeysfile": [".ssh/ok"]}
+
+
+def test_fallback_parser_reads_a_file_with_crlf_line_endings(tmp_path: Path):
+    """A config file written on Windows must read like any other, carriage returns and all.
+
+    The file is split at newlines alone, so every line arrives with a carriage
+    return still on the end of it, and taking that off is the job of
+    SSHD_CONFIG_TRAILING_WHITESPACE -- sshd's own "Strip trailing whitespace"
+    loop, which walks back over " \\t\\r\\n" and a form feed. A carriage
+    return left on the end would land inside the value: the AuthorizedKeysFile
+    pattern would name a file whose name ends in one, and StrictModes would be
+    read as "no\\r" rather than as "no".
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_bytes(b"StrictModes no\r\nAuthorizedKeysFile .ssh/ok\r\nPermitRootLogin no\r\n")
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert config == {
+        "strictmodes": ["no"],
+        "authorizedkeysfile": [".ssh/ok"],
+        "permitrootlogin": ["no"],
+    }
+
+
+def test_fallback_parser_takes_a_form_feed_off_the_end_of_a_line(tmp_path: Path):
+    """A form feed is trimmed off the end of a line, and off that end only.
+
+    It is the one character sshd's trailing set holds that its leading set
+    does not (the "Strip trailing whitespace" loop walks back over WHITESPACE
+    plus a form feed, while load_server_config() steps over " \\t\\r" at the
+    front). Verified against OpenSSH_10.2p1: `sshd -T` prints
+    `authorizedkeysfile /evil/%u` for a line ending in a form feed, and
+    refuses a file whose line begins with one (`Bad configuration option:
+    \\014AuthorizedKeysFile`), which is why the second line here is not read
+    as a setting.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("AuthorizedKeysFile /evil/%u\f\n\fStrictModes no\n")
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert config["authorizedkeysfile"] == ["/evil/%u"]
+    assert "strictmodes" not in config
+
+
+def test_fallback_parser_ignores_a_line_that_is_nothing_but_a_form_feed(tmp_path: Path):
+    """Such a line holds no setting here, and sshd refuses the whole configuration over it.
+
+    str.rstrip() empties the line and it is skipped as blank. sshd's loop
+    stops before the first character instead, leaving a keyword one form feed
+    long, which it then refuses: `no argument after keyword "\\014"`, verified
+    against OpenSSH_10.2p1. That divergence is recorded on
+    SSHD_CONFIG_TRAILING_WHITESPACE; either reading ends with the line
+    contributing nothing, and the lines around it are still read.
+    """
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text("\f\nAuthorizedKeysFile .ssh/ok\nStrictModes no\n")
+
+    config, _, _ = audit.read_effective_sshd_config(sshd_bin="", config_paths=[cfg])
+
+    assert config == {"authorizedkeysfile": [".ssh/ok"], "strictmodes": ["no"]}
+
+
 # --- _split_config_args and the fallback parser's argument handling ----------
 
 
@@ -705,7 +886,7 @@ def test_fallback_parser_strips_the_equals_from_a_path_value(tmp_path: Path):
 
 
 def test_fallback_parser_treats_a_bare_match_line_as_opening_a_block(tmp_path: Path):
-    """A line that is just "Match" has no separator in it, and must still open a block.
+    """A line that is just "Match" has no value on it, and must still open a block.
 
     sshd refuses a configuration like this one outright ("line 1: no argument
     after keyword \"Match\"", verified against OpenSSH 10.2) -- which is one of
@@ -726,9 +907,9 @@ def test_fallback_parser_ignores_a_keyword_with_no_value_and_keeps_reading(tmp_p
     sshd refuses a configuration like this one outright ("line 1: no argument
     after keyword \"PermitRootLogin\"", verified against OpenSSH 10.2), which is
     one of the reasons this fallback parser would be running. Only a bare
-    "Match" means anything on a line with no separator in it; this is the other
-    branch, where the line is dropped, no value is invented for it, and the
-    keywords below it still parse.
+    "Match" means anything on a line that carries no value; every other
+    keyword is dropped, no value is invented for it, and the keywords below it
+    still parse.
     """
     cfg = tmp_path / "sshd_config"
     cfg.write_text("PermitRootLogin\nStrictModes no\n")
