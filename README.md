@@ -57,7 +57,7 @@ sudo audit-ssh-keys --authorized-keys-changed-within 7   # flag authorized_keys 
 
 | Section | Checks |
 | ------- | ------ |
-| Server configuration | Weak signature algorithms still accepted (`ssh-dss`, SHA-1 `ssh-rsa`); `StrictModes no`; `PermitRootLogin yes`; password auth enabled |
+| Server configuration | Weak signature algorithms still accepted (`ssh-dss`, SHA-1 `ssh-rsa`, and their certificate forms); `StrictModes no`; `PermitRootLogin yes`; password auth enabled |
 | Host keys | Algorithm and size; ownership and mode (`sshd` refuses a root-owned key with group/other permission bits; a key owned by anyone else loads regardless, which is its own problem); a `.pub` file next to the key checked against the key itself; configured-but-missing keys; passphrase-protected keys; missing Ed25519 key; optionally, keys whose file changed inside a window you name (`--host-keys-changed-within`) |
 | `authorized_keys` | Every account, every configured path; algorithm and size; what `StrictModes` would reject (the file and every directory above it, up to `$HOME` for a file inside the home directory and otherwise up to `/`, must be owned by the user or root and not group/world-writable); the same key reused across accounts; unrestricted keys on uid-0 accounts; malformed lines; optionally, files changed inside, or untouched for longer than, a window you name (`--authorized-keys-changed-within`, `--authorized-keys-unchanged-for`) |
 | Private keys in `~/.ssh` | Algorithm and size; ownership and mode; whether a passphrase is set; a `.pub` file next to the key checked against the key itself |

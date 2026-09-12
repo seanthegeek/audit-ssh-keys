@@ -33,6 +33,7 @@ Without root the tool still runs, but only over files the invoking user can read
 | Code | Meaning |
 | ---- | ------- |
 | 0 | Audit ran (findings or not — see the report) |
+| 1 | The tool itself failed with an unhandled error, printing a Python traceback to stderr. That is a bug — please report it with the traceback |
 | 2 | Audit could not run at all (`ssh-keygen` missing), or the command line was rejected (an unknown option, or a `DAYS` value that is not a whole number of at least 1) |
 
 The exit code does not reflect findings, so the tool is safe to run from cron or a config-management "gather facts" step. To gate on findings, use `--json` and inspect the severities.
@@ -51,7 +52,7 @@ The exit code does not reflect findings, so the tool is safe to run from cron or
 | `authorized_key_files` | One entry per file: `user`, `file_path`, `key_count`, `issues`, `last_modified` |
 | `authorized_keys` | One entry per key: `user`, `file_path`, `line_number`, `key_type`, `bits`, `fingerprint`, `comment`, `options`, `issues`, `file_last_modified` |
 | `duplicate_authorized_keys` | `{fingerprint: ["user path:line", ...]}` for keys authorised in more than one place |
-| `private_keys` | One entry per private key: `user`, `path`, `key_type`, `bits`, `fingerprint`, `encrypted` (`true`, `false`, or `null` when the file format was not recognised), `issues`, `last_modified` |
+| `private_keys` | One entry per private key: `user`, `path`, `key_type`, `bits`, `fingerprint`, `encrypted` (`true`, `false`, or `null` when it could not be determined — the causes are listed under `could not determine whether the key is passphrase-protected` in [findings.md](findings.md)), `issues`, `last_modified` |
 
 Every `issues` entry is `{"severity": "...", "message": "..."}`.
 

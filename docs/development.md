@@ -20,8 +20,12 @@ pytest
 
 `ruff format .` fixes formatting in place.
 
-CI runs these same four commands on every push and pull request, plus a
-Markdown lint, and runs the root-only tests under `sudo` in a separate job.
+CI (`.github/workflows/ci.yml`) runs the first three commands unchanged, and
+`pytest` with coverage (`pytest --cov=audit_ssh_keys --cov-report=term-missing
+--cov-report=xml`) on Python 3.10 through 3.14, on every pull request and every
+push to `main`. It also lints Markdown and runs the root-only tests under
+`sudo` in a separate job. The release workflow runs the four commands exactly
+as written above.
 
 ## Tests
 
@@ -48,7 +52,12 @@ docs/
 
 ## Releasing
 
-1. Update `CHANGELOG.md` (move Unreleased to a dated version heading).
+1. Add a `## [X.Y.Z] - YYYY-MM-DD` heading to `CHANGELOG.md` above the
+   previous release's, brackets included — that is Keep a Changelog's form, and
+   the release workflow greps for exactly `## [X.Y.Z]` and stops if it is
+   missing — and list the changes under it. Add the matching
+   `[X.Y.Z]: https://github.com/seanthegeek/audit-ssh-keys/releases/tag/vX.Y.Z`
+   link definition at the end of the file.
 2. Bump `__version__` in `src/audit_ssh_keys/__init__.py`.
 3. Commit, then tag and push:
 
@@ -59,20 +68,27 @@ docs/
 
 Pushing the tag runs the release workflow
 (`.github/workflows/release.yml`), which checks the tag against
-`__version__` and the changelog heading, runs the checks, builds the wheel
-and sdist, and creates the GitHub release titled without the `v` with both
-files attached.
+`__version__` and the changelog heading, runs the checks, builds the wheel and
+sdist, checks that `dist/` holds exactly one of each, uploads both to PyPI, and
+creates the GitHub release titled without the `v` with the same two files
+attached.
 
-### If the workflow fails
+### If the workflow fails after the PyPI upload
 
-Do the same steps by hand. Build the wheel and sdist:
+Only the steps after the upload can be redone by hand, and the section below
+says how to tell which side of it a failure landed on. A failure before or
+during the upload is fixed by fixing the cause and re-running the job — there
+is no manual upload path.
+
+Everything after the upload is one step: creating the GitHub release. Build the
+same two files locally:
 
 ```bash
 uvx hatch build
 ```
 
-(or `python -m build`). Both land in `dist/`. Then create the GitHub release,
-attaching those files:
+(or `python -m build`). Both land in `dist/`. Then create the release,
+attaching them:
 
 ```bash
 gh release create vX.Y.Z --title X.Y.Z --generate-notes dist/*
@@ -80,4 +96,20 @@ gh release create vX.Y.Z --title X.Y.Z --generate-notes dist/*
 
 The title has no `v` prefix, per this repo's release rules, even though the tag does.
 
-PyPI publishing is not set up yet.
+### How PyPI publishing works
+
+PyPI is published through a trusted publisher, so no API token is stored
+anywhere: the project is registered on pypi.org against this repository and the
+`release.yml` workflow file, and the job's OIDC token is what proves who it is.
+That registration names no environment, so the release job must not declare one
+— PyPI rejects the token if the two disagree.
+
+The upload runs before the GitHub release is created, because PyPI never
+accepts the same version twice. If the upload fails, nothing was uploaded: fix
+the cause and re-run the failed job from the Actions tab, leaving the tag where
+it is. If the upload succeeded and a later step failed, PyPI already has the
+files and only the GitHub release still needs creating, by hand as above.
+
+There is no manual upload path — that is why the by-hand steps above stop at
+the GitHub release. A release whose files have to change gets a new version
+number.

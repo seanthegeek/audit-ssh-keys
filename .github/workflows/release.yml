@@ -5,12 +5,12 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
+      id-token: write # PyPI trusted publishing (OIDC), for the publish step
     steps:
       - uses: actions/checkout@v7
         with:
@@ -56,6 +56,22 @@ jobs:
             ls -la dist/
             exit 1
           fi
+
+      # Publishing comes before the GitHub release because PyPI never accepts
+      # the same version twice: this is the one step that cannot be redone. If
+      # it fails, nothing was uploaded, so the cause can be fixed and the job
+      # re-run from the Actions tab without moving the tag. If the release were
+      # created first, that re-run would stop at `gh release create` ("already
+      # exists") and never reach the upload. Reads dist/, the action's default,
+      # which is where `python -m build` wrote the two files checked just above.
+      #
+      # No API token is stored anywhere: the project is registered on pypi.org
+      # as a trusted publisher naming this repository and this workflow file,
+      # so the job's OIDC token is what proves who it is. That registration
+      # names no environment, so this job must not declare one -- PyPI rejects
+      # the token if the two disagree.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
       - name: Create the GitHub release
         env:
