@@ -44,13 +44,21 @@ The exit code does not reflect findings, so the tool is safe to run from cron or
 | `effective_authorized_keys_file` | The global `AuthorizedKeysFile` patterns. An account whose `Match` block moves the file is still scanned at the moved location (see `authorized_key_files`), but that override is not reflected here |
 | `coverage_warnings` | Things the audit could not see (see [How it works](how-it-works.md)) |
 | `server_config_issues` | Findings about `sshd` settings |
-| `host_keys` | One entry per host key: `path`, `key_type`, `bits`, `fingerprint`, `issues` |
-| `authorized_key_files` | One entry per file: `user`, `file_path`, `key_count`, `issues` |
-| `authorized_keys` | One entry per key: `user`, `file_path`, `line_number`, `key_type`, `bits`, `fingerprint`, `comment`, `options`, `issues` |
+| `host_keys` | One entry per host key: `path`, `key_type`, `bits`, `fingerprint`, `issues`, `last_modified` |
+| `authorized_key_files` | One entry per file: `user`, `file_path`, `key_count`, `issues`, `last_modified` |
+| `authorized_keys` | One entry per key: `user`, `file_path`, `line_number`, `key_type`, `bits`, `fingerprint`, `comment`, `options`, `issues`, `file_last_modified` |
 | `duplicate_authorized_keys` | `{fingerprint: ["user path:line", ...]}` for keys authorised in more than one place |
-| `private_keys` | One entry per private key: `user`, `path`, `key_type`, `bits`, `fingerprint`, `encrypted` (`true`, `false`, or `null` when the file format was not recognised), `issues` |
+| `private_keys` | One entry per private key: `user`, `path`, `key_type`, `bits`, `fingerprint`, `encrypted` (`true`, `false`, or `null` when the file format was not recognised), `issues`, `last_modified` |
 
 Every `issues` entry is `{"severity": "...", "message": "..."}`.
+
+Every last-modified date is the file's modification time as `YYYY-MM-DD` in the
+server's local time zone, so it matches what `ls -l` shows on the same host, and
+is `null` when there is no date to report — the file is not there, it could not
+be stat'd, or the entry names no file at all (a `(none)` host-key placeholder).
+On a key entry the field is named `file_last_modified` because it is the date of
+the file the line sits in: an `authorized_keys` file carries no per-key
+timestamp, so it says when the file changed, not when that key was added.
 
 Fingerprints are SHA256, as printed by `ssh-keygen -l`, so they can be joined against other tooling and across hosts.
 
@@ -68,7 +76,7 @@ A typical rollup:
 for h in host1 host2 host3; do
   ssh "$h" sudo audit-ssh-keys --json > "reports/$h.json"
 done
-jq -r '.authorized_keys[] | select(.issues[]?.severity == "CRITICAL") | "\(.user) \(.file_path):\(.line_number) \(.fingerprint)"' reports/*.json
+jq -r '.authorized_keys[] | select(.issues[]?.severity == "CRITICAL") | "\(.user) \(.file_path):\(.line_number) \(.fingerprint) \(.file_last_modified)"' reports/*.json
 ```
 
 Cross-host key reuse is a natural next step: concatenate the `authorized_keys` arrays and group by `fingerprint`.

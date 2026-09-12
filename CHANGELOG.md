@@ -13,4 +13,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Server-configuration checks for weak accepted signature algorithms, `StrictModes`, `PermitRootLogin`, and password authentication
 - Coverage warnings when keys come from `AuthorizedKeysCommand` or `TrustedUserCAKeys`, when `HostKeyAgent` holds the private host keys, or when `AuthorizedKeysFile` mixes `none` with real paths (which a future `sshd` will refuse to start on)
 - `--json` output for fleet rollups; `-v/--verbose` to list every key including clean ones; `--skip-host`, `--skip-authorized`, `--skip-private`, `--min-rsa-bits`, `--debug`
+- The date each key file was last modified, on each host key, `authorized_keys` file, key entry and private key heading in the text report, and as `last_modified` (`file_last_modified` on an `authorized_keys` entry) in the JSON
 - Test suite and docs

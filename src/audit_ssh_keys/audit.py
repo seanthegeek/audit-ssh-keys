@@ -47,6 +47,7 @@ import unicodedata
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -144,18 +145,31 @@ class Issue:
 
 @dataclass
 class HostKeyFinding:
-    """One sshd host key."""
+    """One sshd host key.
+
+    last_modified is the date the key file was last changed, as YYYY-MM-DD in
+    the server's local time zone, or None when there is no date to report: the
+    file is absent, it could not be stat'd, or this entry is a placeholder such
+    as `(none)` that names no file at all.
+    """
 
     path: str
     key_type: str
     bits: int
     fingerprint: str
     issues: list[Issue] = field(default_factory=list)
+    last_modified: str | None = None
 
 
 @dataclass
 class AuthorizedKeyFinding:
-    """A parsed authorized_keys entry."""
+    """A parsed authorized_keys entry.
+
+    file_last_modified is the date the file this line sits in was last changed,
+    as YYYY-MM-DD in the server's local time zone, or None when that date could
+    not be determined. It says when the file changed, not when this key was
+    added: an authorized_keys file carries no per-line timestamp.
+    """
 
     user: str
     file_path: str
@@ -166,16 +180,23 @@ class AuthorizedKeyFinding:
     comment: str
     options: list[str]
     issues: list[Issue] = field(default_factory=list)
+    file_last_modified: str | None = None
 
 
 @dataclass
 class FileFinding:
-    """File-level (not per-key) issues for one authorized_keys file."""
+    """File-level (not per-key) issues for one authorized_keys file.
+
+    last_modified is the date the file was last changed, as YYYY-MM-DD in the
+    server's local time zone, or None when that date could not be determined
+    (the file could not be stat'd).
+    """
 
     user: str
     file_path: str
     key_count: int
     issues: list[Issue] = field(default_factory=list)
+    last_modified: str | None = None
 
 
 @dataclass
@@ -184,6 +205,10 @@ class PrivateKeyFinding:
 
     encrypted is True (passphrase-protected), False (no passphrase), or None
     when the file format was not recognised, so it could not be determined.
+
+    last_modified is the date the key file was last changed, as YYYY-MM-DD in
+    the server's local time zone, or None when that date could not be
+    determined (the file could not be stat'd).
     """
 
     user: str
@@ -193,6 +218,7 @@ class PrivateKeyFinding:
     fingerprint: str
     encrypted: bool | None
     issues: list[Issue] = field(default_factory=list)
+    last_modified: str | None = None
 
 
 @dataclass
@@ -235,6 +261,25 @@ def _is_regular_file(path: Path) -> bool:
     """True when path exists and is a regular file. Raises OSError when that could not be checked."""
     st = _stat_if_present(path)
     return st is not None and stat.S_ISREG(st.st_mode)
+
+
+def _last_modified(mtime: float) -> str | None:
+    """The date a file was last modified, as YYYY-MM-DD, or None when the timestamp is out of range.
+
+    The date is in the server's local time zone, which is what `ls -l` and
+    `stat` show the operator on the same box, so the two agree.
+
+    A file's modification time is whatever was written to it, so it can be a
+    year the calendar cannot express or a number too large for the platform's
+    time conversion. That must not abort the run, so only the one conversion
+    that can fail is guarded, and an unusable timestamp reports no date at all.
+    """
+    try:
+        # date().isoformat() always writes the year with four digits; strftime
+        # would print a year below 1000 without its leading zeros.
+        return datetime.fromtimestamp(mtime).date().isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1706,18 +1751,19 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
             continue
         seen.add(str(path))
         try:
-            present = _is_regular_file(path)
+            st = _stat_if_present(path)
         except OSError as exc:
             findings.append(HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", f"could not stat host key: {exc}")]))
             every_key_identified = False
             continue
-        if not present:
+        if st is None or not stat.S_ISREG(st.st_mode):
             if configured:
                 # Explicitly configured but missing: sshd will log an error for it.
                 findings.append(
                     HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", "configured HostKey does not exist")])
                 )
             continue
+        modified = _last_modified(st.st_mtime)
 
         if not looks_like_private_key(path):
             public = fingerprint_file(path)
@@ -1753,6 +1799,7 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
                                     "(a certificate belongs on a HostCertificate line)",
                                 )
                             ],
+                            last_modified=modified,
                         )
                     )
                     continue
@@ -1769,6 +1816,7 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
                                 "public key file; the private half is held by HostKeyAgent and cannot be audited here",
                             )
                         ],
+                        last_modified=modified,
                     )
                     # sshd serves this key through the agent, so the host does
                     # offer this key type, and its algorithm and size still matter.
@@ -1793,18 +1841,21 @@ def audit_host_keys(config: dict[str, list[str]], min_rsa_bits: int, *, owner_ui
                                     "sshd cannot load a private key from it",
                                 )
                             ],
+                            last_modified=modified,
                         )
                     )
                 continue
 
         result, mismatch = fingerprint_private_key(path)
         if result is None:
-            finding = HostKeyFinding(str(path), "?", 0, "", [Issue("LOW", "could not fingerprint host key")])
+            finding = HostKeyFinding(
+                str(path), "?", 0, "", [Issue("LOW", "could not fingerprint host key")], last_modified=modified
+            )
             every_key_identified = False
         else:
             key_type, bits, fingerprint, _ = result
             types_present.add(key_type.upper())
-            finding = HostKeyFinding(str(path), key_type, bits, fingerprint)
+            finding = HostKeyFinding(str(path), key_type, bits, fingerprint, last_modified=modified)
             finding.issues.extend(grade_key(key_type, bits, min_rsa_bits))
 
         # These checks apply regardless of whether the key could be fingerprinted:
@@ -1976,7 +2027,7 @@ def audit_authorized_keys(
             if (user.pw_name, str(path)) in seen_paths:
                 continue
             try:
-                present = _is_regular_file(path)
+                st = _stat_if_present(path)
             except OSError as exc:
                 # Could not even tell whether the file is there -- for example,
                 # another account's home when this tool is not running as
@@ -1993,11 +2044,14 @@ def audit_authorized_keys(
                     )
                 )
                 continue
-            if not present:
+            if st is None or not stat.S_ISREG(st.st_mode):
                 continue
             seen_paths.add((user.pw_name, str(path)))
 
-            file_finding = FileFinding(user=user.pw_name, file_path=str(path), key_count=0)
+            # Path.stat() follows symlinks, so a symlinked authorized_keys
+            # reports the date of the file sshd actually reads.
+            modified = _last_modified(st.st_mtime)
+            file_finding = FileFinding(user=user.pw_name, file_path=str(path), key_count=0, last_modified=modified)
             file_finding.issues.extend(check_strictmodes_path(path, user))
 
             try:
@@ -2062,6 +2116,7 @@ def audit_authorized_keys(
                     fingerprint=fingerprint,
                     comment=comment,
                     options=options,
+                    file_last_modified=modified,
                 )
                 if _is_certificate(key_type):
                     # auth_check_authkey_line() (auth2-pubkeyfile.c) matches a plain
@@ -2169,6 +2224,16 @@ def audit_private_keys(
             if str(path) in host_key_paths or not looks_like_private_key(path):
                 continue
 
+            try:
+                key_st = _stat_if_present(path)
+            except OSError as exc:
+                # The directory listing above already found this to be a
+                # regular file, so a failure here is a race rather than a
+                # layout the operator can act on -- and a permission problem
+                # that persists is reported by check_private_key_perms(), which
+                # stats the file itself. Leave the date out and carry on.
+                logger.debug("could not stat %s: %s", path, exc)
+                key_st = None
             encrypted = private_key_is_encrypted(path)
             finding = PrivateKeyFinding(
                 user=user.pw_name,
@@ -2177,6 +2242,7 @@ def audit_private_keys(
                 bits=0,
                 fingerprint="",
                 encrypted=encrypted,
+                last_modified=_last_modified(key_st.st_mtime) if key_st is not None else None,
             )
             result, mismatch = fingerprint_private_key(path)
             if result is not None:
@@ -2324,6 +2390,23 @@ def _worst(issues: list[Issue]) -> int:
     return min((SEVERITY_ORDER[i.severity] for i in issues), default=len(SEVERITY_ORDER))
 
 
+def _modified_suffix(date: str | None) -> str:
+    """The `last modified <date>` tail for a line naming a file, or nothing when there is no date.
+
+    A file whose date could not be determined prints exactly the line it
+    printed before this was added, so the report gains a date where there is
+    one and says nothing where there is not.
+    """
+    return f" (last modified {date})" if date else ""
+
+
+def _file_summary(f: FileFinding) -> str:
+    """What goes in the parentheses after an authorized_keys file's path: its key count, and its date when known."""
+    if f.last_modified:
+        return f"{f.key_count} key(s), last modified {f.last_modified}"
+    return f"{f.key_count} key(s)"
+
+
 def _print_key_entry(k: AuthorizedKeyFinding) -> None:
     _out(f"  line {k.line_number}: {k.key_type} {k.bits}-bit  {k.fingerprint}  {k.comment or '(no comment)'}")
     if k.options:
@@ -2368,7 +2451,7 @@ def print_report(report: Report, verbose: bool = False) -> None:
         _out(f"\n=== Host keys ({len(report.host_keys)}) ===")
         shown_host_keys = report.host_keys if verbose else [hk for hk in report.host_keys if hk.issues]
         for hk in shown_host_keys:
-            line = f"\n{hk.path}"
+            line = f"\n{hk.path}{_modified_suffix(hk.last_modified)}"
             if hk.fingerprint:
                 line += f"\n  {hk.key_type} {hk.bits}-bit  {hk.fingerprint}"
             _out(line)
@@ -2385,17 +2468,17 @@ def print_report(report: Report, verbose: bool = False) -> None:
             for k in report.authorized_keys:
                 keys_by_account_file[k.user, k.file_path].append(k)
             for f in report.authorized_key_files:
-                _out(f"\n{f.user}: {f.file_path} ({f.key_count} key(s))")
+                _out(f"\n{f.user}: {f.file_path} ({_file_summary(f)})")
                 _print_issues(f.issues)
                 for k in sorted(keys_by_account_file[f.user, f.file_path], key=lambda k: k.line_number):
                     _print_key_entry(k)
         else:
             for f in (f for f in report.authorized_key_files if f.issues):
-                _out(f"\n{f.user}: {f.file_path} ({f.key_count} key(s))")
+                _out(f"\n{f.user}: {f.file_path} ({_file_summary(f)})")
                 _print_issues(f.issues)
             key_issues = sorted((k for k in report.authorized_keys if k.issues), key=lambda k: _worst(k.issues))
             for k in key_issues:
-                _out(f"\n{k.user}: {k.file_path}:{k.line_number}")
+                _out(f"\n{k.user}: {k.file_path}:{k.line_number}{_modified_suffix(k.file_last_modified)}")
                 _out(f"  {k.key_type} {k.bits}-bit  {k.fingerprint}  {k.comment or '(no comment)'}")
                 if k.options:
                     _out(f"  options: {','.join(k.options)}")
@@ -2407,7 +2490,7 @@ def print_report(report: Report, verbose: bool = False) -> None:
         _out(f"\n=== Private keys in ~/.ssh ({len(report.private_keys)}) ===")
         shown_private_keys = report.private_keys if verbose else [pk for pk in report.private_keys if pk.issues]
         for pk in sorted(shown_private_keys, key=lambda p: _worst(p.issues)):
-            _out(f"\n{pk.user}: {pk.path}")
+            _out(f"\n{pk.user}: {pk.path}{_modified_suffix(pk.last_modified)}")
             desc = f"{pk.key_type} {pk.bits}-bit  {pk.fingerprint}" if pk.fingerprint else "(unfingerprinted)"
             if pk.encrypted is True:
                 passphrase_desc = "passphrase-protected"

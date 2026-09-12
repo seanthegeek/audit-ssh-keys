@@ -20,13 +20,13 @@ sshd config source: sshd -T
 
 === Host keys (3) ===
 
-/etc/ssh/ssh_host_rsa_key
+/etc/ssh/ssh_host_rsa_key (last modified 2023-11-04)
   RSA 2048-bit  SHA256:/EqCt23YD1l/qoc+0D2kBP6H6jCo3An+wBUshL+LFPY
   [MEDIUM] RSA 2048-bit is below policy minimum of 3072
 ...
 === authorized_keys (3 file(s), 6 key(s)) ===
 
-svc-backup: /var/lib/svc-backup/.ssh/authorized_keys (2 key(s))
+svc-backup: /var/lib/svc-backup/.ssh/authorized_keys (2 key(s), last modified 2026-02-17)
   [HIGH] /var/lib/svc-backup/.ssh/authorized_keys is owned by mallory, not svc-backup or root
 ...
 Totals: CRITICAL: 1  HIGH: 3  MEDIUM: 5  LOW: 1  INFO: 2
@@ -60,6 +60,9 @@ sudo audit-ssh-keys --json     # machine-readable, for pipelines and fleet rollu
 | Host keys | Algorithm and size; ownership and mode (`sshd` refuses a root-owned key with group/other permission bits; a key owned by anyone else loads regardless, which is its own problem); a `.pub` file next to the key checked against the key itself; configured-but-missing keys; passphrase-protected keys; missing Ed25519 key |
 | `authorized_keys` | Every account, every configured path; algorithm and size; what `StrictModes` would reject (the file and every directory above it, up to `$HOME` for a file inside the home directory and otherwise up to `/`, must be owned by the user or root and not group/world-writable); the same key reused across accounts; unrestricted keys on uid-0 accounts; malformed lines |
 | Private keys in `~/.ssh` | Algorithm and size; ownership and mode; whether a passphrase is set; a `.pub` file next to the key checked against the key itself |
+
+Every host key, `authorized_keys` file and private key is also reported with
+the date it was last modified.
 
 Every finding has a severity (CRITICAL, HIGH, MEDIUM, LOW, INFO). See
 [docs/findings.md](docs/findings.md) for what each one means and why it has the
