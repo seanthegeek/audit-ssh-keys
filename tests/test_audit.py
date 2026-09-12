@@ -16,6 +16,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,20 @@ def _by_sev(issues: list[audit.Issue]) -> dict[str, list[str]]:
     for i in issues:
         out.setdefault(i.severity, []).append(i.message)
     return out
+
+
+# A fixed modification time for the tests that assert a date. Local noon, so
+# the date it falls on is 2020-02-29 whatever time zone the suite runs in, and
+# the tests can assert that literal string instead of recomputing it with the
+# helper they are testing.
+KNOWN_MTIME = datetime(2020, 2, 29, 12).timestamp()
+KNOWN_DATE = "2020-02-29"
+
+
+def _set_mtime(path: Path, when: float = KNOWN_MTIME) -> Path:
+    """Give a file a known modification time."""
+    os.utime(path, (when, when))
+    return path
 
 
 def _write_ak(user: pwd.struct_passwd, lines: list[str], mode: int = 0o600) -> Path:
@@ -94,6 +109,26 @@ def test_is_regular_file_true_for_a_file_false_for_a_directory_or_missing_path(t
     assert audit._is_regular_file(f) is True
     assert audit._is_regular_file(d) is False
     assert audit._is_regular_file(tmp_path / "missing") is False
+
+
+def test_last_modified_formats_a_timestamp_as_a_local_date():
+    assert audit._last_modified(KNOWN_MTIME) == KNOWN_DATE
+
+
+def test_last_modified_writes_a_year_below_1000_with_four_digits():
+    """The docs promise YYYY-MM-DD, and strftime("%Y") would print year 69 as "69"."""
+    assert audit._last_modified(datetime(69, 12, 31, 12).timestamp()) == "0069-12-31"
+
+
+@pytest.mark.parametrize("mtime", [1e20, -1e20, float("nan"), float("inf")])
+def test_last_modified_is_none_for_a_timestamp_out_of_range(mtime: float):
+    """A file's modification time is whatever was written to it, so a value the calendar cannot hold must not crash.
+
+    A timestamp far beyond the year the platform can express, one far in the
+    past, and the values that are not a time at all each report no date rather
+    than aborting the audit part way through.
+    """
+    assert audit._last_modified(mtime) is None
 
 
 # --- check_strictmodes_path -------------------------------------------------
@@ -1650,11 +1685,11 @@ def test_host_keys_defaults_all_unstattable_reports_only_the_stat_failure(
     every default path to have been confirmed absent.
     """
 
-    def raise_permission_denied(path: Path) -> bool:
+    def raise_permission_denied(path: Path) -> os.stat_result:
         raise OSError("permission denied")
 
     monkeypatch.setattr(audit, "DEFAULT_HOST_KEYS", [str(tmp_path / "nope")])
-    monkeypatch.setattr(audit, "_is_regular_file", raise_permission_denied)
+    monkeypatch.setattr(audit, "_stat_if_present", raise_permission_denied)
 
     findings = audit.audit_host_keys({}, min_rsa_bits=3072)
 
@@ -1750,6 +1785,30 @@ def test_host_keys_unstattable_path_is_low_not_a_crash(tmp_path: Path):
     finding = next(f for f in findings if f.path == str(host_key))
     assert [i.severity for i in finding.issues] == ["LOW"]
     assert finding.issues[0].message.startswith("could not stat host key")
+    # Nothing was stat'd, so there is no date to report either.
+    assert finding.last_modified is None
+
+
+def test_host_key_reports_the_date_it_was_last_modified(keys: dict[str, Path], tmp_path: Path):
+    """A key file that is there carries its date; a configured path that is not there carries none."""
+    ed = tmp_path / "ssh_host_ed25519_key"
+    ed.write_bytes(keys["ed25519"].read_bytes())
+    ed.chmod(0o600)
+    _set_mtime(ed)
+    missing = tmp_path / "ssh_host_rsa_key"
+
+    config = {"hostkey": [str(ed), str(missing)]}
+    findings = audit.audit_host_keys(config, min_rsa_bits=3072, owner_uid=os.getuid())
+    by_path = {f.path: f for f in findings}
+
+    assert by_path[str(ed)].last_modified == KNOWN_DATE
+    assert by_path[str(missing)].last_modified is None
+
+
+def test_host_key_placeholder_entry_has_no_date():
+    """A `(none)` entry names no file, so there is nothing to report a date for."""
+    findings = audit.audit_host_keys({"hostkey": ["none"]}, min_rsa_bits=3072)
+    assert [(f.path, f.last_modified) for f in findings] == [("(none)", None)]
 
 
 # --- audit_authorized_keys ---------------------------------------------------
@@ -1841,9 +1900,46 @@ def test_authorized_keys_unstattable_home_is_a_file_finding_not_a_crash(keys: di
     assert alice_files[0].key_count == 0
     assert [i.severity for i in alice_files[0].issues] == ["LOW"]
     assert alice_files[0].issues[0].message.startswith(f"could not stat {alice_files[0].file_path}")
+    assert alice_files[0].last_modified is None  # nothing was stat'd, so there is no date
     assert not any(k.user == "alice" for k in ak)
 
     assert any(k.user == "bob" for k in ak)  # the other account was still audited normally
+
+
+def test_authorized_keys_file_and_every_key_in_it_carry_the_file_date(keys: dict[str, Path], tmp_path: Path):
+    alice = make_user("alice", USER_UID, tmp_path / "alice")
+    mkdir_clean(Path(alice.pw_dir), tmp_path)
+    ak_path = _write_ak(alice, [pub(keys["ed25519"]), pub(keys["rsa4096"])])
+    _set_mtime(ak_path)
+
+    _, files, ak, _, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
+
+    assert [f.last_modified for f in files] == [KNOWN_DATE]
+    assert len(ak) == 2
+    assert [k.file_last_modified for k in ak] == [KNOWN_DATE, KNOWN_DATE]
+
+
+def test_authorized_keys_symlink_reports_the_date_of_the_file_sshd_reads(keys: dict[str, Path], tmp_path: Path):
+    """Path.stat() follows symlinks, so the date is the target's, not the link's."""
+    alice = make_user("alice", USER_UID, tmp_path / "alice")
+    ssh_dir = mkdir_clean(Path(alice.pw_dir) / ".ssh", tmp_path, mode=0o700)
+    target = ssh_dir / "authorized_keys.real"
+    target.write_text(pub(keys["ed25519"]) + "\n")
+    target.chmod(0o600)
+    _set_mtime(target)
+    link = ssh_dir / "authorized_keys"
+    link.symlink_to(target)
+    # The link's own timestamp is a different date, so a check that read the
+    # link instead of its target would report 1999-01-02 here.
+    link_mtime = datetime(1999, 1, 2, 12).timestamp()
+    os.utime(link, (link_mtime, link_mtime), follow_symlinks=False)
+
+    _, files, ak, _, _ = audit.audit_authorized_keys(
+        {"authorizedkeysfile": [".ssh/authorized_keys"]}, 3072, users=[alice]
+    )
+
+    assert [f.last_modified for f in files] == [KNOWN_DATE]
+    assert [k.file_last_modified for k in ak] == [KNOWN_DATE]
 
 
 def test_authorized_keys_certificate_is_reported_as_inert_not_graded(tmp_path: Path):
@@ -2917,6 +3013,42 @@ def test_private_key_plain_pem_without_a_pub_is_fingerprinted(tmp_path: Path):
     assert not any("could not fingerprint" in i.message for i in finding.issues)
 
 
+def test_private_key_reports_the_date_it_was_last_modified(keys: dict[str, Path], tmp_path: Path):
+    def write(a_ssh: Path) -> None:
+        key = a_ssh / "id_ed25519"
+        key.write_bytes(keys["ed25519"].read_bytes())
+        key.chmod(0o600)
+        _set_mtime(key)
+
+    assert _one_private_key(tmp_path, write).last_modified == KNOWN_DATE
+
+
+def test_private_key_that_cannot_be_stat_d_is_still_audited_without_a_date(
+    keys: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The directory listing already found a regular file, so a stat failure here is a race, not a layout problem.
+
+    The key is still reported -- with no date, rather than not at all.
+    """
+    key_name = "id_ed25519"
+    real_stat = audit._stat_if_present
+
+    def stat_except_the_key(path: Path) -> os.stat_result | None:
+        if path.name == key_name:
+            raise OSError("vanished")
+        return real_stat(path)
+
+    def write(a_ssh: Path) -> None:
+        key = a_ssh / key_name
+        key.write_bytes(keys["ed25519"].read_bytes())
+        key.chmod(0o600)
+        monkeypatch.setattr(audit, "_stat_if_present", stat_except_the_key)
+
+    finding = _one_private_key(tmp_path, write)
+    assert finding.last_modified is None
+    assert finding.key_type == "ED25519"
+
+
 def test_private_keys_skips_symlinks_and_missing_dirs(keys: dict[str, Path], tmp_path: Path):
     alice = make_user("alice", os.getuid(), tmp_path / "alice")
     bob = make_user("bob", os.getuid(), tmp_path / "bob")  # no .ssh at all
@@ -3036,9 +3168,14 @@ def test_audit_py_runs_standalone_without_the_package(tmp_path: Path):
 def _report_with_one_clean_and_one_flagged_key(keys: dict[str, Path], tmp_path: Path) -> audit.Report:
     alice = make_user("alice", USER_UID, tmp_path / "alice")
     mkdir_clean(Path(alice.pw_dir), tmp_path)
-    _write_ak(alice, [pub(keys["rsa4096"]), pub(keys["rsa2048"])])
+    # A known date on the authorized_keys file, so the file header and every
+    # key line taken from it can be checked against a literal date.
+    _set_mtime(_write_ak(alice, [pub(keys["rsa4096"]), pub(keys["rsa2048"])]))
     patterns, files, ak, dupes, _ = audit.audit_authorized_keys({}, 3072, users=[alice])
 
+    # The flagged entries carry a date and the clean ones do not, so one report
+    # shows both what a line looks like with a date and what it looks like
+    # without one.
     host_keys = [
         audit.HostKeyFinding("/etc/ssh/ssh_host_ed25519_key_clean", "ED25519", 256, "SHA256:cleanhostkey"),
         audit.HostKeyFinding(
@@ -3047,6 +3184,7 @@ def _report_with_one_clean_and_one_flagged_key(keys: dict[str, Path], tmp_path: 
             2048,
             "SHA256:flaggedhostkey",
             issues=[audit.Issue("LOW", "example host key finding")],
+            last_modified=KNOWN_DATE,
         ),
     ]
     private_keys = [
@@ -3061,6 +3199,7 @@ def _report_with_one_clean_and_one_flagged_key(keys: dict[str, Path], tmp_path: 
             "SHA256:flaggedprivkey",
             False,
             issues=[audit.Issue("LOW", "example private key finding")],
+            last_modified=KNOWN_DATE,
         ),
     ]
 
@@ -3098,7 +3237,11 @@ def test_default_report_lists_only_keys_with_findings(keys, tmp_path, capsys):
     assert "=== Server configuration ===" in out
     assert "[MEDIUM] example server configuration finding" in out
     lines = out.splitlines()
-    i_file = next(i for i, ln in enumerate(lines) if ln.startswith("alice: ") and ln.endswith("key(s))"))
+    i_file = next(
+        i
+        for i, ln in enumerate(lines)
+        if ln.startswith("alice: ") and ln.endswith(f"key(s), last modified {KNOWN_DATE})")
+    )
     assert lines[i_file + 1] == "  [HIGH] example file finding"
 
 
@@ -3125,6 +3268,83 @@ def test_verbose_report_lists_every_key_grouped_by_file(keys, tmp_path, capsys):
     # Clean private key: "user: path" line, then "type bits fingerprint passphrase" line, then "  ok".
     i_priv_clean = next(i for i, ln in enumerate(lines) if ln == "alice: /home/alice/.ssh/id_ed25519_clean")
     assert lines[i_priv_clean + 2] == "  ok"
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_report_shows_the_last_modified_date_on_every_file_heading(keys, tmp_path, capsys, verbose: bool):
+    report = _report_with_one_clean_and_one_flagged_key(keys, tmp_path)
+    audit.print_report(report, verbose=verbose)
+    lines = capsys.readouterr().out.splitlines()
+    ak_path = report.authorized_key_files[0].file_path
+
+    assert f"/etc/ssh/ssh_host_rsa_key_flagged (last modified {KNOWN_DATE})" in lines
+    assert f"alice: {ak_path} (2 key(s), last modified {KNOWN_DATE})" in lines
+    assert f"alice: /home/alice/.ssh/id_rsa_flagged (last modified {KNOWN_DATE})" in lines
+    if not verbose:
+        # Only the default layout names the file on the key line; the verbose
+        # layout groups keys under the file header, whose date is checked above.
+        assert f"alice: {ak_path}:2 (last modified {KNOWN_DATE})" in lines
+
+
+def test_report_omits_the_date_when_there_is_none_to_report(capsys):
+    """A file with no date prints exactly the line it printed before dates were reported at all.
+
+    Every entry here has a finding, so the default layout prints all four of
+    the line shapes that can carry a date.
+    """
+    file_path = "/home/alice/.ssh/authorized_keys"
+    example = [audit.Issue("LOW", "example finding")]
+    report = audit.Report(
+        config_source="sshd -T",
+        effective_authorized_keys_file=[".ssh/authorized_keys"],
+        coverage_warnings=[],
+        server_config_issues=[],
+        host_keys=[
+            audit.HostKeyFinding("/etc/ssh/ssh_host_ed25519_key", "ED25519", 256, "SHA256:hostkey", issues=example)
+        ],
+        authorized_key_files=[audit.FileFinding(user="alice", file_path=file_path, key_count=1, issues=example)],
+        authorized_keys=[
+            audit.AuthorizedKeyFinding(
+                user="alice",
+                file_path=file_path,
+                line_number=1,
+                key_type="ED25519",
+                bits=256,
+                fingerprint="SHA256:authkey",
+                comment="alice@test",
+                options=[],
+                issues=example,
+            )
+        ],
+        duplicate_authorized_keys={},
+        private_keys=[
+            audit.PrivateKeyFinding(
+                "alice", "/home/alice/.ssh/id_ed25519", "ED25519", 256, "SHA256:priv", True, issues=example
+            )
+        ],
+    )
+
+    audit.print_report(report)
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+
+    assert "last modified" not in out
+    assert "/etc/ssh/ssh_host_ed25519_key" in lines
+    assert f"alice: {file_path} (1 key(s))" in lines
+    assert f"alice: {file_path}:1" in lines
+    assert "alice: /home/alice/.ssh/id_ed25519" in lines
+
+
+def test_json_carries_the_last_modified_dates_and_nulls(keys, tmp_path):
+    """asdict() is what --json emits, so the new fields have to survive it -- including their null state."""
+    report = _report_with_one_clean_and_one_flagged_key(keys, tmp_path)
+    payload = json.loads(json.dumps(asdict(report)))
+
+    assert [h["last_modified"] for h in payload["host_keys"]] == [None, KNOWN_DATE]
+    assert [p["last_modified"] for p in payload["private_keys"]] == [None, KNOWN_DATE]
+    assert [f["last_modified"] for f in payload["authorized_key_files"]] == [KNOWN_DATE]
+    assert [k["file_last_modified"] for k in payload["authorized_keys"]] == [KNOWN_DATE, KNOWN_DATE]
+    assert '"last_modified": null' in json.dumps(payload)
 
 
 def test_default_report_says_no_findings_in_every_section_that_has_none(capsys):
