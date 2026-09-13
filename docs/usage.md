@@ -1,7 +1,8 @@
 # Usage
 
 ```bash
-sudo audit-ssh-keys [OPTIONS]
+sudo python3 audit-ssh-keys.py [OPTIONS]   # run without installing
+sudo audit-ssh-keys [OPTIONS]              # installed copy
 ```
 
 ## Options
@@ -66,19 +67,43 @@ timestamp, so it says when the file changed, not when that key was added.
 
 Fingerprints are SHA256, as printed by `ssh-keygen -l`, so they can be joined against other tooling and across hosts.
 
+## Running without installing
+
+Every release attaches `audit-ssh-keys.py` — a byte-for-byte copy of
+`src/audit_ssh_keys/audit.py` under the command's name — as a release asset.
+Copy that one file to a server and run it with:
+
+```bash
+sudo python3 audit-ssh-keys.py
+```
+
+`--version` reports the release it came from, so a copy is never mysterious
+about what produced a report. Running the script directly writes no bytecode
+cache, because CPython never caches `__main__`, so the copy you placed is the
+only file left behind in the directory you put it in. It is not a write-free
+run, though: fingerprinting a legacy PEM or PKCS#8 private key briefly creates
+a temporary directory holding one symlink, which is removed immediately
+afterwards. The name has a hyphen precisely so it can never be reached by an
+`import` statement — that keeps it from ever shadowing an installed copy of
+the `audit_ssh_keys` package on a machine that has one.
+
+Two other ways to run the tool:
+
+- Install with `pipx` (see [the README](../README.md#install)) to get the
+  `audit-ssh-keys` console script.
+- Copy the whole `src/audit_ssh_keys/` directory to the host and run
+  `python3 -m audit_ssh_keys` from the directory that contains it. This route
+  writes a `__pycache__` directory inside the copied `audit_ssh_keys/`
+  directory unless you add `-B` (`python3 -B -m audit_ssh_keys`).
+
 ## Fleet use
 
-The tool is stdlib-only, so there is no install step required to run it on a host. Three ways to do that:
-
-- Copy the whole `src/audit_ssh_keys/` directory to the host and run `python3 -m audit_ssh_keys` from the directory that contains it.
-- Copy just `audit.py` (it has no other files it depends on) and run `python3 audit.py`. Run this way, `--version` reports `unknown` because the package's version file was not copied along with it.
-- Install the wheel (`pip install audit-ssh-keys`) and use the `audit-ssh-keys` console script.
-
-A typical rollup:
+A typical rollup, copying the standalone script to each host rather than
+assuming an installed command:
 
 ```bash
 for h in host1 host2 host3; do
-  ssh "$h" sudo audit-ssh-keys --json > "reports/$h.json"
+  scp -q audit-ssh-keys.py "$h": && ssh "$h" sudo python3 audit-ssh-keys.py --json > "reports/$h.json"
 done
 jq -r '.authorized_keys[] | select(.issues[]?.severity == "CRITICAL") | "\(.user) \(.file_path):\(.line_number) \(.fingerprint) \(.file_last_modified)"' reports/*.json
 ```

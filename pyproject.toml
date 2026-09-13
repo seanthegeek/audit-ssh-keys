@@ -37,7 +37,7 @@ audit-ssh-keys = "audit_ssh_keys.audit:run"
 dev = ["pytest>=8", "pytest-cov", "ruff", "pyright"]
 
 [tool.hatch.version]
-path = "src/audit_ssh_keys/__init__.py"
+path = "src/audit_ssh_keys/audit.py"
 
 [tool.hatch.build.targets.sdist]
 include = ["src/", "tests/", "docs/", "README.md", "LICENSE", "CHANGELOG.md"]

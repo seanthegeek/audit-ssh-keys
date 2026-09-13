@@ -62,7 +62,10 @@ jobs:
       # an upload cannot. If the release were created first, a re-run would
       # stop at `gh release create` ("already exists") and never reach the
       # upload. Reads dist/, the action's default, which is where
-      # `python -m build` wrote the two files checked just above.
+      # `python -m build` wrote the two files checked just above -- nothing
+      # else is in dist/ at this point. The standalone script is copied in
+      # only after this step, because the action hands everything in dist/
+      # to twine, and twine refuses a bare .py file.
       #
       # skip-existing is on because the wheel and the sdist are uploaded as
       # separate files: a failure part way through can leave one of them on
@@ -82,6 +85,40 @@ jobs:
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           skip-existing: true
+
+      # This is the same file as src/audit_ssh_keys/audit.py, published under
+      # the name of the command instead of the module. The hyphen is
+      # deliberate: a file named audit_ssh_keys.py sitting in someone's
+      # working directory would shadow the installed package for anything
+      # that imports it there, while a name containing a hyphen cannot be
+      # reached by an `import` statement.
+      - name: Copy audit.py to dist/ as the standalone script
+        run: cp src/audit_ssh_keys/audit.py dist/audit-ssh-keys.py
+
+      - name: Check the standalone script is in dist/, is the module, and reports this version
+        run: |
+          set -euo pipefail
+          if [ ! -s dist/audit-ssh-keys.py ]; then
+            echo "dist/audit-ssh-keys.py is missing or empty"
+            ls -la dist/
+            exit 1
+          fi
+          if ! cmp -s src/audit_ssh_keys/audit.py dist/audit-ssh-keys.py; then
+            echo "dist/audit-ssh-keys.py is not byte-identical to src/audit_ssh_keys/audit.py"
+            exit 1
+          fi
+          # -S leaves site-packages out of sys.path, so the copy cannot
+          # borrow its version from the package installed earlier in this
+          # job -- the version has to come from the literal in the file
+          # itself. Stdin is closed per AGENTS.md: every external command
+          # this project runs gets stdin closed.
+          tag=${GITHUB_REF_NAME#v}
+          version_output=$(python -S dist/audit-ssh-keys.py --version </dev/null)
+          expected="audit-ssh-keys $tag"
+          if [ "$version_output" != "$expected" ]; then
+            echo "dist/audit-ssh-keys.py --version printed '$version_output', expected '$expected'"
+            exit 1
+          fi
 
       - name: Create the GitHub release
         env:

@@ -38,10 +38,11 @@ as written above.
 
 ```text
 src/audit_ssh_keys/
-  __init__.py   version
+  __init__.py   re-exports __version__ from audit.py
   __main__.py   python -m entry point
-  audit.py      everything else, in sections: config, ssh-keygen helpers,
-                parsing, grading, the three audit sections, output, CLI
+  audit.py      everything else, including __version__, in sections: config,
+                ssh-keygen helpers, parsing, grading, the three audit
+                sections, output, CLI
 tests/
   conftest.py   key-generation and fake-passwd fixtures
   test_parsing.py   pure functions (no filesystem, no ssh-keygen)
@@ -58,7 +59,7 @@ docs/
    missing — and list the changes under it. Add the matching
    `[X.Y.Z]: https://github.com/seanthegeek/audit-ssh-keys/releases/tag/vX.Y.Z`
    link definition at the end of the file.
-2. Bump `__version__` in `src/audit_ssh_keys/__init__.py`.
+2. Bump `__version__` in `src/audit_ssh_keys/audit.py`, just after the imports.
 3. Commit, then tag and push:
 
    ```bash
@@ -69,9 +70,11 @@ docs/
 Pushing the tag runs the release workflow
 (`.github/workflows/release.yml`), which checks the tag against
 `__version__` and the changelog heading, runs the checks, builds the wheel and
-sdist, checks that `dist/` holds exactly one of each, uploads both to PyPI, and
-creates the GitHub release titled without the `v` with the same two files
-attached.
+sdist, checks that `dist/` holds exactly one of each, uploads both to PyPI,
+copies `audit.py` into `dist/` as `audit-ssh-keys.py`, checks that copy is
+byte-identical to the module and that `python -S dist/audit-ssh-keys.py
+--version` reports the tag's version, and creates the GitHub release titled
+without the `v` with all three files attached.
 
 ### If the workflow fails after the PyPI upload
 
@@ -80,17 +83,21 @@ says how to tell which side of it a failure landed on. A failure before or
 during the upload is fixed by fixing the cause and re-running the job — there
 is no manual upload path.
 
-Everything after the upload is one step: creating the GitHub release. Build the
-same two files locally:
+Everything after the upload is three steps: copying the standalone script,
+checking that copy, and creating the GitHub release. By hand you need only the
+first and last — the check exists to catch a copy that the workflow made
+wrongly, and a `cp` you run yourself from the same checkout cannot fail that
+way. Build the wheel and sdist locally:
 
 ```bash
 uvx hatch build
 ```
 
-(or `python -m build`). Both land in `dist/`. Then create the release,
-attaching them:
+(or `python -m build`). Both land in `dist/`. Then copy the standalone script
+alongside them and create the release, attaching all three files:
 
 ```bash
+cp src/audit_ssh_keys/audit.py dist/audit-ssh-keys.py
 gh release create vX.Y.Z --title X.Y.Z --generate-notes dist/*
 ```
 
@@ -115,7 +122,8 @@ runs with `skip-existing`, so the re-run uploads whichever file is still
 missing instead of stopping at the one already there. Check the project's
 release page on PyPI afterwards to confirm both files are present. If the
 upload succeeded and a later step failed, PyPI already has the files and only
-the GitHub release still needs creating, by hand as above.
+the standalone script copy and the GitHub release still need doing, by hand as
+above.
 
 There is no manual upload path — that is why the by-hand steps above stop at
 the GitHub release. A release whose files have to change gets a new version

@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pwd
+import shutil
 import stat
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from typing import Any, TextIO
 
 import pytest
 
+import audit_ssh_keys
 from audit_ssh_keys import audit
 from tests.conftest import (
     RICH_VALID_OPTIONS,
@@ -4294,15 +4296,37 @@ def test_main_without_ssh_keygen_raises(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_audit_py_runs_standalone_without_the_package(tmp_path: Path):
-    """audit.py must still run when copied off by itself (docs/usage.md, "Fleet use").
+    """Each release attaches audit.py on its own, named audit-ssh-keys.py (docs/usage.md,
+    "Running without installing"), so it must still run -- and report a real version --
+    with no package around it.
 
-    -S skips site-packages, so an installed copy of the package (which would
-    make the `from audit_ssh_keys import __version__` import succeed even
-    with PYTHONPATH stripped) cannot mask the standalone fallback either.
+    -S skips site-packages, so the copy installed by the test environment cannot be
+    reached by the standalone script's process. That is proven directly first: an
+    `import audit_ssh_keys` under `-S` must fail with "No module named", which is what
+    establishes that the package is genuinely out of reach and that the version the
+    standalone script prints can only have come from the literal in audit.py, not from
+    an import that happened to still succeed.
     """
+    script = tmp_path / "audit-ssh-keys.py"
+    shutil.copyfile(audit.__file__, script)
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+
+    # Negative half: prove the package really is unreachable under -S.
+    import_proc = subprocess.run(
+        [sys.executable, "-S", "-c", "import audit_ssh_keys"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    assert import_proc.returncode != 0
+    assert "No module named 'audit_ssh_keys'" in import_proc.stderr
+
+    # Positive half: the standalone copy still reports the real version.
     proc = subprocess.run(
-        [sys.executable, "-S", audit.__file__, "--version"],
+        [sys.executable, "-S", str(script), "--version"],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -4311,7 +4335,7 @@ def test_audit_py_runs_standalone_without_the_package(tmp_path: Path):
         stdin=subprocess.DEVNULL,
     )
     assert proc.returncode == 0
-    assert proc.stdout.strip() == "audit-ssh-keys unknown"
+    assert proc.stdout.strip() == f"audit-ssh-keys {audit_ssh_keys.__version__}"
 
 
 # --- verbose report ------------------------------------------------------------
