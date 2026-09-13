@@ -12,7 +12,7 @@ locations and home directories outside `/home` — and tells you when `sshd` is
 sourcing keys from somewhere a file audit cannot see.
 
 ```text
-$ sudo audit-ssh-keys
+$ sudo python3 audit-ssh-keys.py
 sshd config source: sshd -T
 
 === Server configuration ===
@@ -32,10 +32,44 @@ svc-backup: /var/lib/svc-backup/.ssh/authorized_keys (2 key(s), last modified 20
 Totals: CRITICAL: 1  HIGH: 3  MEDIUM: 5  LOW: 1  INFO: 2
 ```
 
+## Run it
+
+The tool is one Python file. It needs nothing but Python 3.10+ and
+`ssh-keygen` (package `openssh-client` / `openssh-clients`) — no third-party
+dependencies, and no package to install. Copy it to the server and run it as
+root. No package is installed and no key file or configuration is touched;
+the only thing a run writes is a temporary directory holding a single symlink,
+created while fingerprinting a legacy PEM or PKCS#8 private key and removed
+immediately afterwards.
+
+```bash
+curl -fsSLO https://github.com/seanthegeek/audit-ssh-keys/releases/latest/download/audit-ssh-keys.py
+scp audit-ssh-keys.py server:
+ssh server sudo python3 audit-ssh-keys.py
+```
+
+`releases/latest/download/` always fetches the newest release that is not a
+prerelease (the workflow marks any tag containing a letter as a prerelease, so
+`latest` never hands out one of those). To pin a specific version, use
+`https://github.com/seanthegeek/audit-ssh-keys/releases/download/vX.Y.Z/audit-ssh-keys.py`
+instead. Either way, `python3 audit-ssh-keys.py --version` tells you which
+version you have — worth recording alongside any report you keep.
+
+Run it as root — other accounts' key files and the host private keys are not
+readable otherwise, and `sshd -T` needs root.
+
+```bash
+sudo python3 audit-ssh-keys.py            # human-readable report
+sudo python3 audit-ssh-keys.py -v         # list every key, not just those with findings
+sudo python3 audit-ssh-keys.py --json     # machine-readable, for pipelines and fleet rollups
+sudo python3 audit-ssh-keys.py --authorized-keys-changed-within 7   # flag authorized_keys files modified in the last 7 days
+```
+
 ## Install
 
-Requires Python 3.10+ and `ssh-keygen` (package `openssh-client` / `openssh-clients`).
-No third-party Python dependencies.
+For a machine you administer, rather than one you're investigating, installing
+from PyPI gets you an `audit-ssh-keys` command that takes exactly the same
+options.
 
 ```bash
 pipx install audit-ssh-keys
@@ -43,14 +77,10 @@ pipx install audit-ssh-keys
 pipx install .
 ```
 
-Run it as root — other accounts' key files and the host private keys are not
-readable otherwise, and `sshd -T` needs root.
+Then run it as `audit-ssh-keys`, with the same options:
 
 ```bash
-sudo audit-ssh-keys            # human-readable report
-sudo audit-ssh-keys -v         # list every key, not just those with findings
-sudo audit-ssh-keys --json     # machine-readable, for pipelines and fleet rollups
-sudo audit-ssh-keys --authorized-keys-changed-within 7   # flag authorized_keys files modified in the last 7 days
+sudo audit-ssh-keys
 ```
 
 ## What it checks
@@ -72,7 +102,7 @@ severity it does.
 
 ## Documentation
 
-- [Usage](docs/usage.md) — options, exit codes, JSON schema, fleet usage
+- [Usage](docs/usage.md) — options, exit codes, JSON schema, running without installing, fleet usage
 - [Findings reference](docs/findings.md) — every finding, its severity, and remediation
 - [How it works](docs/how-it-works.md) — what is read, what is not, known gaps
 - [Development](docs/development.md) — running tests, linting, releasing

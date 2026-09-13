@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--json` output for fleet rollups; `-v/--verbose` to list every key including clean ones; `--skip-host`, `--skip-authorized`, `--skip-private`, `--min-rsa-bits`, `--debug`, `--version`; and the opt-in modification-time thresholds `--authorized-keys-unchanged-for`, `--authorized-keys-changed-within` and `--host-keys-changed-within`
 - The date each key file was last modified, on each host key, `authorized_keys` file, key entry and private key heading in the text report, and as `last_modified` (`file_last_modified` on an `authorized_keys` entry) in the JSON
 - Test suite and docs
-- Published on PyPI as `audit-ssh-keys`; the release workflow uploads the wheel and sdist through a PyPI trusted publisher
+- Every release attaches `audit-ssh-keys.py`, a copy of the tool's single source file that runs on any host with `python3` and `ssh-keygen` without installing anything and reports its version with `--version`
+- Published on PyPI as `audit-ssh-keys`; the release workflow uploads the wheel and sdist through a PyPI trusted publisher, and attaches the wheel, sdist, and standalone script to the GitHub release
 
 [0.1.0]: https://github.com/seanthegeek/audit-ssh-keys/releases/tag/v0.1.0

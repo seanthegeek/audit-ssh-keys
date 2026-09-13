@@ -55,13 +55,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, TextIO
 
-try:
-    from audit_ssh_keys import __version__
-except ImportError:
-    # audit.py can be copied to a host on its own (see docs/usage.md, "Fleet
-    # use") and run without the rest of the package, so this lookup must not
-    # be a hard dependency.
-    __version__ = "unknown"
+# The version lives here, not in __init__.py, because every release ships
+# this file on its own as audit-ssh-keys.py (see docs/usage.md, "Running
+# without installing"), and that standalone copy has to report its version
+# with no package around it. __init__.py re-exports this value, and
+# [tool.hatch.version] in pyproject.toml reads it from this file.
+__version__ = "0.1.0"
 
 logger = logging.getLogger(__name__)
 
