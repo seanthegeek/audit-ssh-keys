@@ -23,7 +23,7 @@ from typing import Any, TextIO
 
 import pytest
 
-import audit_ssh_keys
+from audit_ssh_keys import __version__ as package_version
 from audit_ssh_keys import audit
 from tests.conftest import (
     RICH_VALID_OPTIONS,
@@ -4335,7 +4335,7 @@ def test_audit_py_runs_standalone_without_the_package(tmp_path: Path):
         stdin=subprocess.DEVNULL,
     )
     assert proc.returncode == 0
-    assert proc.stdout.strip() == f"audit-ssh-keys {audit_ssh_keys.__version__}"
+    assert proc.stdout.strip() == f"audit-ssh-keys {package_version}"
 
 
 # --- verbose report ------------------------------------------------------------
