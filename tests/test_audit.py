@@ -4335,6 +4335,13 @@ def test_audit_py_runs_standalone_without_the_package(tmp_path: Path):
         stdin=subprocess.DEVNULL,
     )
     assert proc.returncode == 0
+    # Pin down what the comparison below is allowed to agree on. "unknown" is
+    # what the deleted fallback printed, and it can still reach both sides at
+    # once: reintroducing that fallback with no literal left in audit.py makes
+    # the package re-export resolve through a circular import to "unknown" too,
+    # so the two would match and this test would pass while reporting no real
+    # version at all.
+    assert package_version != "unknown"
     assert proc.stdout.strip() == f"audit-ssh-keys {package_version}"
 
 

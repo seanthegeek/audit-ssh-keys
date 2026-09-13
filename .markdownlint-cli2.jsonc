@@ -2,9 +2,9 @@
   // Rule settings live in .markdownlint.json, which VS Code's markdownlint
   // extension reads too; this file adds only the path exclusion.
   //
-  // CI lints with the glob "**/*.md" (.github/workflows/ci.yml). On CI that
-  // walks a fresh checkout, but run locally the same glob descends into
-  // .venv and .pytest_cache and reports errors in third-party files. Honour
-  // .gitignore so the command CI runs is the command that works here.
+  // CI lints with the glob "**/*.md" (.github/workflows/ci.yml), which on CI
+  // walks a fresh checkout. Run locally, that same glob descends into .venv
+  // and .pytest_cache and reports errors in third-party files. Honour
+  // .gitignore so the command CI runs is the command that works here too.
   "gitignore": true
 }

@@ -37,8 +37,10 @@ Totals: CRITICAL: 1  HIGH: 3  MEDIUM: 5  LOW: 1  INFO: 2
 The tool is one Python file. It needs nothing but Python 3.10+ and
 `ssh-keygen` (package `openssh-client` / `openssh-clients`) — no third-party
 dependencies, and no package to install. Copy it to the server and run it as
-root: no package is installed and nothing on the host is modified, so a
-machine you are investigating is left as you found it.
+root. No package is installed and no key file or configuration is touched;
+the only thing a run writes is a temporary directory holding a single symlink,
+created while fingerprinting a legacy PEM or PKCS#8 private key and removed
+immediately afterwards.
 
 ```bash
 curl -fsSLO https://github.com/seanthegeek/audit-ssh-keys/releases/latest/download/audit-ssh-keys.py
